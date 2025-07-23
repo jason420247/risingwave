@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ use num_traits::{
     Bounded, CheckedAdd, CheckedDiv, CheckedMul, CheckedNeg, CheckedRem, CheckedSub, Num, One, Pow,
     Zero,
 };
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{IsNull, ToSql, Type, accepts, to_sql_checked};
 
 // masks for the parts of the IEEE 754 float
 const SIGN_MASK: u64 = 0x8000000000000000u64;
@@ -105,6 +105,13 @@ impl<T: Float> OrderedFloat<T> {
     #[inline]
     pub fn into_inner(self) -> T {
         self.0
+    }
+
+    pub fn inner_slice(slice: &[Self]) -> &[T] {
+        let ptr = slice.as_ptr() as *const T;
+
+        // Safety: OrderedFloat is #[repr(transparent)] and has no invalid values.
+        unsafe { std::slice::from_raw_parts(ptr, slice.len()) }
     }
 }
 
@@ -846,9 +853,9 @@ fn raw_double_bits<F: Float>(f: &F) -> u64 {
 }
 
 mod impl_rand {
-    use rand::distributions::uniform::*;
-    use rand::distributions::{Distribution, Open01, OpenClosed01, Standard};
     use rand::Rng;
+    use rand::distr::uniform::*;
+    use rand::distr::{Distribution, Open01, OpenClosed01, StandardUniform};
 
     use super::OrderedFloat;
 
@@ -864,7 +871,7 @@ mod impl_rand {
         }
     }
 
-    impl_distribution! { Standard, f32, f64 }
+    impl_distribution! { StandardUniform, f32, f64 }
     impl_distribution! { Open01, f32, f64 }
     impl_distribution! { OpenClosed01, f32, f64 }
 
@@ -881,23 +888,21 @@ mod impl_rand {
             impl UniformSampler for UniformOrdered<$f> {
                 type X = OrderedFloat<$f>;
 
-                fn new<B1, B2>(low: B1, high: B2) -> Self
+                fn new<B1, B2>(low: B1, high: B2) -> Result<Self, Error>
                 where
                     B1: SampleBorrow<Self::X> + Sized,
                     B2: SampleBorrow<Self::X> + Sized,
                 {
-                    UniformOrdered(UniformFloat::<$f>::new(low.borrow().0, high.borrow().0))
+                    UniformFloat::<$f>::new(low.borrow().0, high.borrow().0).map(UniformOrdered)
                 }
 
-                fn new_inclusive<B1, B2>(low: B1, high: B2) -> Self
+                fn new_inclusive<B1, B2>(low: B1, high: B2) -> Result<Self, Error>
                 where
                     B1: SampleBorrow<Self::X> + Sized,
                     B2: SampleBorrow<Self::X> + Sized,
                 {
-                    UniformOrdered(UniformFloat::<$f>::new_inclusive(
-                        low.borrow().0,
-                        high.borrow().0,
-                    ))
+                    UniformFloat::<$f>::new_inclusive(low.borrow().0, high.borrow().0)
+                        .map(UniformOrdered)
                 }
 
                 fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Self::X {
@@ -1012,15 +1017,15 @@ mod impl_into_ordered {
 }
 
 pub use impl_into_ordered::IntoOrdered;
+use risingwave_common_estimate_size::ZeroHeapSize;
 use serde::Serialize;
-
-use crate::estimate_size::ZeroHeapSize;
 
 #[cfg(test)]
 mod tests {
-    use crate::estimate_size::EstimateSize;
-    use crate::types::ordered_float::OrderedFloat;
+    use risingwave_common_estimate_size::EstimateSize;
+
     use crate::types::IntoOrdered;
+    use crate::types::ordered_float::OrderedFloat;
 
     #[test]
     fn test_cast_to_f64() {
@@ -1113,5 +1118,17 @@ mod tests {
     fn test_ordered_float_estimate_size() {
         let ordered_float = OrderedFloat::<f64>::from(5_i64);
         assert_eq!(ordered_float.estimated_size(), 8);
+    }
+
+    #[test]
+    fn test_inner_slice() {
+        use crate::types::F32;
+
+        assert_eq!(std::mem::size_of::<F32>(), std::mem::size_of::<f32>());
+        assert_eq!(std::mem::align_of::<F32>(), std::mem::align_of::<f32>());
+
+        let slice = &[F32::from(1.0), 2.0.into(), 3.0.into()];
+        let inner = F32::inner_slice(slice);
+        assert_eq!(inner, &[1.0f32, 2.0, 3.0]);
     }
 }

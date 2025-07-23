@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,12 @@ use std::fmt;
 use itertools::Itertools;
 use pretty_xmlish::Pretty;
 use risingwave_common::catalog::Schema;
-use risingwave_common::error::Result;
 use risingwave_common::util::sort_util::{ColumnOrder, ColumnOrderDisplay};
 use risingwave_pb::common::PbColumnOrder;
 
 use super::super::plan_node::*;
-use crate::optimizer::PlanRef;
+use crate::error::Result;
 
-// TODO(rc): use this type to replace all `Vec<ColumnOrder>`
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Order {
     pub column_orders: Vec<ColumnOrder>,
@@ -45,6 +43,16 @@ impl Order {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.column_orders.len()
+    }
+
+    pub fn concat(self, other: Self) -> Self {
+        Self {
+            column_orders: self
+                .column_orders
+                .into_iter()
+                .chain(other.column_orders)
+                .collect(),
+        }
     }
 }
 

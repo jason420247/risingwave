@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use risingwave_pb::stream_plan::BarrierRecvNode;
-use tokio::sync::mpsc::unbounded_channel;
 
 use super::*;
 use crate::executor::BarrierRecvExecutor;
@@ -27,19 +26,17 @@ impl ExecutorBuilder for BarrierRecvExecutorBuilder {
         params: ExecutorParams,
         _node: &Self::Node,
         _store: impl StateStore,
-        stream: &mut LocalStreamManagerCore,
-    ) -> StreamResult<BoxedExecutor> {
+    ) -> StreamResult<Executor> {
         assert!(
             params.input.is_empty(),
             "barrier receiver should not have input"
         );
 
-        let (sender, barrier_receiver) = unbounded_channel();
-        stream
-            .context
-            .barrier_manager()
-            .register_sender(params.actor_context.id, sender);
+        let barrier_receiver = params
+            .local_barrier_manager
+            .subscribe_barrier(params.actor_context.id);
 
-        Ok(BarrierRecvExecutor::new(params.actor_context, params.info, barrier_receiver).boxed())
+        let exec = BarrierRecvExecutor::new(params.actor_context, barrier_receiver);
+        Ok((params.info, exec).into())
     }
 }

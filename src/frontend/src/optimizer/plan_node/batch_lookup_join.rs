@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,23 +14,25 @@
 
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{ColumnId, TableDesc};
-use risingwave_common::error::Result;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::{DistributedLookupJoinNode, LocalLookupJoinNode};
+use risingwave_pb::plan_common::AsOfJoinDesc;
+use risingwave_sqlparser::ast::AsOf;
 
 use super::batch::prelude::*;
-use super::generic::{self, GenericPlanRef};
-use super::utils::{childless_record, Distill};
-use super::ExprRewritable;
+use super::utils::{Distill, childless_record, to_pb_time_travel_as_of};
+use super::{ExprRewritable, generic};
+use crate::error::Result;
 use crate::expr::{Expr, ExprRewriter, ExprVisitor};
+use crate::optimizer::PlanRef;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::utils::IndicesDisplay;
 use crate::optimizer::plan_node::{
-    EqJoinPredicate, EqJoinPredicateDisplay, LogicalScan, PlanBase, PlanTreeNodeUnary, ToBatchPb,
-    ToDistributedBatch, ToLocalBatch,
+    EqJoinPredicate, EqJoinPredicateDisplay, LogicalScan, PlanBase, PlanTreeNodeUnary,
+    ToDistributedBatch, ToLocalBatch, TryToBatchPb,
 };
 use crate::optimizer::property::{Distribution, Order, RequiredDist};
-use crate::optimizer::PlanRef;
+use crate::scheduler::SchedulerResult;
 use crate::utils::ColIndexMappingRewriteExt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,6 +56,10 @@ pub struct BatchLookupJoin {
     /// If `distributed_lookup` is true, it will generate `DistributedLookupJoinNode` for
     /// `ToBatchPb`. Otherwise, it will generate `LookupJoinNode`.
     distributed_lookup: bool,
+
+    as_of: Option<AsOf>,
+    // `AsOf` join description
+    asof_desc: Option<AsOfJoinDesc>,
 }
 
 impl BatchLookupJoin {
@@ -64,6 +70,8 @@ impl BatchLookupJoin {
         right_output_column_ids: Vec<ColumnId>,
         lookup_prefix_len: usize,
         distributed_lookup: bool,
+        as_of: Option<AsOf>,
+        asof_desc: Option<AsOfJoinDesc>,
     ) -> Self {
         // We cannot create a `BatchLookupJoin` without any eq keys. We require eq keys to do the
         // lookup.
@@ -79,6 +87,8 @@ impl BatchLookupJoin {
             right_output_column_ids,
             lookup_prefix_len,
             distributed_lookup,
+            as_of,
+            asof_desc,
         }
     }
 
@@ -157,6 +167,8 @@ impl PlanTreeNodeUnary for BatchLookupJoin {
             self.right_output_column_ids.clone(),
             self.lookup_prefix_len,
             self.distributed_lookup,
+            self.as_of.clone(),
+            self.asof_desc,
         )
     }
 }
@@ -200,9 +212,9 @@ impl ToDistributedBatch for BatchLookupJoin {
     }
 }
 
-impl ToBatchPb for BatchLookupJoin {
-    fn to_batch_prost_body(&self) -> NodeBody {
-        if self.distributed_lookup {
+impl TryToBatchPb for BatchLookupJoin {
+    fn try_to_batch_prost_body(&self) -> SchedulerResult<NodeBody> {
+        Ok(if self.distributed_lookup {
             NodeBody::DistributedLookupJoin(DistributedLookupJoinNode {
                 join_type: self.core.join_type as i32,
                 condition: self
@@ -222,7 +234,7 @@ impl ToBatchPb for BatchLookupJoin {
                     .into_iter()
                     .map(|a| a as _)
                     .collect(),
-                inner_side_table_desc: Some(self.right_table_desc.to_protobuf()),
+                inner_side_table_desc: Some(self.right_table_desc.try_to_protobuf()?),
                 inner_side_column_ids: self
                     .right_output_column_ids
                     .iter()
@@ -231,6 +243,8 @@ impl ToBatchPb for BatchLookupJoin {
                 output_indices: self.core.output_indices.iter().map(|&x| x as u32).collect(),
                 null_safe: self.eq_join_predicate.null_safes(),
                 lookup_prefix_len: self.lookup_prefix_len as u32,
+                as_of: to_pb_time_travel_as_of(&self.as_of)?,
+                asof_desc: self.asof_desc,
             })
         } else {
             NodeBody::LocalLookupJoin(LocalLookupJoinNode {
@@ -252,7 +266,7 @@ impl ToBatchPb for BatchLookupJoin {
                     .into_iter()
                     .map(|a| a as _)
                     .collect(),
-                inner_side_table_desc: Some(self.right_table_desc.to_protobuf()),
+                inner_side_table_desc: Some(self.right_table_desc.try_to_protobuf()?),
                 inner_side_vnode_mapping: vec![], // To be filled in at local.rs
                 inner_side_column_ids: self
                     .right_output_column_ids
@@ -263,8 +277,10 @@ impl ToBatchPb for BatchLookupJoin {
                 worker_nodes: vec![], // To be filled in at local.rs
                 null_safe: self.eq_join_predicate.null_safes(),
                 lookup_prefix_len: self.lookup_prefix_len as u32,
+                as_of: to_pb_time_travel_as_of(&self.as_of)?,
+                asof_desc: self.asof_desc,
             })
-        }
+        })
     }
 }
 

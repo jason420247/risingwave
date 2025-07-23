@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
+use itertools::Itertools;
+use risingwave_common::util::stream_graph_visitor::visit_stream_node_body;
+use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_simulation::cluster::{Cluster, Configuration};
 use risingwave_simulation::ctl_ext::predicate::identity_contains;
 use risingwave_simulation::utils::AssertResult;
@@ -43,11 +46,15 @@ async fn test_dynamic_filter() -> Result<()> {
         .locate_fragments([identity_contains("materialize")])
         .await?;
 
-    let upstream_fragment_ids: HashSet<_> = dynamic_filter_fragment
-        .inner
-        .upstream_fragment_ids
-        .iter()
-        .collect();
+    let mut upstream_fragment_ids = HashSet::new();
+    visit_stream_node_body(
+        dynamic_filter_fragment.inner.nodes.as_ref().unwrap(),
+        |node| {
+            if let NodeBody::Merge(merge) = node {
+                upstream_fragment_ids.insert(merge.upstream_fragment_id);
+            }
+        },
+    );
 
     let fragment = materialize_fragments
         .iter()
@@ -56,7 +63,16 @@ async fn test_dynamic_filter() -> Result<()> {
 
     let id = fragment.id();
 
-    cluster.reschedule(format!("{id}-[1,2,3]")).await?;
+    let (worker_1, worker_2, worker_3) = fragment
+        .all_worker_count()
+        .into_keys()
+        .collect_tuple::<(_, _, _)>()
+        .unwrap();
+
+    // prev -[1,2,3]
+    cluster
+        .reschedule(format!("{id}:[{worker_1}:-2, {worker_2}:-1]"))
+        .await?;
     sleep(Duration::from_secs(3)).await;
 
     session.run(SELECT).await?.assert_result_eq("");
@@ -68,7 +84,10 @@ async fn test_dynamic_filter() -> Result<()> {
     // 2
     // 3
 
-    cluster.reschedule(format!("{id}-[4,5]+[1,2,3]")).await?;
+    // prev -[4,5]+[1,2,3]
+    cluster
+        .reschedule(format!("{id}:[{worker_3}:-1, {worker_1}:2]"))
+        .await?;
     sleep(Duration::from_secs(3)).await;
     session.run(SELECT).await?.assert_result_eq("1\n2\n3");
 
@@ -78,7 +97,10 @@ async fn test_dynamic_filter() -> Result<()> {
     session.run(SELECT).await?.assert_result_eq("3");
     // 3
 
-    cluster.reschedule(format!("{id}-[1,2,3]+[4,5]")).await?;
+    // prev -[1,2,3]+[4,5]
+    cluster
+        .reschedule(format!("{id}:[{worker_1}:-2, {worker_3}:1]"))
+        .await?;
     sleep(Duration::from_secs(3)).await;
     session.run(SELECT).await?.assert_result_eq("3");
 
@@ -89,7 +111,10 @@ async fn test_dynamic_filter() -> Result<()> {
     // 2
     // 3
     //
-    cluster.reschedule(format!("{id}+[1,2,3]")).await?;
+    // prev +[1,2,3]
+    cluster
+        .reschedule(format!("{id}:[{worker_1}:2, {worker_2}:1]"))
+        .await?;
     sleep(Duration::from_secs(3)).await;
     session.run(SELECT).await?.assert_result_eq("2\n3");
 
@@ -98,7 +123,8 @@ async fn test_dynamic_filter() -> Result<()> {
     sleep(Duration::from_secs(5)).await;
     session.run(SELECT).await?.assert_result_eq("");
 
-    cluster.reschedule(format!("{id}-[1]")).await?;
+    // prev -[1]
+    cluster.reschedule(format!("{id}:[{worker_1}:1]")).await?;
     sleep(Duration::from_secs(3)).await;
     session.run(SELECT).await?.assert_result_eq("");
 

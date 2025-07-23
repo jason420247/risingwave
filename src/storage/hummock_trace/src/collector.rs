@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::env;
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::BufWriter;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicU64;
 
 use bincode::{Decode, Encode};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use risingwave_hummock_sdk::HummockReadEpoch;
+use risingwave_common::catalog::TableId;
+use risingwave_hummock_sdk::{HummockEpoch, HummockReadEpoch};
 use risingwave_pb::meta::SubscribeResponse;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{
-    unbounded_channel as channel, UnboundedReceiver as Receiver, UnboundedSender as Sender,
+    UnboundedReceiver as Receiver, UnboundedSender as Sender, unbounded_channel as channel,
 };
 use tokio::task_local;
 
@@ -35,7 +37,7 @@ use crate::write::{TraceWriter, TraceWriterImpl};
 use crate::{
     ConcurrentIdGenerator, Operation, OperationResult, Record, RecordId, RecordIdGenerator,
     TracedInitOptions, TracedNewLocalOptions, TracedReadOptions, TracedSealCurrentEpochOptions,
-    TracedSubResp, UniqueIdGenerator,
+    TracedSubResp, TracedTryWaitEpochOptions, UniqueIdGenerator,
 };
 
 // Global collector instance used for trace collection
@@ -76,14 +78,14 @@ fn set_should_use_trace() -> bool {
 /// Initialize the `GLOBAL_COLLECTOR` with configured log file
 pub fn init_collector() {
     TRACE_RT.spawn(async move {
-        let path = env::var(LOG_PATH).unwrap_or_else(|_| DEFAULT_PATH.to_string());
+        let path = env::var(LOG_PATH).unwrap_or_else(|_| DEFAULT_PATH.to_owned());
         let path = Path::new(&path);
         tracing::info!("Hummock Tracing log path {}", path.to_string_lossy());
 
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                create_dir_all(parent).unwrap();
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            create_dir_all(parent).unwrap();
         }
         let f = OpenOptions::new()
             .write(true)
@@ -198,14 +200,6 @@ impl TraceSpan {
         }
     }
 
-    pub fn new_epoch_span(storage_type: StorageType) -> MayTraceSpan {
-        Self::new_global_op(Operation::LocalStorageEpoch, storage_type)
-    }
-
-    pub fn new_is_dirty_span(storage_type: StorageType) -> MayTraceSpan {
-        Self::new_global_op(Operation::LocalStorageIsDirty, storage_type)
-    }
-
     pub fn new_seal_current_epoch_span(
         epoch: u64,
         opts: TracedSealCurrentEpochOptions,
@@ -214,19 +208,14 @@ impl TraceSpan {
         Self::new_global_op(Operation::SealCurrentEpoch { epoch, opts }, storage_type)
     }
 
-    pub fn new_clear_shared_buffer_span() -> MayTraceSpan {
-        Self::new_global_op(Operation::ClearSharedBuffer, StorageType::Global)
-    }
-
-    pub fn new_validate_read_epoch_span(epoch: HummockReadEpoch) -> MayTraceSpan {
+    pub fn new_try_wait_epoch_span(
+        epoch: HummockReadEpoch,
+        options: TracedTryWaitEpochOptions,
+    ) -> MayTraceSpan {
         Self::new_global_op(
-            Operation::ValidateReadEpoch(epoch.into()),
+            Operation::TryWaitEpoch(epoch.into(), options),
             StorageType::Global,
         )
-    }
-
-    pub fn new_try_wait_epoch_span(epoch: HummockReadEpoch) -> MayTraceSpan {
-        Self::new_global_op(Operation::TryWaitEpoch(epoch.into()), StorageType::Global)
     }
 
     pub fn new_get_span(
@@ -283,16 +272,24 @@ impl TraceSpan {
         )
     }
 
-    pub fn new_sync_span(epoch: u64, storage_type: StorageType) -> MayTraceSpan {
-        Self::new_global_op(Operation::Sync(epoch), storage_type)
-    }
-
-    pub fn new_seal_span(
-        epoch: u64,
-        is_checkpoint: bool,
+    pub fn new_sync_span(
+        sync_table_epochs: &Vec<(HummockEpoch, HashSet<TableId>)>,
         storage_type: StorageType,
     ) -> MayTraceSpan {
-        Self::new_global_op(Operation::Seal(epoch, is_checkpoint), storage_type)
+        Self::new_global_op(
+            Operation::Sync(
+                sync_table_epochs
+                    .iter()
+                    .map(|(epoch, table_ids)| {
+                        (
+                            *epoch,
+                            table_ids.iter().map(|table_id| table_id.table_id).collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+            storage_type,
+        )
     }
 
     pub fn new_local_storage_span(
@@ -310,15 +307,8 @@ impl TraceSpan {
         Self::new_global_op(Operation::DropLocalStorage, storage_type)
     }
 
-    pub fn new_flush_span(
-        delete_range: Vec<(Bound<Bytes>, Bound<Bytes>)>,
-        storage_type: StorageType,
-    ) -> MayTraceSpan {
-        let delete_range = delete_range
-            .into_iter()
-            .map(|(k, v)| (k.map(Bytes::into), v.map(Bytes::into)))
-            .collect();
-        Self::new_global_op(Operation::Flush(delete_range), storage_type)
+    pub fn new_flush_span(storage_type: StorageType) -> MayTraceSpan {
+        Self::new_global_op(Operation::Flush, storage_type)
     }
 
     pub fn new_try_flush_span(storage_type: StorageType) -> MayTraceSpan {
@@ -496,23 +486,23 @@ mod tests {
     #[ignore]
     #[test]
     fn test_set_use_trace() {
-        std::env::remove_var(USE_TRACE);
+        unsafe { std::env::remove_var(USE_TRACE) };
         assert!(!set_should_use_trace());
 
-        std::env::set_var(USE_TRACE, "true");
+        unsafe { std::env::set_var(USE_TRACE, "true") };
         assert!(set_should_use_trace());
 
-        std::env::set_var(USE_TRACE, "false");
+        unsafe { std::env::set_var(USE_TRACE, "false") };
         assert!(!set_should_use_trace());
 
-        std::env::set_var(USE_TRACE, "invalid");
+        unsafe { std::env::set_var(USE_TRACE, "invalid") };
         assert!(!set_should_use_trace());
     }
 
     #[ignore]
     #[test]
     fn test_should_use_trace() {
-        std::env::set_var(USE_TRACE, "true");
+        unsafe { std::env::set_var(USE_TRACE, "true") };
         assert!(should_use_trace());
         assert!(set_should_use_trace());
     }

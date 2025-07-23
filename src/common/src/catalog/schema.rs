@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 use std::ops::Index;
 
-use itertools::Itertools;
 use risingwave_pb::plan_common::{PbColumnDesc, PbField};
 
 use super::ColumnDesc;
@@ -27,11 +26,15 @@ use crate::util::iter_util::ZipEqFast;
 pub struct Field {
     pub data_type: DataType,
     pub name: String,
-    /// For STRUCT type.
-    pub sub_fields: Vec<Field>,
-    /// The user-defined type's name, when the type is created from a protobuf schema file,
-    /// this field will store the message name.
-    pub type_name: String,
+}
+
+impl Field {
+    pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
+        Self {
+            data_type,
+            name: name.into(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Field {
@@ -44,7 +47,7 @@ impl Field {
     pub fn to_prost(&self) -> PbField {
         PbField {
             data_type: Some(self.data_type.to_protobuf()),
-            name: self.name.to_string(),
+            name: self.name.clone(),
         }
     }
 }
@@ -54,8 +57,6 @@ impl From<&ColumnDesc> for Field {
         Self {
             data_type: desc.data_type.clone(),
             name: desc.name.clone(),
-            sub_fields: desc.field_descs.iter().map(|d| d.into()).collect_vec(),
-            type_name: desc.type_name.clone(),
         }
     }
 }
@@ -65,12 +66,6 @@ impl From<ColumnDesc> for Field {
         Self {
             data_type: column_desc.data_type,
             name: column_desc.name,
-            sub_fields: column_desc
-                .field_descs
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            type_name: column_desc.type_name,
         }
     }
 }
@@ -80,9 +75,24 @@ impl From<&PbColumnDesc> for Field {
         Self {
             data_type: pb_column_desc.column_type.as_ref().unwrap().into(),
             name: pb_column_desc.name.clone(),
-            sub_fields: pb_column_desc.field_descs.iter().map(Into::into).collect(),
-            type_name: pb_column_desc.type_name.clone(),
         }
+    }
+}
+
+/// Something that has a data type and a name.
+#[auto_impl::auto_impl(&)]
+pub trait FieldLike {
+    fn data_type(&self) -> &DataType;
+    fn name(&self) -> &str;
+}
+
+impl FieldLike for Field {
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -197,9 +207,18 @@ impl Schema {
             true
         }
     }
+
+    pub fn formatted_col_names(&self) -> String {
+        self.fields
+            .iter()
+            .map(|f| format!("\"{}\"", &f.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl Field {
+    // TODO: rename to `new`
     pub fn with_name<S>(data_type: DataType, name: S) -> Self
     where
         S: Into<String>,
@@ -207,25 +226,6 @@ impl Field {
         Self {
             data_type,
             name: name.into(),
-            sub_fields: vec![],
-            type_name: String::new(),
-        }
-    }
-
-    pub fn with_struct<S>(
-        data_type: DataType,
-        name: S,
-        sub_fields: Vec<Field>,
-        type_name: S,
-    ) -> Self
-    where
-        S: Into<String>,
-    {
-        Self {
-            data_type,
-            name: name.into(),
-            sub_fields,
-            type_name: type_name.into(),
         }
     }
 
@@ -233,8 +233,6 @@ impl Field {
         Self {
             data_type,
             name: String::new(),
-            sub_fields: vec![],
-            type_name: String::new(),
         }
     }
 
@@ -246,8 +244,6 @@ impl Field {
         Self {
             data_type: desc.data_type.clone(),
             name: format!("{}.{}", table_name, desc.name),
-            sub_fields: desc.field_descs.iter().map(|d| d.into()).collect_vec(),
-            type_name: desc.type_name.clone(),
         }
     }
 }
@@ -257,8 +253,6 @@ impl From<&PbField> for Field {
         Self {
             data_type: DataType::from(prost_field.get_data_type().expect("data type not found")),
             name: prost_field.get_name().clone(),
-            sub_fields: vec![],
-            type_name: String::new(),
         }
     }
 }

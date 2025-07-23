@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -73,7 +73,7 @@ impl Parameter {
         self.param_types.has_infer(self.index)
     }
 
-    pub fn cast_infer_type(&mut self, data_type: DataType) {
+    pub fn cast_infer_type(&mut self, data_type: &DataType) {
         self.param_types.record_infer_type(self.index, data_type);
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ pub struct LocalExchangeSource {
 impl LocalExchangeSource {
     pub fn create(
         output_id: TaskOutputId,
-        context: impl BatchTaskContext,
+        context: &dyn BatchTaskContext,
         task_id: TaskId,
     ) -> Result<Self> {
         let task_output = context.get_task_output(output_id)?;
@@ -75,10 +75,11 @@ impl ExchangeSource for LocalExchangeSource {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use risingwave_common::config::RpcClientConfig;
     use risingwave_pb::batch_plan::{TaskId, TaskOutputId};
     use risingwave_pb::data::DataChunk;
     use risingwave_pb::task_service::exchange_service_server::{
@@ -154,7 +155,9 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         assert!(server_run.load(Ordering::SeqCst));
 
-        let client = ComputeClient::new(addr.into()).await.unwrap();
+        let client = ComputeClient::new(addr.into(), &RpcClientConfig::default())
+            .await
+            .unwrap();
         let task_output_id = TaskOutputId {
             task_id: Some(TaskId::default()),
             ..Default::default()

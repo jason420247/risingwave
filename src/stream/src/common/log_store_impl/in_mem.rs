@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
+use await_tree::InstrumentAwait;
+use futures::FutureExt;
 use risingwave_common::array::StreamChunk;
-use risingwave_common::buffer::Bitmap;
-use risingwave_common::util::epoch::{EpochPair, INVALID_EPOCH};
+use risingwave_common::util::epoch::{EpochExt, EpochPair, INVALID_EPOCH};
 use risingwave_connector::sink::log_store::{
-    LogReader, LogStoreFactory, LogStoreReadItem, LogStoreResult, LogWriter, TruncateOffset,
+    FlushCurrentEpochOptions, LogReader, LogStoreFactory, LogStoreReadItem, LogStoreResult,
+    LogWriter, LogWriterPostFlushCurrentEpoch, TruncateOffset,
 };
 use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
 use tokio::sync::oneshot;
 
@@ -32,9 +32,8 @@ enum InMemLogStoreItem {
     StreamChunk(StreamChunk),
     Barrier {
         next_epoch: u64,
-        is_checkpoint: bool,
+        options: FlushCurrentEpochOptions,
     },
-    UpdateVnodeBitmap(Arc<Bitmap>),
 }
 
 /// An in-memory log store that can buffer a bounded amount of stream chunk in memory via bounded
@@ -101,6 +100,9 @@ impl LogStoreFactory for BoundedInMemLogStoreFactory {
     type Reader = BoundedInMemLogStoreReader;
     type Writer = BoundedInMemLogStoreWriter;
 
+    const ALLOW_REWIND: bool = false;
+    const REBUILD_SINK_ON_UPDATE_VNODE_BITMAP: bool = false;
+
     async fn build(self) -> (Self::Reader, Self::Writer) {
         let (init_epoch_tx, init_epoch_rx) = oneshot::channel();
         let (item_tx, item_rx) = channel(self.bound);
@@ -132,8 +134,12 @@ impl LogReader for BoundedInMemLogStoreReader {
         let epoch = init_epoch_rx.await.context("unable to get init epoch")?;
         assert_eq!(self.epoch_progress, UNINITIALIZED);
         self.epoch_progress = LogReaderEpochProgress::Consuming(epoch);
-        self.latest_offset = TruncateOffset::Barrier { epoch: epoch - 1 };
-        self.truncate_offset = TruncateOffset::Barrier { epoch: epoch - 1 };
+        self.latest_offset = TruncateOffset::Barrier {
+            epoch: epoch.prev_epoch(),
+        };
+        self.truncate_offset = TruncateOffset::Barrier {
+            epoch: epoch.prev_epoch(),
+        };
         Ok(())
     }
 
@@ -167,10 +173,10 @@ impl LogReader for BoundedInMemLogStoreReader {
                         ))
                     }
                     InMemLogStoreItem::Barrier {
-                        is_checkpoint,
                         next_epoch,
+                        options,
                     } => {
-                        if is_checkpoint {
+                        if options.is_checkpoint {
                             self.epoch_progress = AwaitingTruncate {
                                 next_epoch,
                                 sealed_epoch: current_epoch,
@@ -181,12 +187,15 @@ impl LogReader for BoundedInMemLogStoreReader {
                         self.latest_offset = TruncateOffset::Barrier {
                             epoch: current_epoch,
                         };
-                        Ok((current_epoch, LogStoreReadItem::Barrier { is_checkpoint }))
+                        Ok((
+                            current_epoch,
+                            LogStoreReadItem::Barrier {
+                                is_checkpoint: options.is_checkpoint,
+                                new_vnode_bitmap: options.new_vnode_bitmap,
+                                is_stop: options.is_stop,
+                            },
+                        ))
                     }
-                    InMemLogStoreItem::UpdateVnodeBitmap(vnode_bitmap) => Ok((
-                        current_epoch,
-                        LogStoreReadItem::UpdateVnodeBitmap(vnode_bitmap),
-                    )),
                 },
                 AwaitingTruncate { .. } => Err(anyhow!(
                     "should not call next_item on checkpoint barrier for in-mem log store"
@@ -196,7 +205,7 @@ impl LogReader for BoundedInMemLogStoreReader {
         }
     }
 
-    async fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
+    fn truncate(&mut self, offset: TruncateOffset) -> LogStoreResult<()> {
         // check the truncate offset is higher than prev truncate offset
         if self.truncate_offset >= offset {
             return Err(anyhow!(
@@ -219,23 +228,25 @@ impl LogReader for BoundedInMemLogStoreReader {
             sealed_epoch,
             next_epoch,
         } = &self.epoch_progress
+            && let TruncateOffset::Barrier { epoch } = offset
+            && epoch == *sealed_epoch
         {
-            if let TruncateOffset::Barrier { epoch } = offset
-                && epoch == *sealed_epoch
-            {
-                let sealed_epoch = *sealed_epoch;
-                self.epoch_progress = Consuming(*next_epoch);
-                self.truncated_epoch_tx
-                    .send(sealed_epoch)
-                    .map_err(|_| anyhow!("unable to send sealed epoch"))?;
-            }
+            let sealed_epoch = *sealed_epoch;
+            self.epoch_progress = Consuming(*next_epoch);
+            self.truncated_epoch_tx
+                .send(sealed_epoch)
+                .map_err(|_| anyhow!("unable to send sealed epoch"))?;
         }
         self.truncate_offset = offset;
         Ok(())
     }
 
-    async fn rewind(&mut self) -> LogStoreResult<(bool, Option<Bitmap>)> {
-        Ok((false, None))
+    async fn rewind(&mut self) -> LogStoreResult<()> {
+        Err(anyhow!("should not call rewind on it"))
+    }
+
+    async fn start_from(&mut self, _start_offset: Option<u64>) -> LogStoreResult<()> {
+        Ok(())
     }
 }
 
@@ -256,6 +267,7 @@ impl LogWriter for BoundedInMemLogStoreWriter {
     async fn write_chunk(&mut self, chunk: StreamChunk) -> LogStoreResult<()> {
         self.item_tx
             .send(InMemLogStoreItem::StreamChunk(chunk))
+            .instrument_await("in_mem_send_item_chunk")
             .await
             .map_err(|_| anyhow!("unable to send stream chunk"))?;
         Ok(())
@@ -264,13 +276,15 @@ impl LogWriter for BoundedInMemLogStoreWriter {
     async fn flush_current_epoch(
         &mut self,
         next_epoch: u64,
-        is_checkpoint: bool,
-    ) -> LogStoreResult<()> {
+        options: FlushCurrentEpochOptions,
+    ) -> LogStoreResult<LogWriterPostFlushCurrentEpoch<'_>> {
+        let is_checkpoint = options.is_checkpoint;
         self.item_tx
             .send(InMemLogStoreItem::Barrier {
                 next_epoch,
-                is_checkpoint,
+                options,
             })
+            .instrument_await("in_mem_send_item_barrier")
             .await
             .map_err(|_| anyhow!("unable to send barrier"))?;
 
@@ -283,19 +297,15 @@ impl LogWriter for BoundedInMemLogStoreWriter {
             let truncated_epoch = self
                 .truncated_epoch_rx
                 .recv()
+                .instrument_await("in_mem_recv_truncated_epoch")
                 .await
                 .ok_or_else(|| anyhow!("cannot get truncated epoch"))?;
             assert_eq!(truncated_epoch, prev_epoch);
         }
 
-        Ok(())
-    }
-
-    async fn update_vnode_bitmap(&mut self, new_vnodes: Arc<Bitmap>) -> LogStoreResult<()> {
-        self.item_tx
-            .send(InMemLogStoreItem::UpdateVnodeBitmap(new_vnodes))
-            .await
-            .map_err(|_| anyhow!("unable to send vnode bitmap"))
+        Ok(LogWriterPostFlushCurrentEpoch::new(move || {
+            async move { Ok(()) }.boxed()
+        }))
     }
 
     fn pause(&mut self) -> LogStoreResult<()> {
@@ -315,37 +325,40 @@ mod tests {
     use std::task::Poll;
 
     use futures::FutureExt;
-    use risingwave_common::array::Op;
+    use risingwave_common::array::{Op, StreamChunkBuilder};
     use risingwave_common::types::{DataType, ScalarImpl};
-    use risingwave_common::util::epoch::EpochPair;
+    use risingwave_common::util::epoch::{EpochPair, test_epoch};
     use risingwave_connector::sink::log_store::{
         LogReader, LogStoreFactory, LogStoreReadItem, LogWriter, TruncateOffset,
     };
 
     use crate::common::log_store_impl::in_mem::BoundedInMemLogStoreFactory;
-    use crate::common::StreamChunkBuilder;
+    use crate::common::log_store_impl::kv_log_store::test_utils::LogWriterTestExt;
 
     #[tokio::test]
     async fn test_in_memory_log_store() {
         let factory = BoundedInMemLogStoreFactory::new(4);
         let (mut reader, mut writer) = factory.build().await;
 
-        let init_epoch = 233;
-        let epoch1 = init_epoch + 1;
-        let epoch2 = init_epoch + 2;
+        let init_epoch = test_epoch(1);
+        let epoch1 = test_epoch(2);
+        let epoch2 = test_epoch(3);
 
         let ops = vec![Op::Insert, Op::Delete, Op::UpdateInsert, Op::UpdateDelete];
-        let mut builder = StreamChunkBuilder::new(10000, vec![DataType::Int64, DataType::Varchar]);
+        let mut builder =
+            StreamChunkBuilder::unlimited(vec![DataType::Int64, DataType::Varchar], None);
         for (i, op) in ops.into_iter().enumerate() {
-            assert!(builder
-                .append_row(
-                    op,
-                    [
-                        Some(ScalarImpl::Int64(i as i64)),
-                        Some(ScalarImpl::Utf8(format!("name_{}", i).into_boxed_str()))
-                    ]
-                )
-                .is_none());
+            assert!(
+                builder
+                    .append_row(
+                        op,
+                        [
+                            Some(ScalarImpl::Int64(i as i64)),
+                            Some(ScalarImpl::Utf8(format!("name_{}", i).into_boxed_str()))
+                        ]
+                    )
+                    .is_none()
+            );
         }
         let stream_chunk = builder.take().unwrap();
         let stream_chunk_clone = stream_chunk.clone();
@@ -363,9 +376,15 @@ mod tests {
                 .write_chunk(stream_chunk_clone.clone())
                 .await
                 .unwrap();
-            writer.flush_current_epoch(epoch1, false).await.unwrap();
+            writer
+                .flush_current_epoch_for_test(epoch1, false)
+                .await
+                .unwrap();
             writer.write_chunk(stream_chunk_clone).await.unwrap();
-            writer.flush_current_epoch(epoch2, true).await.unwrap();
+            writer
+                .flush_current_epoch_for_test(epoch2, true)
+                .await
+                .unwrap();
         });
 
         reader.init().await.unwrap();
@@ -388,7 +407,7 @@ mod tests {
         };
 
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert!(!is_checkpoint);
                 assert_eq!(epoch, init_epoch);
             }
@@ -405,7 +424,7 @@ mod tests {
         };
 
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert!(is_checkpoint);
                 assert_eq!(epoch, epoch1);
             }
@@ -417,24 +436,25 @@ mod tests {
                 epoch: init_epoch,
                 chunk_id: chunk_id1_2,
             })
-            .await
             .unwrap();
-        assert!(poll_fn(|cx| Poll::Ready(join_handle.poll_unpin(cx)))
-            .await
-            .is_pending());
+        assert!(
+            poll_fn(|cx| Poll::Ready(join_handle.poll_unpin(cx)))
+                .await
+                .is_pending()
+        );
         reader
             .truncate(TruncateOffset::Chunk {
                 epoch: epoch1,
                 chunk_id: chunk_id2_1,
             })
-            .await
             .unwrap();
-        assert!(poll_fn(|cx| Poll::Ready(join_handle.poll_unpin(cx)))
-            .await
-            .is_pending());
+        assert!(
+            poll_fn(|cx| Poll::Ready(join_handle.poll_unpin(cx)))
+                .await
+                .is_pending()
+        );
         reader
             .truncate(TruncateOffset::Barrier { epoch: epoch1 })
-            .await
             .unwrap();
         join_handle.await.unwrap();
     }

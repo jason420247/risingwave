@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,13 @@
  * @type {import('next').NextConfig}
  */
 const nextConfig = {
+  output: "export",
   trailingSlash: true,
+  eslint: {
+    // We have a separate step for running ESLint in CI.
+    // Ignore to skip the development dependency on `eslint` for production builds.
+    ignoreDuringBuilds: true,
+  },
 }
 
 module.exports = nextConfig

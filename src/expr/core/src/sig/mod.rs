@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,22 +21,26 @@ use std::sync::LazyLock;
 
 use itertools::Itertools;
 use risingwave_common::types::DataType;
+use risingwave_pb::expr::agg_call::PbKind as PbAggKind;
 use risingwave_pb::expr::expr_node::PbType as ScalarFunctionType;
 use risingwave_pb::expr::table_function::PbType as TableFunctionType;
 
-use crate::aggregate::{AggCall, AggKind as AggregateFunctionType, BoxedAggregateFunction};
+use crate::ExprError;
+use crate::aggregate::{AggCall, BoxedAggregateFunction};
 use crate::error::Result;
 use crate::expr::BoxedExpression;
 use crate::table_function::BoxedTableFunction;
-use crate::ExprError;
+
+mod udf;
+
+pub use self::udf::*;
 
 /// The global registry of all function signatures.
-pub static FUNCTION_REGISTRY: LazyLock<FunctionRegistry> = LazyLock::new(|| unsafe {
-    // SAFETY: this function is called after all `#[ctor]` functions are called.
+pub static FUNCTION_REGISTRY: LazyLock<FunctionRegistry> = LazyLock::new(|| {
     let mut map = FunctionRegistry::default();
-    tracing::info!("found {} functions", FUNCTION_REGISTRY_INIT.len());
-    for sig in FUNCTION_REGISTRY_INIT.drain(..) {
-        map.insert(sig);
+    tracing::info!("found {} functions", FUNCTIONS.len());
+    for f in FUNCTIONS {
+        map.insert(f());
     }
     map
 });
@@ -109,9 +113,38 @@ impl FunctionRegistry {
         name: impl Into<FuncName>,
         args: &[DataType],
         ret: &DataType,
-    ) -> Option<&FuncSign> {
-        let v = self.0.get(&name.into())?;
-        v.iter().find(|d| d.match_args_ret(args, ret))
+    ) -> Result<&FuncSign, ExprError> {
+        let name = name.into();
+        let err = |candidates: &Vec<FuncSign>| {
+            // Note: if we return error here, it probably means there is a bug in frontend type inference,
+            // because such error should be caught in the frontend.
+            ExprError::UnsupportedFunction(format!(
+                "{}({}) -> {}{}",
+                name,
+                args.iter().format(", "),
+                ret,
+                if candidates.is_empty() {
+                    "".to_owned()
+                } else {
+                    format!(
+                        "\nHINT: Supported functions:\n{}",
+                        candidates
+                            .iter()
+                            .map(|d| format!(
+                                "  {}({}) -> {}",
+                                d.name,
+                                d.inputs_type.iter().format(", "),
+                                d.ret_type
+                            ))
+                            .format("\n")
+                    )
+                }
+            ))
+        };
+        let v = self.0.get(&name).ok_or_else(|| err(&vec![]))?;
+        v.iter()
+            .find(|d| d.match_args_ret(args, ret))
+            .ok_or_else(|| err(v))
     }
 
     /// Returns all function signatures with the same type and number of arguments.
@@ -321,7 +354,7 @@ impl FuncSign {
 pub enum FuncName {
     Scalar(ScalarFunctionType),
     Table(TableFunctionType),
-    Aggregate(AggregateFunctionType),
+    Aggregate(PbAggKind),
     Udf(String),
 }
 
@@ -337,8 +370,8 @@ impl From<TableFunctionType> for FuncName {
     }
 }
 
-impl From<AggregateFunctionType> for FuncName {
-    fn from(ty: AggregateFunctionType) -> Self {
+impl From<PbAggKind> for FuncName {
+    fn from(ty: PbAggKind) -> Self {
         Self::Aggregate(ty)
     }
 }
@@ -355,7 +388,7 @@ impl FuncName {
         match self {
             Self::Scalar(ty) => ty.as_str_name().into(),
             Self::Table(ty) => ty.as_str_name().into(),
-            Self::Aggregate(ty) => ty.to_protobuf().as_str_name().into(),
+            Self::Aggregate(ty) => ty.as_str_name().into(),
             Self::Udf(name) => name.clone().into(),
         }
     }
@@ -372,16 +405,16 @@ impl FuncName {
         }
     }
 
-    pub fn as_aggregate(&self) -> AggregateFunctionType {
+    pub fn as_aggregate(&self) -> PbAggKind {
         match self {
-            Self::Aggregate(ty) => *ty,
+            Self::Aggregate(kind) => *kind,
             _ => panic!("Expected an aggregate function"),
         }
     }
 }
 
 /// An extended data type that can be used to declare a function's argument or result type.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SigDataType {
     /// Exact data type
     Exact(DataType),
@@ -391,6 +424,11 @@ pub enum SigDataType {
     AnyArray,
     /// Accepts any struct data type
     AnyStruct,
+    /// TODO: not all type can be used as a map key.
+    AnyMap,
+    /// Vector of a certain size
+    /// Named without `Any` prefix to align with PostgreSQL
+    Vector,
 }
 
 impl From<DataType> for SigDataType {
@@ -406,6 +444,8 @@ impl std::fmt::Display for SigDataType {
             Self::Any => write!(f, "any"),
             Self::AnyArray => write!(f, "anyarray"),
             Self::AnyStruct => write!(f, "anystruct"),
+            Self::AnyMap => write!(f, "anymap"),
+            Self::Vector => write!(f, "vector"),
         }
     }
 }
@@ -418,6 +458,8 @@ impl SigDataType {
             Self::Any => true,
             Self::AnyArray => dt.is_array(),
             Self::AnyStruct => dt.is_struct(),
+            Self::AnyMap => dt.is_map(),
+            Self::Vector => matches!(dt, DataType::Vector(_)),
         }
     }
 
@@ -459,22 +501,6 @@ pub enum FuncBuilder {
     Udf,
 }
 
-/// Register a function into global registry.
-///
-/// # Safety
-///
-/// This function must be called sequentially.
-///
-/// It is designed to be used by `#[function]` macro.
-/// Users SHOULD NOT call this function.
-#[doc(hidden)]
-pub unsafe fn _register(sig: FuncSign) {
-    FUNCTION_REGISTRY_INIT.push(sig)
-}
-
-/// The global registry of function signatures on initialization.
-///
-/// `#[function]` macro will generate a `#[ctor]` function to register the signature into this
-/// vector. The calls are guaranteed to be sequential. The vector will be drained and moved into
-/// `FUNCTION_REGISTRY` on the first access of `FUNCTION_REGISTRY`.
-static mut FUNCTION_REGISTRY_INIT: Vec<FuncSign> = Vec::new();
+/// A static distributed slice of functions defined by `#[function]`.
+#[linkme::distributed_slice]
+pub static FUNCTIONS: [fn() -> FuncSign];

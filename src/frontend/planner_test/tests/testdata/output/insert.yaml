@@ -80,7 +80,11 @@
   sql: |
     create table t (v1 real, v2 int);
     insert into t values (22.33, true);
-  binder_error: 'Bind error: cannot cast type "boolean" to "integer" in Assign context'
+  binder_error: |
+    failed to cast the 2nd column
+
+    Caused by:
+      cannot cast type "boolean" to "integer" in Assign context
 - name: simple insert
   sql: |
     create table t (v1 int, v2 int);
@@ -175,7 +179,11 @@
   sql: |
     create table t (v1 timestamp, v2 real);
     insert into t select time '01:02:03', 4.5 from t;
-  binder_error: 'Bind error: cannot cast type "time without time zone" to "timestamp without time zone" in Assign context'
+  binder_error: |
+    failed to cast the 1st column
+
+    Caused by:
+      cannot cast type "time without time zone" to "timestamp without time zone" in Assign context
 - name: insert into select mismatch columns length
   sql: |
     create table t (v1 int, v2 real);
@@ -231,7 +239,7 @@
     └─LogicalInsert { table: t, returning: true, mapping: [0:0, 1:1] }
       └─LogicalAgg { group_key: [t.a, t.b], aggs: [] }
         └─LogicalProject { exprs: [t.a, t.b] }
-          └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id] }
+          └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id, t._rw_timestamp] }
   batch_plan: |-
     BatchExchange { order: [], dist: Single }
     └─BatchProject { exprs: [a, b, a, (a + b) as $expr1] }
@@ -244,7 +252,11 @@
   sql: |
     create table t (a int, b int);
     insert into t values (0,1), (1,2) returning sum(a);
-  binder_error: 'Bind error: should not have agg/window in the `RETURNING` list'
+  binder_error: |
+    Failed to bind expression: sum(a)
+
+    Caused by:
+      Invalid input syntax: aggregate functions are not allowed in INSERT
 - name: insert and specify all columns with values
   sql: |
     create table t (a int, b int);
@@ -280,7 +292,7 @@
   logical_plan: |-
     LogicalInsert { table: t, mapping: [0:0], default: [1<-null:Int32] }
     └─LogicalProject { exprs: [t.b] }
-      └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id] }
+      └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id, t._rw_timestamp] }
   batch_plan: |-
     BatchExchange { order: [], dist: Single }
     └─BatchInsert { table: t, mapping: [0:0], default: [1<-null:Int32] }
@@ -305,7 +317,7 @@
     LogicalInsert { table: t, mapping: [0:0], default: [1<-null:Int32] }
     └─LogicalProject { exprs: [t.a] }
       └─LogicalProject { exprs: [t.a] }
-        └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id] }
+        └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id, t._rw_timestamp] }
   batch_plan: |-
     BatchExchange { order: [], dist: Single }
     └─BatchInsert { table: t, mapping: [0:0], default: [1<-null:Int32] }
@@ -330,5 +342,44 @@
     └─LogicalValues { rows: [[1:Int32]], schema: Schema { fields: [*VALUES*_0.column_0:Int32] } }
   batch_plan: |-
     BatchExchange { order: [], dist: Single }
-    └─BatchInsert { table: t, mapping: [0:0], default: [1<-(2:Int32 + 3:Int32)] }
+    └─BatchInsert { table: t, mapping: [0:0], default: [1<-5:Int32] }
       └─BatchValues { rows: [[1:Int32]] }
+- name: distributed insert
+  sql: |
+    set batch_enable_distributed_dml = true;
+    create table t (a int, b int);
+    insert into t select * from t;
+  batch_distributed_plan: |-
+    BatchSimpleAgg { aggs: [sum()] }
+    └─BatchExchange { order: [], dist: Single }
+      └─BatchInsert { table: t, mapping: [0:0, 1:1] }
+        └─BatchExchange { order: [], dist: HashShard(t.a, t.b) }
+          └─BatchScan { table: t, columns: [t.a, t.b], distribution: SomeShard }
+- name: test binding for insert select issue 15594
+  sql: |
+    create table t (a int);
+    create table t2 (b int);
+    insert into t select 1 as a from t2 group by a;
+  batch_plan: |-
+    BatchExchange { order: [], dist: Single }
+    └─BatchInsert { table: t, mapping: [0:0] }
+      └─BatchExchange { order: [], dist: Single }
+        └─BatchProject { exprs: [1:Int32] }
+          └─BatchHashAgg { group_key: [1:Int32], aggs: [] }
+            └─BatchExchange { order: [], dist: HashShard(1:Int32) }
+              └─BatchProject { exprs: [1:Int32] }
+                └─BatchScan { table: t2, columns: [], distribution: SomeShard }
+- name: test binding for insert select issue 15594
+  sql: |
+    create table t (a int);
+    create table t2 (b int);
+    insert into t select 1 as a from t2 group by a returning a;
+  batch_plan: |-
+    BatchExchange { order: [], dist: Single }
+    └─BatchInsert { table: t, returning: true, mapping: [0:0] }
+      └─BatchExchange { order: [], dist: Single }
+        └─BatchProject { exprs: [1:Int32] }
+          └─BatchHashAgg { group_key: [1:Int32], aggs: [] }
+            └─BatchExchange { order: [], dist: HashShard(1:Int32) }
+              └─BatchProject { exprs: [1:Int32] }
+                └─BatchScan { table: t2, columns: [], distribution: SomeShard }

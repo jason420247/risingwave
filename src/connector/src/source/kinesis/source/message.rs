@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,36 +13,34 @@
 // limitations under the License.
 
 use aws_sdk_kinesis::types::Record;
+use aws_smithy_types::DateTime;
+use aws_smithy_types_convert::date_time::DateTimeExt;
+use risingwave_common::types::{DatumRef, ScalarRefImpl};
 
 use crate::source::{SourceMessage, SourceMeta, SplitId};
 
 #[derive(Clone, Debug)]
-pub struct KinesisMessage {
-    pub shard_id: SplitId,
-    pub sequence_number: String,
-    pub partition_key: String,
-    pub payload: Vec<u8>,
+pub struct KinesisMeta {
+    // from `approximate_arrival_timestamp` of type `Option<aws_smithy_types::DateTime>`
+    timestamp: Option<DateTime>,
 }
 
-impl From<KinesisMessage> for SourceMessage {
-    fn from(msg: KinesisMessage) -> Self {
-        SourceMessage {
-            key: Some(msg.partition_key.into_bytes()),
-            payload: Some(msg.payload),
-            offset: msg.sequence_number.clone(),
-            split_id: msg.shard_id,
-            meta: SourceMeta::Empty,
-        }
+impl KinesisMeta {
+    pub fn extract_timestamp(&self) -> DatumRef<'_> {
+        Some(ScalarRefImpl::Timestamptz(
+            self.timestamp?.to_chrono_utc().ok()?.into(),
+        ))
     }
 }
 
-impl KinesisMessage {
-    pub fn new(shard_id: SplitId, message: Record) -> Self {
-        KinesisMessage {
-            shard_id,
-            sequence_number: message.sequence_number,
-            partition_key: message.partition_key,
-            payload: message.data.into_inner(),
-        }
+pub fn from_kinesis_record(value: &Record, split_id: SplitId) -> SourceMessage {
+    SourceMessage {
+        key: Some(value.partition_key.clone().into_bytes()),
+        payload: Some(value.data.clone().into_inner()),
+        offset: value.sequence_number.clone(),
+        split_id,
+        meta: SourceMeta::Kinesis(KinesisMeta {
+            timestamp: value.approximate_arrival_timestamp,
+        }),
     }
 }

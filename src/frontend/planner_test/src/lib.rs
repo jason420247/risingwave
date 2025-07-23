@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,25 +21,26 @@ risingwave_expr_impl::enable!();
 
 mod resolve_id;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 pub use resolve_id::*;
 use risingwave_frontend::handler::util::SourceSchemaCompatExt;
 use risingwave_frontend::handler::{
-    create_index, create_mv, create_schema, create_source, create_table, create_view, drop_table,
-    explain, variable, HandlerArgs,
+    HandlerArgs, create_index, create_mv, create_schema, create_source, create_table, create_view,
+    drop_table, explain, variable,
 };
+use risingwave_frontend::optimizer::backfill_order_strategy::explain_backfill_order_in_dot_format;
 use risingwave_frontend::session::SessionImpl;
-use risingwave_frontend::test_utils::{create_proto_file, get_explain_output, LocalFrontend};
+use risingwave_frontend::test_utils::{LocalFrontend, create_proto_file, get_explain_output};
 use risingwave_frontend::{
-    build_graph, explain_stream_graph, Binder, Explain, FrontendOpts, OptimizerContext,
-    OptimizerContextRef, PlanRef, Planner, WithOptions,
+    Binder, Explain, FrontendOpts, OptimizerContext, OptimizerContextRef, PlanRef, Planner,
+    WithOptionsSecResolved, build_graph, explain_stream_graph,
 };
 use risingwave_sqlparser::ast::{
-    AstOption, DropMode, EmitMode, ExplainOptions, ObjectName, Statement,
+    AstOption, BackfillOrderStrategy, DropMode, EmitMode, ExplainOptions, ObjectName, Statement,
 };
 use risingwave_sqlparser::parser::Parser;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,8 @@ pub enum TestType {
     BatchPlanProto,
     /// Batch plan for local execution `.gen_batch_local_plan()`
     BatchLocalPlan,
+    /// Batch plan for local execution `.gen_batch_distributed_plan()`
+    BatchDistributedPlan,
 
     /// Create MV plan `.gen_create_mv_plan()`
     StreamPlan,
@@ -76,6 +79,8 @@ pub enum TestType {
     EowcStreamPlan,
     /// Create MV fragments plan with EOWC semantics
     EowcStreamDistPlan,
+    /// Create Backfill Order Plan
+    BackfillOrderPlan,
 
     /// Create sink plan (assumes blackhole sink)
     /// TODO: Other sinks
@@ -201,6 +206,9 @@ pub struct TestCaseResult {
     /// Batch plan for local execution `.gen_batch_local_plan()`
     pub batch_local_plan: Option<String>,
 
+    /// Batch plan for distributed execution `.gen_batch_distributed_plan()`
+    pub batch_distributed_plan: Option<String>,
+
     /// Generate sink plan
     pub sink_plan: Option<String>,
 
@@ -215,6 +223,9 @@ pub struct TestCaseResult {
 
     /// Create MV fragments plan with EOWC semantics
     pub eowc_stream_dist_plan: Option<String>,
+
+    /// Create Backfill Order Plan
+    pub backfill_order_plan: Option<String>,
 
     /// Error of binder
     pub binder_error: Option<String>,
@@ -263,7 +274,7 @@ impl TestCase {
             frontend.session_ref()
         };
 
-        if let Some(ref config_map) = self.with_config_map() {
+        if let Some(config_map) = self.with_config_map() {
             for (key, val) in config_map {
                 session.set_config(key, val.to_owned()).unwrap();
             }
@@ -295,9 +306,11 @@ impl TestCase {
 
         let mut result = result.unwrap_or_default();
         result.input = self.input.clone();
-        result.create_source = self.create_source().clone();
-        result.create_table_with_connector = self.create_table_with_connector().clone();
-        result.with_config_map = self.with_config_map().clone();
+        result.create_source.clone_from(self.create_source());
+        result
+            .create_table_with_connector
+            .clone_from(self.create_table_with_connector());
+        result.with_config_map.clone_from(self.with_config_map());
 
         Ok(result)
     }
@@ -312,7 +325,7 @@ impl TestCase {
         let object_to_create = if is_table { "TABLE" } else { "SOURCE" };
         format!(
             r#"CREATE {} {}
-    WITH (connector = 'kafka', kafka.topic = 'abc', kafka.servers = 'localhost:1001')
+    WITH (connector = 'kafka', kafka.topic = 'abc', kafka.brokers = 'localhost:1001')
     FORMAT {} ENCODE {} (message = '.test.TestRecord', schema.location = 'file://"#,
             object_to_create, connector_name, connector_format, connector_encode
         )
@@ -420,26 +433,36 @@ impl TestCase {
                     columns,
                     constraints,
                     if_not_exists,
-                    source_schema,
+                    format_encode,
                     source_watermarks,
                     append_only,
+                    on_conflict,
+                    with_version_column,
                     cdc_table_info,
                     include_column_options,
+                    wildcard_idx,
+                    webhook_info,
+                    engine,
                     ..
                 } => {
-                    let source_schema = source_schema.map(|schema| schema.into_v2_with_warning());
+                    let format_encode = format_encode.map(|schema| schema.into_v2_with_warning());
 
                     create_table::handle_create_table(
                         handler_args,
                         name,
                         columns,
+                        wildcard_idx,
                         constraints,
                         if_not_exists,
-                        source_schema,
+                        format_encode,
                         source_watermarks,
                         append_only,
+                        on_conflict,
+                        with_version_column.map(|x| x.real_value()),
                         cdc_table_info,
                         include_column_options,
+                        webhook_info,
+                        engine,
                     )
                     .await?;
                 }
@@ -555,9 +578,15 @@ impl TestCase {
                 Statement::CreateSchema {
                     schema_name,
                     if_not_exists,
+                    owner,
                 } => {
-                    create_schema::handle_create_schema(handler_args, schema_name, if_not_exists)
-                        .await?;
+                    create_schema::handle_create_schema(
+                        handler_args,
+                        schema_name,
+                        if_not_exists,
+                        owner,
+                    )
+                    .await?;
                 }
                 _ => return Err(anyhow!("Unsupported statement type")),
             }
@@ -584,14 +613,15 @@ impl TestCase {
             }
         };
 
-        let mut planner = Planner::new(context.clone());
+        let mut planner = Planner::new_for_stream(context.clone());
 
-        let mut logical_plan = match planner.plan(bound) {
-            Ok(logical_plan) => {
+        let plan_root = match planner.plan(bound) {
+            Ok(plan_root) => {
                 if self.expected_outputs.contains(&TestType::LogicalPlan) {
-                    ret.logical_plan = Some(explain_plan(&logical_plan.clone().into_subplan()));
+                    ret.logical_plan =
+                        Some(explain_plan(&plan_root.clone().into_unordered_subplan()));
                 }
-                logical_plan
+                plan_root
             }
             Err(err) => {
                 ret.planner_error = Some(err.to_report_string_pretty());
@@ -604,8 +634,9 @@ impl TestCase {
             .contains(&TestType::OptimizedLogicalPlanForBatch)
             || self.expected_outputs.contains(&TestType::OptimizerError)
         {
+            let plan_root = plan_root.clone();
             let optimized_logical_plan_for_batch =
-                match logical_plan.gen_optimized_logical_plan_for_batch() {
+                match plan_root.gen_optimized_logical_plan_for_batch() {
                     Ok(optimized_logical_plan_for_batch) => optimized_logical_plan_for_batch,
                     Err(err) => {
                         ret.optimizer_error = Some(err.to_report_string_pretty());
@@ -619,7 +650,7 @@ impl TestCase {
                 .contains(&TestType::OptimizedLogicalPlanForBatch)
             {
                 ret.optimized_logical_plan_for_batch =
-                    Some(explain_plan(&optimized_logical_plan_for_batch));
+                    Some(explain_plan(&optimized_logical_plan_for_batch.plan));
             }
         }
 
@@ -628,8 +659,9 @@ impl TestCase {
             .contains(&TestType::OptimizedLogicalPlanForStream)
             || self.expected_outputs.contains(&TestType::OptimizerError)
         {
+            let plan_root = plan_root.clone();
             let optimized_logical_plan_for_stream =
-                match logical_plan.gen_optimized_logical_plan_for_stream() {
+                match plan_root.gen_optimized_logical_plan_for_stream() {
                     Ok(optimized_logical_plan_for_stream) => optimized_logical_plan_for_stream,
                     Err(err) => {
                         ret.optimizer_error = Some(err.to_report_string_pretty());
@@ -643,20 +675,18 @@ impl TestCase {
                 .contains(&TestType::OptimizedLogicalPlanForStream)
             {
                 ret.optimized_logical_plan_for_stream =
-                    Some(explain_plan(&optimized_logical_plan_for_stream));
+                    Some(explain_plan(&optimized_logical_plan_for_stream.plan));
             }
         }
 
         'batch: {
-            // if self.batch_plan.is_some()
-            //     || self.batch_plan_proto.is_some()
-            //     || self.batch_error.is_some()
             if self.expected_outputs.contains(&TestType::BatchPlan)
                 || self.expected_outputs.contains(&TestType::BatchPlanProto)
                 || self.expected_outputs.contains(&TestType::BatchError)
             {
-                let batch_plan = match logical_plan.gen_batch_plan() {
-                    Ok(batch_plan) => match logical_plan.gen_batch_distributed_plan(batch_plan) {
+                let plan_root = plan_root.clone();
+                let batch_plan = match plan_root.gen_batch_plan() {
+                    Ok(batch_plan) => match batch_plan.gen_batch_distributed_plan() {
                         Ok(batch_plan) => batch_plan,
                         Err(err) => {
                             ret.batch_error = Some(err.to_report_string_pretty());
@@ -677,7 +707,7 @@ impl TestCase {
                 // Only generate batch_plan_proto if it is specified in test case
                 if self.expected_outputs.contains(&TestType::BatchPlanProto) {
                     ret.batch_plan_proto = Some(serde_yaml::to_string(
-                        &batch_plan.to_batch_prost_identity(false),
+                        &batch_plan.to_batch_prost_identity(false)?,
                     )?);
                 }
             }
@@ -687,8 +717,9 @@ impl TestCase {
             if self.expected_outputs.contains(&TestType::BatchLocalPlan)
                 || self.expected_outputs.contains(&TestType::BatchError)
             {
-                let batch_plan = match logical_plan.gen_batch_plan() {
-                    Ok(batch_plan) => match logical_plan.gen_batch_local_plan(batch_plan) {
+                let plan_root = plan_root.clone();
+                let batch_plan = match plan_root.gen_batch_plan() {
+                    Ok(batch_plan) => match batch_plan.gen_batch_local_plan() {
                         Ok(batch_plan) => batch_plan,
                         Err(err) => {
                             ret.batch_error = Some(err.to_report_string_pretty());
@@ -704,6 +735,37 @@ impl TestCase {
                 // Only generate batch_plan if it is specified in test case
                 if self.expected_outputs.contains(&TestType::BatchLocalPlan) {
                     ret.batch_local_plan = Some(explain_plan(&batch_plan));
+                }
+            }
+        }
+
+        'distributed_batch: {
+            if self
+                .expected_outputs
+                .contains(&TestType::BatchDistributedPlan)
+                || self.expected_outputs.contains(&TestType::BatchError)
+            {
+                let plan_root = plan_root.clone();
+                let batch_plan = match plan_root.gen_batch_plan() {
+                    Ok(batch_plan) => match batch_plan.gen_batch_distributed_plan() {
+                        Ok(batch_plan) => batch_plan,
+                        Err(err) => {
+                            ret.batch_error = Some(err.to_report_string_pretty());
+                            break 'distributed_batch;
+                        }
+                    },
+                    Err(err) => {
+                        ret.batch_error = Some(err.to_report_string_pretty());
+                        break 'distributed_batch;
+                    }
+                };
+
+                // Only generate batch_plan if it is specified in test case
+                if self
+                    .expected_outputs
+                    .contains(&TestType::BatchDistributedPlan)
+                {
+                    ret.batch_distributed_plan = Some(explain_plan(&batch_plan));
                 }
             }
         }
@@ -749,7 +811,7 @@ impl TestCase {
                     return Err(anyhow!("expect a query"));
                 };
 
-                let stream_plan = match create_mv::gen_create_mv_plan(
+                let (stream_plan, table) = match create_mv::gen_create_mv_plan(
                     &session,
                     context.clone(),
                     q,
@@ -757,7 +819,7 @@ impl TestCase {
                     vec![],
                     Some(emit_mode),
                 ) {
-                    Ok((stream_plan, _)) => stream_plan,
+                    Ok(r) => r,
                     Err(err) => {
                         *ret_error_str = Some(err.to_report_string_pretty());
                         continue;
@@ -771,28 +833,50 @@ impl TestCase {
 
                 // Only generate stream_dist_plan if it is specified in test case
                 if dist_plan {
-                    let graph = build_graph(stream_plan);
-                    *ret_dist_plan_str = Some(explain_stream_graph(&graph, false));
+                    let graph = build_graph(stream_plan.clone(), None)?;
+                    *ret_dist_plan_str =
+                        Some(explain_stream_graph(&graph, Some(table.to_prost()), false));
+                }
+
+                if self.expected_outputs.contains(&TestType::BackfillOrderPlan) {
+                    match explain_backfill_order_in_dot_format(
+                        &session,
+                        BackfillOrderStrategy::Auto,
+                        stream_plan,
+                    ) {
+                        Ok(formatted_order_plan) => {
+                            ret.backfill_order_plan = Some(formatted_order_plan);
+                        }
+                        Err(err) => {
+                            *ret_error_str = Some(err.to_report_string_pretty());
+                        }
+                    }
                 }
             }
         }
 
         'sink: {
             if self.expected_outputs.contains(&TestType::SinkPlan) {
+                let plan_root = plan_root.clone();
                 let sink_name = "sink_test";
-                let mut options = HashMap::new();
-                options.insert("connector".to_string(), "blackhole".to_string());
-                options.insert("type".to_string(), "append-only".to_string());
-                let options = WithOptions::new(options);
+                let mut options = BTreeMap::new();
+                options.insert("connector".to_owned(), "blackhole".to_owned());
+                options.insert("type".to_owned(), "append-only".to_owned());
+                // let options = WithOptionsSecResolved::without_secrets(options);
+                let options = WithOptionsSecResolved::without_secrets(options);
                 let format_desc = (&options).try_into().unwrap();
-                match logical_plan.gen_sink_plan(
-                    sink_name.to_string(),
+                match plan_root.gen_sink_plan(
+                    sink_name.to_owned(),
                     format!("CREATE SINK {sink_name} AS {}", stmt),
                     options,
                     false,
                     "test_db".into(),
                     "test_table".into(),
                     format_desc,
+                    false,
+                    None,
+                    None,
+                    false,
                     None,
                 ) {
                     Ok(sink_plan) => {
@@ -874,17 +958,17 @@ pub async fn run_test_file(file_path: &Path, file_content: &str) -> Result<()> {
 
     let mut failed_num = 0;
     let cases: Vec<TestCase> = serde_yaml::from_str(file_content).map_err(|e| {
-        if let Some(loc) = e.location() {
-            anyhow!(
-                "failed to parse yaml: {}, at {}:{}:{}",
-                e.as_report(),
+        let context = if let Some(loc) = e.location() {
+            format!(
+                "failed to parse yaml at {}:{}:{}",
                 file_path.display(),
                 loc.line(),
                 loc.column()
             )
         } else {
-            anyhow!("failed to parse yaml: {}", e.as_report())
-        }
+            "failed to parse yaml".to_owned()
+        };
+        anyhow::anyhow!(e).context(context)
     })?;
     let cases = resolve_testcase_id(cases).expect("failed to resolve");
     let mut outputs = vec![];
@@ -892,7 +976,7 @@ pub async fn run_test_file(file_path: &Path, file_content: &str) -> Result<()> {
     for (i, c) in cases.into_iter().enumerate() {
         println!(
             "Running test #{i} (id: {}), SQL:\n{}",
-            c.id().clone().unwrap_or_else(|| "<none>".to_string()),
+            c.id().clone().unwrap_or_else(|| "<none>".to_owned()),
             c.sql()
         );
         match c.run(true).await {
@@ -902,9 +986,9 @@ pub async fn run_test_file(file_path: &Path, file_content: &str) -> Result<()> {
             Err(e) => {
                 eprintln!(
                     "Test #{i} (id: {}) failed, SQL:\n{}\nError: {}",
-                    c.id().clone().unwrap_or_else(|| "<none>".to_string()),
+                    c.id().clone().unwrap_or_else(|| "<none>".to_owned()),
                     c.sql(),
-                    e
+                    e.as_report()
                 );
                 failed_num += 1;
             }

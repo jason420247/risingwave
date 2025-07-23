@@ -7,12 +7,6 @@ keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
-
 [dependencies]
 anyhow = "1"
 assert_matches = "1"
@@ -22,24 +16,28 @@ either = "1"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-async-stream = { workspace = true }
 futures-util = "0.3"
-hashbrown = { workspace = true }
-hytra = "0.1.2"
-itertools = "0.12"
+iceberg = { workspace = true }
+itertools = { workspace = true }
+linkme = { workspace = true }
 memcomparable = "0.2"
-parking_lot = { version = "0.12", features = ["arc_lock"] }
-paste = "1"
-prometheus = { version = "0.13", features = ["process"] }
+mysql_async = { workspace = true }
+opendal = { workspace = true }
+panic-message = "0.3"
+parking_lot = { workspace = true }
+parquet = { workspace = true }
+prometheus = { version = "0.14", features = ["process"] }
+rand = { workspace = true }
 risingwave_common = { workspace = true }
 risingwave_connector = { workspace = true }
+risingwave_dml = { workspace = true }
 risingwave_expr = { workspace = true }
 risingwave_hummock_sdk = { workspace = true }
 risingwave_pb = { workspace = true }
 risingwave_rpc_client = { workspace = true }
-risingwave_source = { workspace = true }
 risingwave_storage = { workspace = true }
 scopeguard = "1"
 serde_json = "1"
-thiserror = "1"
+thiserror = { workspace = true }
 thiserror-ext = { workspace = true }
 tokio = { version = "0.2", package = "madsim-tokio", features = [
     "rt",
@@ -50,57 +48,19 @@ tokio = { version = "0.2", package = "madsim-tokio", features = [
     "signal",
     "fs",
 ] }
-tokio-metrics = "0.3.0"
-tokio-stream = "0.1"
-tokio-util = { workspace = true }
+tokio-postgres = "0.7"
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tracing = "0.1"
-
-[target.'cfg(enable_task_local_alloc)'.dependencies]
-task_stats_alloc = { path = "../utils/task_stats_alloc" }
+twox-hash = "2"
 
 [target.'cfg(not(madsim))'.dependencies]
 workspace-hack = { path = "../workspace-hack" }
 
 [dev-dependencies]
-criterion = { workspace = true, features = ["async_tokio", "async"] }
-rand = "0.8"
-risingwave_expr_impl = { workspace = true }
-risingwave_hummock_sdk = { workspace = true, features = ["enable_test_epoch"] }
+rand = { workspace = true }
+risingwave_hummock_sdk = { workspace = true }
 tempfile = "3"
-tikv-jemallocator = { workspace = true }
-
-[[bench]]
-name = "filter"
-harness = false
-
-[[bench]]
-name = "nested_loop_join"
-harness = false
-
-[[bench]]
-name = "hash_join"
-harness = false
-
-[[bench]]
-name = "sort"
-harness = false
-
-[[bench]]
-name = "top_n"
-harness = false
-
-[[bench]]
-name = "hash_agg"
-harness = false
-
-[[bench]]
-name = "expand"
-harness = false
-
-[[bench]]
-name = "limit"
-harness = false
 
 [lints]
 workspace = true

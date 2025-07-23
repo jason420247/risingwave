@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 use std::iter;
 use std::mem::size_of;
 
-use risingwave_pb::common::buffer::CompressionType;
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::common::Buffer;
+use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::data::{ArrayType, PbArray};
 
 use super::{Array, ArrayBuilder, DataType};
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::EstimateSize;
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::util::iter_util::ZipEqDebug;
 
 /// `BytesArray` is a collection of Rust `[u8]`s.
@@ -38,9 +38,11 @@ impl Array for BytesArray {
     type RefItem<'a> = &'a [u8];
 
     unsafe fn raw_value_at_unchecked(&self, idx: usize) -> &[u8] {
-        let begin = *self.offset.get_unchecked(idx) as usize;
-        let end = *self.offset.get_unchecked(idx + 1) as usize;
-        self.data.get_unchecked(begin..end)
+        unsafe {
+            let begin = *self.offset.get_unchecked(idx) as usize;
+            let end = *self.offset.get_unchecked(idx + 1) as usize;
+            self.data.get_unchecked(begin..end)
+        }
     }
 
     fn len(&self) -> usize {
@@ -108,12 +110,6 @@ impl Array for BytesArray {
     }
 }
 
-impl BytesArray {
-    pub(super) fn data(&self) -> &[u8] {
-        &self.data
-    }
-}
-
 impl<'a> FromIterator<Option<&'a [u8]>> for BytesArray {
     fn from_iter<I: IntoIterator<Item = Option<&'a [u8]>>>(iter: I) -> Self {
         let iter = iter.into_iter();
@@ -148,19 +144,24 @@ pub struct BytesArrayBuilder {
 impl ArrayBuilder for BytesArrayBuilder {
     type ArrayType = BytesArray;
 
-    fn new(capacity: usize) -> Self {
-        let mut offset = Vec::with_capacity(capacity + 1);
+    /// Creates a new `BytesArrayBuilder`.
+    ///
+    /// `item_capacity` is the number of items to pre-allocate. The size of the preallocated
+    /// buffer of offsets is the number of items plus one.
+    /// No additional memory is pre-allocated for the data buffer.
+    fn new(item_capacity: usize) -> Self {
+        let mut offset = Vec::with_capacity(item_capacity + 1);
         offset.push(0);
         Self {
             offset,
-            data: Vec::with_capacity(capacity),
-            bitmap: BitmapBuilder::with_capacity(capacity),
+            data: Vec::with_capacity(0),
+            bitmap: BitmapBuilder::with_capacity(item_capacity),
         }
     }
 
-    fn with_type(capacity: usize, ty: DataType) -> Self {
+    fn with_type(item_capacity: usize, ty: DataType) -> Self {
         assert_eq!(ty, DataType::Bytea);
-        Self::new(capacity)
+        Self::new(item_capacity)
     }
 
     fn append_n<'a>(&'a mut self, n: usize, value: Option<&'a [u8]>) {
@@ -272,7 +273,7 @@ pub struct PartialBytesWriter<'a> {
     builder: &'a mut BytesArrayBuilder,
 }
 
-impl<'a> PartialBytesWriter<'a> {
+impl PartialBytesWriter<'_> {
     /// `write_ref` will append partial dirty data to `builder`.
     /// `PartialBytesWriter::write_ref` is different from `BytesWriter::write_ref`
     /// in that it allows us to call it multiple times.
@@ -288,7 +289,7 @@ impl<'a> PartialBytesWriter<'a> {
     }
 }
 
-impl<'a> Drop for PartialBytesWriter<'a> {
+impl Drop for PartialBytesWriter<'_> {
     fn drop(&mut self) {
         // If `finish` is not called, we should rollback the data.
         self.builder.rollback_partial();

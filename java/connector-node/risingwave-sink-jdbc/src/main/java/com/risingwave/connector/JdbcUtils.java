@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,8 +25,11 @@ import java.util.Properties;
 
 public abstract class JdbcUtils {
 
+    static final int CONNECTION_TIMEOUT = 30;
+    static final int SOCKET_TIMEOUT = 300;
+
     public static Optional<JdbcDialectFactory> getDialectFactory(String jdbcUrl) {
-        if (jdbcUrl.startsWith("jdbc:mysql")) {
+        if (jdbcUrl.startsWith("jdbc:mysql") || jdbcUrl.startsWith("jdbc:mariadb")) {
             return Optional.of(new MySqlDialectFactory());
         } else if (jdbcUrl.startsWith("jdbc:postgresql")) {
             return Optional.of(new PostgresDialectFactory());
@@ -36,16 +39,33 @@ public abstract class JdbcUtils {
     }
 
     /** The connection returned by this method is *not* autoCommit */
-    public static Connection getConnection(String jdbcUrl) throws SQLException {
+    public static Connection getConnection(
+            String jdbcUrl, String user, String password, boolean autoCommit) throws SQLException {
         var props = new Properties();
         // enable TCP keep alive to avoid connection closed by server
         // both MySQL and PG support this property
         // https://jdbc.postgresql.org/documentation/use/
         // https://dev.mysql.com/doc/connectors/en/connector-j-connp-props-networking.html#cj-conn-prop_tcpKeepAlive
         props.setProperty("tcpKeepAlive", "true");
+
+        // default timeout in seconds
+        boolean isPg = jdbcUrl.startsWith("jdbc:postgresql");
+
+        // postgres use seconds and mysql use milliseconds
+        int connectTimeout = isPg ? CONNECTION_TIMEOUT : CONNECTION_TIMEOUT * 1000;
+        int socketTimeout = isPg ? SOCKET_TIMEOUT : SOCKET_TIMEOUT * 1000;
+        props.setProperty("connectTimeout", String.valueOf(connectTimeout));
+        props.setProperty("socketTimeout", String.valueOf(socketTimeout));
+        if (user != null) {
+            props.put("user", user);
+        }
+        if (password != null) {
+            props.put("password", password);
+        }
+
         var conn = DriverManager.getConnection(jdbcUrl, props);
         // disable auto commit can improve performance
-        conn.setAutoCommit(false);
+        conn.setAutoCommit(autoCommit);
         // explicitly set isolation level to RC
         conn.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
         return conn;

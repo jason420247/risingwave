@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,8 @@
 use risingwave_pb::plan_common::JoinType;
 
 use super::{BoxedRule, Rule};
-use crate::optimizer::plan_node::{LogicalApply, LogicalDedup, LogicalFilter, PlanTreeNodeUnary};
 use crate::optimizer::PlanRef;
+use crate::optimizer::plan_node::{LogicalApply, LogicalDedup, LogicalFilter, PlanTreeNodeUnary};
 use crate::utils::Condition;
 
 /// Transpose `LogicalApply` and `LogicalDedup`.
@@ -57,7 +57,7 @@ impl Rule for ApplyDedupTransposeRule {
             return None;
         }
 
-        let new_apply = LogicalApply::new(
+        let new_apply = LogicalApply::create(
             left,
             dedup_input,
             JoinType::Inner,
@@ -65,8 +65,7 @@ impl Rule for ApplyDedupTransposeRule {
             correlated_id,
             correlated_indices,
             false,
-        )
-        .into();
+        );
 
         let new_dedup = {
             let mut new_dedup_cols: Vec<usize> = (0..apply_left_len).collect();

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 use itertools::Itertools;
 use risingwave_common::bail_not_implemented;
 use risingwave_common::catalog::{Field, Schema};
-use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_sqlparser::ast::Values;
@@ -23,7 +22,8 @@ use risingwave_sqlparser::ast::Values;
 use super::bind_context::Clause;
 use super::statement::RewriteExprsRecursive;
 use crate::binder::Binder;
-use crate::expr::{align_types, CorrelatedId, Depth, ExprImpl};
+use crate::error::{ErrorCode, Result};
+use crate::expr::{CorrelatedId, Depth, ExprImpl, align_types};
 
 #[derive(Debug, Clone)]
 pub struct BoundValues {
@@ -60,9 +60,14 @@ impl BoundValues {
         self.rows.iter_mut().flatten()
     }
 
-    pub fn is_correlated(&self, depth: Depth) -> bool {
+    pub fn is_correlated_by_depth(&self, depth: Depth) -> bool {
         self.exprs()
             .any(|expr| expr.has_correlated_input_ref_by_depth(depth))
+    }
+
+    pub fn is_correlated_by_correlated_id(&self, correlated_id: CorrelatedId) -> bool {
+        self.exprs()
+            .any(|expr| expr.has_correlated_input_ref_by_correlated_id(correlated_id))
     }
 
     pub fn collect_correlated_indices_by_depth_and_assign_id(
@@ -88,16 +93,16 @@ impl Binder {
     /// If values are shorter than expected, `NULL`s will be filled.
     pub(super) fn bind_values(
         &mut self,
-        values: Values,
-        expected_types: Option<Vec<DataType>>,
+        values: &Values,
+        expected_types: Option<&[DataType]>,
     ) -> Result<BoundValues> {
         assert!(!values.0.is_empty());
 
         self.context.clause = Some(Clause::Values);
-        let vec2d = values.0;
+        let vec2d = &values.0;
         let mut bound = vec2d
-            .into_iter()
-            .map(|vec| vec.into_iter().map(|expr| self.bind_expr(expr)).collect())
+            .iter()
+            .map(|vec| vec.iter().map(|expr| self.bind_expr(expr)).collect())
             .collect::<Result<Vec<Vec<_>>>>()?;
         self.context.clause = None;
 
@@ -113,10 +118,10 @@ impl Binder {
             Some(types) => {
                 bound = bound
                     .into_iter()
-                    .map(|vec| Self::cast_on_insert(&types.clone(), vec))
+                    .map(|vec| Self::cast_on_insert(types, vec))
                     .try_collect()?;
 
-                types
+                types.to_vec()
             }
             None => (0..num_columns)
                 .map(|col_index| align_types(bound.iter_mut().map(|row| &mut row[col_index])))
@@ -145,7 +150,7 @@ impl Binder {
         {
             bail_not_implemented!("Subquery in VALUES");
         }
-        if bound_values.is_correlated(1) {
+        if bound_values.is_correlated_by_depth(1) {
             bail_not_implemented!("CorrelatedInputRef in VALUES");
         }
         Ok(bound_values)
@@ -154,7 +159,7 @@ impl Binder {
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::util::iter_util::{zip_eq_fast, ZipEqFast};
+    use risingwave_common::util::iter_util::zip_eq_fast;
     use risingwave_sqlparser::ast::{Expr, Value};
 
     use super::*;
@@ -166,10 +171,10 @@ mod tests {
         let mut binder = mock_binder();
 
         // Test i32 -> decimal.
-        let expr1 = Expr::Value(Value::Number("1".to_string()));
-        let expr2 = Expr::Value(Value::Number("1.1".to_string()));
+        let expr1 = Expr::Value(Value::Number("1".to_owned()));
+        let expr2 = Expr::Value(Value::Number("1.1".to_owned()));
         let values = Values(vec![vec![expr1], vec![expr2]]);
-        let res = binder.bind_values(values, None).unwrap();
+        let res = binder.bind_values(&values, None).unwrap();
 
         let types = vec![DataType::Decimal];
         let n_cols = types.len();

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,37 +15,49 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use compact_task::PbTaskStatus;
 use futures::StreamExt;
 use itertools::Itertools;
-use risingwave_common::catalog::{TableId, NON_RESERVED_SYS_CATALOG_ID};
+use risingwave_common::catalog::{SYS_CATALOG_START_ID, TableId};
+use risingwave_hummock_sdk::HummockVersionId;
+use risingwave_hummock_sdk::key_range::KeyRange;
 use risingwave_hummock_sdk::version::HummockVersionDelta;
+use risingwave_meta::backup_restore::BackupManagerRef;
 use risingwave_meta::manager::MetadataManager;
+use risingwave_meta::manager::iceberg_compaction::IcebergCompactionManagerRef;
 use risingwave_pb::hummock::get_compaction_score_response::PickerInfo;
 use risingwave_pb::hummock::hummock_manager_service_server::HummockManagerService;
 use risingwave_pb::hummock::subscribe_compaction_event_request::Event as RequestEvent;
 use risingwave_pb::hummock::*;
+use risingwave_pb::iceberg_compaction::subscribe_iceberg_compaction_event_request::Event as IcebergRequestEvent;
+use risingwave_pb::iceberg_compaction::{
+    SubscribeIcebergCompactionEventRequest, SubscribeIcebergCompactionEventResponse,
+};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::hummock::compaction::selector::ManualCompactionOption;
-use crate::hummock::{HummockManagerRef, VacuumManagerRef};
 use crate::RwReceiverStream;
+use crate::hummock::HummockManagerRef;
+use crate::hummock::compaction::selector::ManualCompactionOption;
 
 pub struct HummockServiceImpl {
     hummock_manager: HummockManagerRef,
-    vacuum_manager: VacuumManagerRef,
     metadata_manager: MetadataManager,
+    backup_manager: BackupManagerRef,
+    iceberg_compaction_manager: IcebergCompactionManagerRef,
 }
 
 impl HummockServiceImpl {
     pub fn new(
         hummock_manager: HummockManagerRef,
-        vacuum_trigger: VacuumManagerRef,
         metadata_manager: MetadataManager,
+        backup_manager: BackupManagerRef,
+        iceberg_compaction_manager: IcebergCompactionManagerRef,
     ) -> Self {
         HummockServiceImpl {
             hummock_manager,
-            vacuum_manager: vacuum_trigger,
             metadata_manager,
+            backup_manager,
+            iceberg_compaction_manager,
         }
     }
 }
@@ -65,6 +77,8 @@ macro_rules! fields_to_kvs {
 #[async_trait::async_trait]
 impl HummockManagerService for HummockServiceImpl {
     type SubscribeCompactionEventStream = RwReceiverStream<SubscribeCompactionEventResponse>;
+    type SubscribeIcebergCompactionEventStream =
+        RwReceiverStream<SubscribeIcebergCompactionEventResponse>;
 
     async fn unpin_version_before(
         &self,
@@ -72,7 +86,10 @@ impl HummockManagerService for HummockServiceImpl {
     ) -> Result<Response<UnpinVersionBeforeResponse>, Status> {
         let req = request.into_inner();
         self.hummock_manager
-            .unpin_version_before(req.context_id, req.unpin_version_before)
+            .unpin_version_before(
+                req.context_id,
+                HummockVersionId::new(req.unpin_version_before),
+            )
             .await?;
         Ok(Response::new(UnpinVersionBeforeResponse { status: None }))
     }
@@ -81,10 +98,13 @@ impl HummockManagerService for HummockServiceImpl {
         &self,
         _request: Request<GetCurrentVersionRequest>,
     ) -> Result<Response<GetCurrentVersionResponse>, Status> {
-        let current_version = self.hummock_manager.get_current_version().await;
+        let current_version = self
+            .hummock_manager
+            .on_current_version(|version| version.into())
+            .await;
         Ok(Response::new(GetCurrentVersionResponse {
             status: None,
-            current_version: Some(current_version.to_protobuf()),
+            current_version: Some(current_version),
         }))
     }
 
@@ -100,7 +120,7 @@ impl HummockManagerService for HummockServiceImpl {
             ))
             .await?;
         Ok(Response::new(ReplayVersionDeltaResponse {
-            version: Some(version.to_protobuf()),
+            version: Some(version.into()),
             modified_compaction_groups: compaction_groups,
         }))
     }
@@ -111,7 +131,10 @@ impl HummockManagerService for HummockServiceImpl {
     ) -> Result<Response<TriggerCompactionDeterministicResponse>, Status> {
         let req = request.into_inner();
         self.hummock_manager
-            .trigger_compaction_deterministic(req.version_id, req.compaction_groups)
+            .trigger_compaction_deterministic(
+                HummockVersionId::new(req.version_id),
+                req.compaction_groups,
+            )
             .await?;
         Ok(Response::new(TriggerCompactionDeterministicResponse {}))
     }
@@ -122,7 +145,7 @@ impl HummockManagerService for HummockServiceImpl {
     ) -> Result<Response<DisableCommitEpochResponse>, Status> {
         let version = self.hummock_manager.disable_commit_epoch().await;
         Ok(Response::new(DisableCommitEpochResponse {
-            current_version: Some(version.to_protobuf()),
+            current_version: Some(version.into()),
         }))
     }
 
@@ -133,90 +156,32 @@ impl HummockManagerService for HummockServiceImpl {
         let req = request.into_inner();
         let version_deltas = self
             .hummock_manager
-            .list_version_deltas(req.start_id, req.num_limit, req.committed_epoch_limit)
+            .list_version_deltas(HummockVersionId::new(req.start_id), req.num_limit)
             .await?;
         let resp = ListVersionDeltasResponse {
             version_deltas: Some(PbHummockVersionDeltas {
                 version_deltas: version_deltas
-                    .iter()
-                    .map(HummockVersionDelta::to_protobuf)
+                    .into_iter()
+                    .map(HummockVersionDelta::into)
                     .collect(),
             }),
         };
         Ok(Response::new(resp))
     }
 
-    async fn pin_specific_snapshot(
+    async fn get_new_object_ids(
         &self,
-        request: Request<PinSpecificSnapshotRequest>,
-    ) -> Result<Response<PinSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let hummock_snapshot = self
+        request: Request<GetNewObjectIdsRequest>,
+    ) -> Result<Response<GetNewObjectIdsResponse>, Status> {
+        let object_id_range = self
             .hummock_manager
-            .pin_specific_snapshot(req.context_id, req.epoch)
+            .get_new_object_ids(request.into_inner().number)
             .await?;
-        Ok(Response::new(PinSnapshotResponse {
+        Ok(Response::new(GetNewObjectIdsResponse {
             status: None,
-            snapshot: Some(hummock_snapshot),
+            start_id: object_id_range.start_id.inner(),
+            end_id: object_id_range.end_id.inner(),
         }))
-    }
-
-    async fn pin_snapshot(
-        &self,
-        request: Request<PinSnapshotRequest>,
-    ) -> Result<Response<PinSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let hummock_snapshot = self.hummock_manager.pin_snapshot(req.context_id).await?;
-        Ok(Response::new(PinSnapshotResponse {
-            status: None,
-            snapshot: Some(hummock_snapshot),
-        }))
-    }
-
-    async fn unpin_snapshot(
-        &self,
-        request: Request<UnpinSnapshotRequest>,
-    ) -> Result<Response<UnpinSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        self.hummock_manager.unpin_snapshot(req.context_id).await?;
-        Ok(Response::new(UnpinSnapshotResponse { status: None }))
-    }
-
-    async fn unpin_snapshot_before(
-        &self,
-        request: Request<UnpinSnapshotBeforeRequest>,
-    ) -> Result<Response<UnpinSnapshotBeforeResponse>, Status> {
-        let req = request.into_inner();
-        self.hummock_manager
-            .unpin_snapshot_before(req.context_id, req.min_snapshot.unwrap())
-            .await?;
-        Ok(Response::new(UnpinSnapshotBeforeResponse { status: None }))
-    }
-
-    async fn get_new_sst_ids(
-        &self,
-        request: Request<GetNewSstIdsRequest>,
-    ) -> Result<Response<GetNewSstIdsResponse>, Status> {
-        let sst_id_range = self
-            .hummock_manager
-            .get_new_sst_ids(request.into_inner().number)
-            .await?;
-        Ok(Response::new(GetNewSstIdsResponse {
-            status: None,
-            start_id: sst_id_range.start_id,
-            end_id: sst_id_range.end_id,
-        }))
-    }
-
-    async fn report_vacuum_task(
-        &self,
-        request: Request<ReportVacuumTaskRequest>,
-    ) -> Result<Response<ReportVacuumTaskResponse>, Status> {
-        if let Some(vacuum_task) = request.into_inner().vacuum_task {
-            self.vacuum_manager.report_vacuum_task(vacuum_task).await?;
-        }
-        sync_point::sync_point!("AFTER_REPORT_VACUUM");
-        Ok(Response::new(ReportVacuumTaskResponse { status: None }))
     }
 
     async fn trigger_manual_compaction(
@@ -227,14 +192,18 @@ impl HummockManagerService for HummockServiceImpl {
         let compaction_group_id = request.compaction_group_id;
         let mut option = ManualCompactionOption {
             level: request.level as usize,
-            sst_ids: request.sst_ids,
+            sst_ids: request.sst_ids.into_iter().map(|id| id.into()).collect(),
             ..Default::default()
         };
 
         // rewrite the key_range
         match request.key_range {
-            Some(key_range) => {
-                option.key_range = key_range;
+            Some(pb_key_range) => {
+                option.key_range = KeyRange {
+                    left: pb_key_range.left.into(),
+                    right: pb_key_range.right.into(),
+                    right_exclusive: pb_key_range.right_exclusive,
+                };
             }
 
             None => {
@@ -243,7 +212,7 @@ impl HummockManagerService for HummockServiceImpl {
         }
 
         // get internal_table_id by metadata_manger
-        if request.table_id >= NON_RESERVED_SYS_CATALOG_ID as u32 {
+        if request.table_id < SYS_CATALOG_START_ID as u32 {
             // We need to make sure to use the correct table_id to filter sst
             let table_id = TableId::new(request.table_id);
             if let Ok(table_fragment) = self
@@ -255,10 +224,12 @@ impl HummockManagerService for HummockServiceImpl {
             }
         }
 
-        assert!(option
-            .internal_table_id
-            .iter()
-            .all(|table_id| *table_id >= (NON_RESERVED_SYS_CATALOG_ID as u32)),);
+        assert!(
+            option
+                .internal_table_id
+                .iter()
+                .all(|table_id| *table_id < SYS_CATALOG_START_ID as u32),
+        );
 
         tracing::info!(
             "Try trigger_manual_compaction compaction_group_id {} option {:?}",
@@ -275,53 +246,24 @@ impl HummockManagerService for HummockServiceImpl {
         }))
     }
 
-    async fn get_epoch(
-        &self,
-        _request: Request<GetEpochRequest>,
-    ) -> Result<Response<GetEpochResponse>, Status> {
-        let hummock_snapshot = self.hummock_manager.latest_snapshot();
-        Ok(Response::new(GetEpochResponse {
-            status: None,
-            snapshot: Some(hummock_snapshot),
-        }))
-    }
-
-    async fn report_full_scan_task(
-        &self,
-        request: Request<ReportFullScanTaskRequest>,
-    ) -> Result<Response<ReportFullScanTaskResponse>, Status> {
-        let req = request.into_inner();
-        let hummock_manager = self.hummock_manager.clone();
-        hummock_manager
-            .metrics
-            .total_object_count
-            .set(req.total_object_count as _);
-        hummock_manager
-            .metrics
-            .total_object_size
-            .set(req.total_object_size as _);
-        // The following operation takes some time, so we do it in dedicated task and responds the
-        // RPC immediately.
-        tokio::spawn(async move {
-            match hummock_manager.complete_full_gc(req.object_ids).await {
-                Ok(number) => {
-                    tracing::info!("Full GC results {} SSTs to delete", number);
-                }
-                Err(e) => {
-                    tracing::warn!("Full GC SST failed: {:#?}", e);
-                }
-            }
-        });
-        Ok(Response::new(ReportFullScanTaskResponse { status: None }))
-    }
-
     async fn trigger_full_gc(
         &self,
         request: Request<TriggerFullGcRequest>,
     ) -> Result<Response<TriggerFullGcResponse>, Status> {
-        self.hummock_manager.start_full_gc(Duration::from_secs(
-            request.into_inner().sst_retention_time_sec,
-        ))?;
+        let req = request.into_inner();
+        let backup_manager_2 = self.backup_manager.clone();
+        let hummock_manager_2 = self.hummock_manager.clone();
+        tokio::task::spawn(async move {
+            use thiserror_ext::AsReport;
+            let _ = hummock_manager_2
+                .start_full_gc(
+                    Duration::from_secs(req.sst_retention_time_sec),
+                    req.prefix,
+                    Some(backup_manager_2),
+                )
+                .await
+                .inspect_err(|e| tracing::warn!(error = %e.as_report(), "Failed to start GC."));
+        });
         Ok(Response::new(TriggerFullGcResponse { status: None }))
     }
 
@@ -337,23 +279,6 @@ impl HummockManagerService for HummockServiceImpl {
         Ok(Response::new(RiseCtlGetPinnedVersionsSummaryResponse {
             summary: Some(PinnedVersionsSummary {
                 pinned_versions,
-                workers,
-            }),
-        }))
-    }
-
-    async fn rise_ctl_get_pinned_snapshots_summary(
-        &self,
-        _request: Request<RiseCtlGetPinnedSnapshotsSummaryRequest>,
-    ) -> Result<Response<RiseCtlGetPinnedSnapshotsSummaryResponse>, Status> {
-        let pinned_snapshots = self.hummock_manager.list_pinned_snapshot().await;
-        let workers = self
-            .hummock_manager
-            .list_workers(&pinned_snapshots.iter().map(|p| p.context_id).collect_vec())
-            .await?;
-        Ok(Response::new(RiseCtlGetPinnedSnapshotsSummaryResponse {
-            summary: Some(PinnedSnapshotsSummary {
-                pinned_snapshots,
                 workers,
             }),
         }))
@@ -413,8 +338,7 @@ impl HummockManagerService for HummockServiceImpl {
         } = request.into_inner();
 
         self.hummock_manager
-            .init_metadata_for_version_replay(tables, compaction_groups)
-            .await?;
+            .init_metadata_for_version_replay(tables, compaction_groups)?;
         Ok(Response::new(InitMetadataForReplayResponse {}))
     }
 
@@ -425,7 +349,7 @@ impl HummockManagerService for HummockServiceImpl {
         let req = request.into_inner();
         let version = self.hummock_manager.pin_version(req.context_id).await?;
         Ok(Response::new(PinVersionResponse {
-            pinned_version: Some(version.to_protobuf()),
+            pinned_version: Some(version.into()),
         }))
     }
 
@@ -436,8 +360,17 @@ impl HummockManagerService for HummockServiceImpl {
         let req = request.into_inner();
         let new_group_id = self
             .hummock_manager
-            .split_compaction_group(req.group_id, &req.table_ids)
-            .await?;
+            .move_state_tables_to_dedicated_compaction_group(
+                req.group_id,
+                &req.table_ids,
+                if req.partition_vnode_count > 0 {
+                    Some(req.partition_vnode_count)
+                } else {
+                    None
+                },
+            )
+            .await?
+            .0;
         Ok(Response::new(SplitCompactionGroupResponse { new_group_id }))
     }
 
@@ -463,7 +396,7 @@ impl HummockManagerService for HummockServiceImpl {
     ) -> Result<Response<RiseCtlGetCheckpointVersionResponse>, Status> {
         let checkpoint_version = self.hummock_manager.get_checkpoint_version().await;
         Ok(Response::new(RiseCtlGetCheckpointVersionResponse {
-            checkpoint_version: Some(checkpoint_version.to_protobuf()),
+            checkpoint_version: Some(checkpoint_version.into()),
         }))
     }
 
@@ -496,7 +429,7 @@ impl HummockManagerService for HummockServiceImpl {
                 _ => {
                     return Err(Status::invalid_argument(
                         "the first message must be `Register`",
-                    ))
+                    ));
                 }
             }
         };
@@ -530,6 +463,53 @@ impl HummockManagerService for HummockServiceImpl {
         Ok(Response::new(RwReceiverStream::new(rx)))
     }
 
+    async fn subscribe_iceberg_compaction_event(
+        &self,
+        request: Request<Streaming<SubscribeIcebergCompactionEventRequest>>,
+    ) -> Result<Response<Self::SubscribeIcebergCompactionEventStream>, tonic::Status> {
+        let mut request_stream: Streaming<SubscribeIcebergCompactionEventRequest> =
+            request.into_inner();
+        let register_req = {
+            let req = request_stream.next().await.ok_or_else(|| {
+                Status::invalid_argument("subscribe_compaction_event request is empty")
+            })??;
+
+            match req.event {
+                Some(IcebergRequestEvent::Register(register)) => register,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "the first message must be `Register`",
+                    ));
+                }
+            }
+        };
+
+        let context_id = register_req.context_id;
+
+        // check_context and add_compactor as a whole is not atomic, but compactor_manager will
+        // remove invalid compactor eventually.
+        if !self.hummock_manager.check_context(context_id).await? {
+            return Err(Status::new(
+                tonic::Code::Internal,
+                format!("invalid hummock context {}", context_id),
+            ));
+        }
+
+        let rx: tokio::sync::mpsc::UnboundedReceiver<
+            Result<SubscribeIcebergCompactionEventResponse, crate::MetaError>,
+        > = self
+            .iceberg_compaction_manager
+            .iceberg_compactor_manager
+            .add_compactor(context_id);
+
+        self.iceberg_compaction_manager
+            .add_compactor_stream(context_id, request_stream);
+
+        // TODO: Trigger iceberg compaction
+
+        Ok(Response::new(RwReceiverStream::new(rx)))
+    }
+
     async fn report_compaction_task(
         &self,
         _request: Request<ReportCompactionTaskRequest>,
@@ -548,9 +528,9 @@ impl HummockManagerService for HummockServiceImpl {
             .into_iter()
             .flat_map(|(object_id, v)| {
                 v.into_iter()
-                    .map(move |(compaction_group_id, sst_id)| BranchedObject {
-                        object_id,
-                        sst_id,
+                    .map(move |(compaction_group_id, sst_ids)| BranchedObject {
+                        object_id: object_id.inner(),
+                        sst_id: sst_ids.into_iter().map(|id| id.inner()).collect(),
                         compaction_group_id,
                     })
             })
@@ -582,19 +562,17 @@ impl HummockManagerService for HummockServiceImpl {
             min_delta_log_num_for_hummock_version_checkpoint,
             min_sst_retention_time_sec,
             full_gc_interval_sec,
-            collect_gc_watermark_spin_interval_sec,
             periodic_compaction_interval_sec,
             periodic_space_reclaim_compaction_interval_sec,
             periodic_ttl_reclaim_compaction_interval_sec,
             periodic_tombstone_reclaim_compaction_interval_sec,
-            periodic_split_compact_group_interval_sec,
-            split_group_size_limit,
-            min_table_split_size,
+            periodic_scheduling_compaction_group_split_interval_sec,
             do_not_config_object_storage_lifecycle,
             partition_vnode_count,
-            table_write_throughput_threshold,
-            min_table_split_write_throughput,
-            compaction_task_max_heartbeat_interval_secs
+            table_high_write_throughput_threshold,
+            table_low_write_throughput_threshold,
+            compaction_task_max_heartbeat_interval_secs,
+            periodic_scheduling_compaction_group_merge_interval_sec
         );
         Ok(Response::new(ListHummockMetaConfigResponse { configs }))
     }
@@ -659,11 +637,39 @@ impl HummockManagerService for HummockServiceImpl {
         let request = request.into_inner();
         let ret = self
             .hummock_manager
-            .cancel_compact_task(request.task_id, request.task_status())
+            .cancel_compact_task(
+                request.task_id,
+                PbTaskStatus::try_from(request.task_status).unwrap(),
+            )
             .await?;
 
         let response = Response::new(CancelCompactTaskResponse { ret });
         return Ok(response);
+    }
+
+    async fn get_version_by_epoch(
+        &self,
+        request: Request<GetVersionByEpochRequest>,
+    ) -> Result<Response<GetVersionByEpochResponse>, Status> {
+        let GetVersionByEpochRequest { epoch, table_id } = request.into_inner();
+        let version = self
+            .hummock_manager
+            .epoch_to_version(epoch, table_id)
+            .await?;
+        Ok(Response::new(GetVersionByEpochResponse {
+            version: Some(version.to_protobuf()),
+        }))
+    }
+
+    async fn merge_compaction_group(
+        &self,
+        request: Request<MergeCompactionGroupRequest>,
+    ) -> Result<Response<MergeCompactionGroupResponse>, Status> {
+        let req = request.into_inner();
+        self.hummock_manager
+            .merge_compaction_group(req.left_group_id, req.right_group_id)
+            .await?;
+        Ok(Response::new(MergeCompactionGroupResponse {}))
     }
 }
 
@@ -678,7 +684,7 @@ mod tests {
         }
         let s = S {
             foo: 15,
-            bar: "foobar".to_string(),
+            bar: "foobar".to_owned(),
         };
         let kvs: HashMap<String, String> = fields_to_kvs!(s, foo, bar);
         assert_eq!(kvs.len(), 2);

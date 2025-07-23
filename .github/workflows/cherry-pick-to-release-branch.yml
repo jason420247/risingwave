@@ -1,39 +1,26 @@
-name: PR for release branch
+name: Deprecation Notice for old cherry-pick label
 on:
   pull_request:
     branches:
       - main
-    types: ["closed"]
+    types: ["labeled"]
 
 jobs:
-  release_pull_request_1_5:
-    if: "contains(github.event.pull_request.labels.*.name, 'need-cherry-pick-release-1.5')  &&  github.event.pull_request.merged == true"
+  deprecation_notice:
+    if: startsWith(github.event.label.name, 'need-cherry-pick-release-')
     runs-on: ubuntu-latest
-    name: release_pull_request
     steps:
-      - name: checkout
-        uses: actions/checkout@v1
-      - name: Create PR to branch
-        uses: risingwavelabs/github-action-cherry-pick@master
+      - name: Add deprecation notice comment
+        uses: actions/github-script@v7
         with:
-          pr_branch: 'release-1.5'
-          pr_labels: 'cherry-pick'
-          pr_body: ${{ format('Cherry picking \#{0} onto branch release-1.5', github.event.number) }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: '> [!WARNING]\n> The `need-cherry-pick-release-xx` label is deprecated. Please use `need-cherry-pick-since-release-xx` instead for future PRs.'
+            })
 
-  release_pull_request_1_6:
-    if: "contains(github.event.pull_request.labels.*.name, 'need-cherry-pick-release-1.6')  &&  github.event.pull_request.merged == true"
-    runs-on: ubuntu-latest
-    name: release_pull_request
-    steps:
-      - name: checkout
-        uses: actions/checkout@v1
-      - name: Create PR to branch
-        uses: risingwavelabs/github-action-cherry-pick@master
-        with:
-          pr_branch: 'release-1.6'
-          pr_labels: 'cherry-pick'
-          pr_body: ${{ format('Cherry picking \#{0} onto branch release-1.6', github.event.number) }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+permissions:
+  issues: write
+  pull-requests: write

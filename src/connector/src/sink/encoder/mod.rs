@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,13 +21,17 @@ use risingwave_common::row::Row;
 use crate::sink::Result;
 
 mod avro;
+mod bson;
+pub mod bytes;
 mod json;
 mod proto;
 pub mod template;
+pub mod text;
 
 pub use avro::{AvroEncoder, AvroHeader};
+pub use bson::BsonEncoder;
 pub use json::JsonEncoder;
-pub use proto::ProtoEncoder;
+pub use proto::{ProtoEncoder, ProtoHeader};
 
 /// Encode a row of a relation into
 /// * an object in json
@@ -57,7 +61,7 @@ pub trait RowEncoder {
 /// * an json object
 /// * a protobuf message
 /// * an avro record
-/// into
+///   into
 /// * string (required by kinesis key)
 /// * bytes
 ///
@@ -139,10 +143,37 @@ pub enum CustomJsonType {
     // Doris's json need date is string.
     // The internal order of the struct should follow the insertion order.
     // The decimal needs verification and calibration.
-    Doris(HashMap<String, (u8, u8)>),
+    Doris(HashMap<String, u8>),
     // Es's json need jsonb is struct
     Es,
+    // starrocks' need jsonb is struct
+    StarRocks,
     None,
+}
+
+/// How the jsonb type is encoded.
+///
+/// - `String`: encode jsonb as string. `[1, true, "foo"] -> "[1, true, \"foo\"]"`
+/// - `Dynamic`: encode jsonb as json type dynamically. `[1, true, "foo"] -> [1, true, "foo"]`
+pub enum JsonbHandlingMode {
+    String,
+    Dynamic,
+}
+
+impl JsonbHandlingMode {
+    pub const OPTION_KEY: &'static str = "jsonb.handling.mode";
+
+    pub fn from_options(options: &BTreeMap<String, String>) -> Result<Self> {
+        match options.get(Self::OPTION_KEY).map(std::ops::Deref::deref) {
+            Some("string") | None => Ok(Self::String),
+            Some("dynamic") => Ok(Self::Dynamic),
+            Some(v) => Err(super::SinkError::Config(anyhow::anyhow!(
+                "unrecognized {} value {}",
+                Self::OPTION_KEY,
+                v
+            ))),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -171,7 +202,7 @@ impl std::fmt::Display for FieldEncodeError {
 
         write!(
             f,
-            "encode {} error: {}",
+            "encode '{}' error: {}",
             self.rev_path.iter().rev().join("."),
             self.message
         )

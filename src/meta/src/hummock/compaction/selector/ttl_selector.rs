@@ -1,4 +1,4 @@
-//  Copyright 2024 RisingWave Labs
+//  Copyright 2025 RisingWave Labs
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -19,16 +19,13 @@
 
 use std::collections::HashMap;
 
-use risingwave_common::catalog::TableOption;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
 use risingwave_pb::hummock::compact_task;
-use risingwave_pb::hummock::hummock_version::Levels;
 
 use super::{CompactionSelector, DynamicLevelSelectorCore};
 use crate::hummock::compaction::picker::{TtlPickerState, TtlReclaimCompactionPicker};
-use crate::hummock::compaction::{create_compaction_task, CompactionTask, LocalSelectorStatistic};
-use crate::hummock::level_handler::LevelHandler;
-use crate::hummock::model::CompactionGroup;
+use crate::hummock::compaction::selector::CompactionSelectorContext;
+use crate::hummock::compaction::{CompactionTask, create_compaction_task};
 
 #[derive(Default)]
 pub struct TtlCompactionSelector {
@@ -39,13 +36,18 @@ impl CompactionSelector for TtlCompactionSelector {
     fn pick_compaction(
         &mut self,
         task_id: HummockCompactionTaskId,
-        group: &CompactionGroup,
-        levels: &Levels,
-        level_handlers: &mut [LevelHandler],
-        _selector_stats: &mut LocalSelectorStatistic,
-        table_id_to_options: HashMap<u32, TableOption>,
+        context: CompactionSelectorContext<'_>,
     ) -> Option<CompactionTask> {
-        let dynamic_level_core = DynamicLevelSelectorCore::new(group.compaction_config.clone());
+        let CompactionSelectorContext {
+            group,
+            levels,
+            level_handlers,
+            table_id_to_options,
+            developer_config,
+            ..
+        } = context;
+        let dynamic_level_core =
+            DynamicLevelSelectorCore::new(group.compaction_config.clone(), developer_config);
         let ctx = dynamic_level_core.calculate_level_base_size(levels);
         let picker = TtlReclaimCompactionPicker::new(table_id_to_options);
         let state = self.state.entry(group.group_id).or_default();

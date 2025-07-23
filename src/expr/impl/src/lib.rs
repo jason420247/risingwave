@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,19 +23,18 @@
 #![allow(non_snake_case)] // for `ctor` generated code
 #![feature(let_chains)]
 #![feature(assert_matches)]
-#![feature(lint_reasons)]
 #![feature(iterator_try_collect)]
-#![feature(exclusive_range_pattern)]
-#![feature(lazy_cell)]
-#![feature(round_ties_even)]
 #![feature(coroutines)]
 #![feature(test)]
 #![feature(iter_array_chunks)]
-#![feature(result_flattening)]
+#![feature(used_with_arg)]
+#![feature(coverage_attribute)]
 
 mod aggregate;
 mod scalar;
 mod table_function;
+mod udf;
+mod window_function;
 
 /// Enable functions in this crate.
 #[macro_export]

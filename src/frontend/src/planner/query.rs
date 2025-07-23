@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,19 +13,21 @@
 // limitations under the License.
 
 use fixedbitset::FixedBitSet;
-use risingwave_common::error::Result;
 
 use crate::binder::BoundQuery;
+use crate::error::Result;
 use crate::optimizer::plan_node::{LogicalLimit, LogicalTopN};
 use crate::optimizer::property::{Order, RequiredDist};
-use crate::optimizer::PlanRoot;
+use crate::optimizer::{LogicalPlanRoot, PlanRoot};
 use crate::planner::Planner;
 
 pub const LIMIT_ALL_COUNT: u64 = u64::MAX / 2;
 
 impl Planner {
     /// Plan a [`BoundQuery`]. Need to bind before planning.
-    pub fn plan_query(&mut self, query: BoundQuery) -> Result<PlanRoot> {
+    ///
+    /// Works for both batch query and streaming query (`CREATE MATERIALIZED VIEW`).
+    pub fn plan_query(&mut self, query: BoundQuery) -> Result<LogicalPlanRoot> {
         let out_names = query.schema().names();
         let BoundQuery {
             body,
@@ -38,11 +40,18 @@ impl Planner {
 
         let extra_order_exprs_len = extra_order_exprs.len();
         let mut plan = self.plan_set_expr(body, extra_order_exprs, &order)?;
-        let order = Order {
+        let mut order = Order {
             column_orders: order,
         };
+
         if limit.is_some() || offset.is_some() {
+            // Optimize order key if using it for TopN / Limit.
+            // Both are singleton dist, so we can leave dist_key_indices as empty.
+            let func_dep = plan.functional_dependency();
+            order = func_dep.minimize_order_key(order, &[]);
+
             let limit = limit.unwrap_or(LIMIT_ALL_COUNT);
+
             let offset = offset.unwrap_or_default();
             plan = if order.column_orders.is_empty() {
                 // Should be rejected by parser.
@@ -62,7 +71,8 @@ impl Planner {
             // Do not output projected_row_id hidden column.
             out_fields.set(0, false);
         }
-        let root = PlanRoot::new(plan, RequiredDist::Any, order, out_fields, out_names);
+        let root =
+            PlanRoot::new_with_logical_plan(plan, RequiredDist::Any, order, out_fields, out_names);
         Ok(root)
     }
 }

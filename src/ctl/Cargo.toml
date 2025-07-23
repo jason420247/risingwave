@@ -7,37 +7,39 @@ keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
+[lib]
+test = false
 
 [dependencies]
 anyhow = "1"
 bytes = "1"
-chrono = "0.4"
-clap = { version = "4", features = ["derive"] }
+chrono = { workspace = true }
+clap = { workspace = true }
 comfy-table = "7"
-etcd-client = { workspace = true }
+foyer = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
-inquire = "0.6.2"
-itertools = "0.12"
-regex = "1.10.0"
+hex = "0.4"
+inquire = "0.7.0"
+itertools = { workspace = true }
+prost = { workspace = true }
+regex = { workspace = true }
 risingwave_common = { workspace = true }
 risingwave_connector = { workspace = true }
 risingwave_frontend = { workspace = true }
 risingwave_hummock_sdk = { workspace = true }
 risingwave_meta = { workspace = true }
+risingwave_meta_model = { workspace = true }
 risingwave_object_store = { workspace = true }
 risingwave_pb = { workspace = true }
 risingwave_rpc_client = { workspace = true }
 risingwave_storage = { workspace = true }
 risingwave_stream = { workspace = true }
+rw-diagnose-tools = { git = "https://github.com/risingwavelabs/rw-diagnose-tools", rev = "380d1b7b23a77ee0bbb0d2b9d552de58db4490cc" }
+sea-orm = { workspace = true }
 serde = "1"
 serde_json = "1"
 serde_yaml = "0.9.25"
-size = "0.4"
+size = "0.5"
 thiserror-ext = { workspace = true }
 tokio = { version = "0.2", package = "madsim-tokio", features = [
     "rt",
@@ -48,6 +50,7 @@ tokio = { version = "0.2", package = "madsim-tokio", features = [
     "signal",
     "fs",
 ] }
+tonic = { workspace = true }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
@@ -55,10 +58,7 @@ uuid = { version = "1", features = ["v4"] }
 workspace-hack = { path = "../workspace-hack" }
 
 [dev-dependencies]
-risingwave_hummock_sdk = { workspace = true, features = ["enable_test_epoch"] }
+risingwave_hummock_sdk = { workspace = true }
 
 [lints]
 workspace = true
-
-[lib]
-test = false

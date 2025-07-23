@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,50 +14,51 @@
 
 use std::ops::Bound;
 
+use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use futures_async_stream::try_stream;
+use risingwave_common::catalog::TableId;
 use risingwave_common::util::addr::HostAddr;
-use risingwave_common_service::observer_manager::{Channel, NotificationClient, ObserverError};
+use risingwave_common_service::{Channel, NotificationClient, ObserverError};
 use risingwave_hummock_sdk::key::TableKey;
-use risingwave_hummock_sdk::HummockReadEpoch;
+use risingwave_hummock_sdk::{HummockReadEpoch, HummockVersionId, SyncResult};
 use risingwave_hummock_trace::{
     GlobalReplay, LocalReplay, LocalReplayRead, ReplayItem, ReplayRead, ReplayStateStore,
     ReplayWrite, Result, TraceError, TracedBytes, TracedInitOptions, TracedNewLocalOptions,
-    TracedReadOptions, TracedSealCurrentEpochOptions, TracedSubResp,
+    TracedReadOptions, TracedSealCurrentEpochOptions, TracedSubResp, TracedTryWaitEpochOptions,
 };
 use risingwave_meta::manager::{MessageStatus, MetaSrvEnv, NotificationManagerRef, WorkerKey};
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::meta::subscribe_response::{Info, Operation as RespOperation};
 use risingwave_pb::meta::{SubscribeResponse, SubscribeType};
-use risingwave_storage::hummock::store::LocalHummockStorage;
 use risingwave_storage::hummock::HummockStorage;
-use risingwave_storage::store::{
-    LocalStateStore, StateStoreIterItemStream, StateStoreRead, SyncResult,
-};
-use risingwave_storage::{StateStore, StateStoreReadIterStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use risingwave_storage::hummock::store::LocalHummockStorage;
+use risingwave_storage::hummock::test_utils::{StateStoreReadTestExt, StateStoreTestReadOptions};
+use risingwave_storage::store::*;
+use risingwave_storage::{StateStore, StateStoreIter, StateStoreReadIter};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 pub(crate) struct GlobalReplayIter<S>
 where
-    S: StateStoreReadIterStream,
+    S: StateStoreReadIter,
 {
     inner: S,
 }
 
 impl<S> GlobalReplayIter<S>
 where
-    S: StateStoreReadIterStream,
+    S: StateStoreReadIter,
 {
     pub(crate) fn new(inner: S) -> Self {
         Self { inner }
     }
 
     pub(crate) fn into_stream(self) -> impl Stream<Item = Result<ReplayItem>> {
-        self.inner.map(|item_res| {
+        self.inner.into_stream(to_owned_item).map(|item_res| {
             item_res
                 .map(|(key, value)| (key.user_key.table_key.0.into(), value.into()))
-                .map_err(|_| TraceError::IterFailed("iter failed to retrieve item".to_string()))
+                .map_err(|_| TraceError::IterFailed("iter failed to retrieve item".to_owned()))
         })
     }
 }
@@ -67,8 +68,9 @@ pub(crate) struct LocalReplayIter {
 }
 
 impl LocalReplayIter {
-    pub(crate) async fn new(stream: impl StateStoreIterItemStream) -> Self {
-        let inner = stream
+    pub(crate) async fn new(iter: impl StateStoreIter) -> Self {
+        let inner = iter
+            .into_stream(to_owned_item)
             .map_ok(|value| (value.0.user_key.table_key.0.into(), value.1.into()))
             .try_collect::<Vec<_>>()
             .await
@@ -97,6 +99,18 @@ impl GlobalReplayImpl {
 
 impl GlobalReplay for GlobalReplayImpl {}
 
+fn convert_read_options(read_options: TracedReadOptions) -> StateStoreTestReadOptions {
+    StateStoreTestReadOptions {
+        table_id: read_options.table_id.table_id.into(),
+        prefix_hint: read_options.prefix_hint.map(Into::into),
+        prefetch_options: read_options.prefetch_options.into(),
+        cache_policy: read_options.cache_policy.into(),
+        read_committed: read_options.read_committed,
+        retention_seconds: read_options.retention_seconds,
+        read_version_from_backup: read_options.read_version_from_backup,
+    }
+}
+
 #[async_trait::async_trait]
 impl ReplayRead for GlobalReplayImpl {
     async fn iter(
@@ -110,12 +124,13 @@ impl ReplayRead for GlobalReplayImpl {
             key_range.1.map(TracedBytes::into).map(TableKey),
         );
 
+        let read_options = convert_read_options(read_options);
+
         let iter = self
             .store
-            .iter(key_range, epoch, read_options.into())
+            .iter(key_range, epoch, read_options)
             .await
             .unwrap();
-        let iter = iter.boxed();
         let stream = GlobalReplayIter::new(iter).into_stream().boxed();
         Ok(stream)
     }
@@ -126,9 +141,10 @@ impl ReplayRead for GlobalReplayImpl {
         epoch: u64,
         read_options: TracedReadOptions,
     ) -> Result<Option<TracedBytes>> {
+        let read_options = convert_read_options(read_options);
         Ok(self
             .store
-            .get(TableKey(key.into()), epoch, read_options.into())
+            .get(TableKey(key.into()), epoch, read_options)
             .await
             .unwrap()
             .map(TracedBytes::from))
@@ -137,17 +153,20 @@ impl ReplayRead for GlobalReplayImpl {
 
 #[async_trait::async_trait]
 impl ReplayStateStore for GlobalReplayImpl {
-    async fn sync(&self, id: u64) -> Result<usize> {
+    async fn sync(&self, sync_table_epochs: Vec<(u64, Vec<u32>)>) -> Result<usize> {
         let result: SyncResult = self
             .store
-            .sync(id)
+            .sync(
+                sync_table_epochs
+                    .into_iter()
+                    .map(|(epoch, table_ids)| {
+                        (epoch, table_ids.into_iter().map(TableId::new).collect())
+                    })
+                    .collect(),
+            )
             .await
             .map_err(|e| TraceError::SyncFailed(format!("{e}")))?;
         Ok(result.sync_size)
-    }
-
-    fn seal_epoch(&self, epoch_id: u64, is_checkpoint: bool) {
-        self.store.seal_epoch(epoch_id, is_checkpoint);
     }
 
     async fn notify_hummock(&self, info: Info, op: RespOperation, version: u64) -> Result<u64> {
@@ -161,7 +180,9 @@ impl ReplayStateStore for GlobalReplayImpl {
 
         // wait till version updated
         if let Some(prev_version_id) = prev_version_id {
-            self.store.wait_version_update(prev_version_id).await;
+            self.store
+                .wait_version_update(HummockVersionId::new(prev_version_id))
+                .await;
         }
         Ok(version)
     }
@@ -171,26 +192,15 @@ impl ReplayStateStore for GlobalReplayImpl {
         Box::new(LocalReplayImpl(local_storage))
     }
 
-    async fn try_wait_epoch(&self, epoch: HummockReadEpoch) -> Result<()> {
+    async fn try_wait_epoch(
+        &self,
+        epoch: HummockReadEpoch,
+        options: TracedTryWaitEpochOptions,
+    ) -> Result<()> {
         self.store
-            .try_wait_epoch(epoch)
+            .try_wait_epoch(epoch, options.into())
             .await
             .map_err(|_| TraceError::TryWaitEpochFailed)?;
-        Ok(())
-    }
-
-    fn validate_read_epoch(&self, epoch: HummockReadEpoch) -> Result<()> {
-        self.store
-            .validate_read_epoch(epoch)
-            .map_err(|_| TraceError::ValidateReadEpochFailed)?;
-        Ok(())
-    }
-
-    async fn clear_shared_buffer(&self) -> Result<()> {
-        self.store
-            .clear_shared_buffer()
-            .await
-            .map_err(|_| TraceError::ClearSharedBufferFailed)?;
         Ok(())
     }
 }
@@ -209,26 +219,15 @@ impl LocalReplay for LocalReplayImpl {
         self.0.seal_current_epoch(next_epoch, opts.into());
     }
 
-    fn epoch(&self) -> u64 {
-        self.0.epoch()
+    async fn flush(&mut self) -> Result<usize> {
+        self.0.flush().await.map_err(|_| TraceError::FlushFailed)
     }
 
-    async fn flush(
-        &mut self,
-        delete_ranges: Vec<(Bound<TracedBytes>, Bound<TracedBytes>)>,
-    ) -> Result<usize> {
-        let delete_ranges = delete_ranges
-            .into_iter()
-            .map(|(start, end)| (start.map(TracedBytes::into), end.map(TracedBytes::into)))
-            .collect();
+    async fn try_flush(&mut self) -> Result<()> {
         self.0
-            .flush(delete_ranges)
+            .try_flush()
             .await
-            .map_err(|_| TraceError::FlushFailed)
-    }
-
-    fn is_dirty(&self) -> bool {
-        self.0.is_dirty()
+            .map_err(|_| TraceError::TryFlushFailed)
     }
 }
 
@@ -248,7 +247,6 @@ impl LocalReplayRead for LocalReplayImpl {
             .await
             .unwrap();
 
-        let iter = iter.boxed();
         let stream = LocalReplayIter::new(iter).await.into_stream().boxed();
         Ok(stream)
     }
@@ -258,12 +256,13 @@ impl LocalReplayRead for LocalReplayImpl {
         key: TracedBytes,
         read_options: TracedReadOptions,
     ) -> Result<Option<TracedBytes>> {
-        Ok(
-            LocalStateStore::get(&self.0, TableKey(key.into()), read_options.into())
-                .await
-                .unwrap()
-                .map(TracedBytes::from),
-        )
+        Ok(self
+            .0
+            .on_key_value(TableKey(key.into()), read_options.into(), |_, value| {
+                Ok(TracedBytes::from(Bytes::copy_from_slice(value)))
+            })
+            .await
+            .unwrap())
     }
 }
 
@@ -321,9 +320,11 @@ impl NotificationClient for ReplayNotificationClient {
     ) -> std::result::Result<Self::Channel, ObserverError> {
         let (tx, rx) = unbounded_channel();
 
-        self.notification_manager
-            .insert_sender(subscribe_type, WorkerKey(self.addr.to_protobuf()), tx)
-            .await;
+        self.notification_manager.insert_sender(
+            subscribe_type,
+            WorkerKey(self.addr.to_protobuf()),
+            tx,
+        );
 
         // send the first snapshot message
         let op = self.first_resp.0.operation();

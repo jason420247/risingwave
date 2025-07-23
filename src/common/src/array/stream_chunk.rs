@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,17 +19,18 @@ use std::sync::Arc;
 use std::{fmt, mem};
 
 use either::Either;
+use enum_as_inner::EnumAsInner;
 use itertools::Itertools;
 use rand::prelude::SmallRng;
 use rand::{Rng, SeedableRng};
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::{PbOp, PbStreamChunk};
 
 use super::stream_chunk_builder::StreamChunkBuilder;
 use super::{ArrayImpl, ArrayRef, ArrayResult, DataChunkTestExt, RowRef};
 use crate::array::DataChunk;
-use crate::buffer::{Bitmap, BitmapBuilder};
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::catalog::Schema;
-use crate::estimate_size::EstimateSize;
 use crate::field_generator::VarcharProperty;
 use crate::row::Row;
 use crate::types::{DataType, DefaultOrdered, ToText};
@@ -40,7 +41,7 @@ use crate::types::{DataType, DefaultOrdered, ToText};
 /// but always appear in pairs to represent an update operation.
 /// For example, table source, aggregation and outer join can generate updates by themselves,
 /// while most of the other operators only pass through updates with best effort.
-#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash, EnumAsInner)]
 pub enum Op {
     Insert,
     Delete,
@@ -79,9 +80,26 @@ impl Op {
             Op::UpdateInsert => Op::Insert,
         }
     }
-}
 
-pub type Ops<'a> = &'a [Op];
+    pub fn to_i16(self) -> i16 {
+        match self {
+            Op::Insert => 1,
+            Op::Delete => 2,
+            Op::UpdateInsert => 3,
+            Op::UpdateDelete => 4,
+        }
+    }
+
+    pub fn to_varchar(self) -> String {
+        match self {
+            Op::Insert => "Insert",
+            Op::Delete => "Delete",
+            Op::UpdateInsert => "UpdateInsert",
+            Op::UpdateDelete => "UpdateDelete",
+        }
+        .to_owned()
+    }
+}
 
 /// `StreamChunk` is used to pass data over the streaming pathway.
 #[derive(Clone, PartialEq)]
@@ -132,11 +150,7 @@ impl StreamChunk {
     /// Should prefer using [`StreamChunkBuilder`] instead to avoid unnecessary
     /// allocation of rows.
     pub fn from_rows(rows: &[(Op, impl Row)], data_types: &[DataType]) -> Self {
-        // `append_row` will cause the builder to finish immediately once capacity is met.
-        // Hence, we allocate an extra row here, to avoid the builder finishing prematurely.
-        // This just makes the code cleaner, since we can loop through all rows, and consume it finally.
-        // TODO: introduce `new_unlimited` to decouple memory reservation from builder capacity.
-        let mut builder = StreamChunkBuilder::new(rows.len() + 1, data_types.to_vec());
+        let mut builder = StreamChunkBuilder::unlimited(data_types.to_vec(), Some(rows.len()));
 
         for (op, row) in rows {
             let none = builder.append_row(*op, row);
@@ -240,17 +254,17 @@ impl StreamChunk {
     }
 
     /// Returns a table-like text representation of the `StreamChunk`.
-    pub fn to_pretty(&self) -> impl Display {
+    pub fn to_pretty(&self) -> impl Display + use<> {
         self.to_pretty_inner(None)
     }
 
     /// Returns a table-like text representation of the `StreamChunk` with a header of column names
     /// from the given `schema`.
-    pub fn to_pretty_with_schema(&self, schema: &Schema) -> impl Display {
+    pub fn to_pretty_with_schema(&self, schema: &Schema) -> impl Display + use<> {
         self.to_pretty_inner(Some(schema))
     }
 
-    fn to_pretty_inner(&self, schema: Option<&Schema>) -> impl Display {
+    fn to_pretty_inner(&self, schema: Option<&Schema>) -> impl Display + use<> {
         use comfy_table::{Cell, CellAlignment, Table};
 
         if self.cardinality() == 0 {
@@ -303,6 +317,33 @@ impl StreamChunk {
         }
     }
 
+    /// Remove the adjacent delete-insert if their row value are the same.
+    pub fn eliminate_adjacent_noop_update(self) -> Self {
+        let len = self.data_chunk().capacity();
+        let mut c: StreamChunkMut = self.into();
+        let mut prev_r = None;
+        for curr in 0..len {
+            if !c.vis(curr) {
+                continue;
+            }
+            if let Some(prev) = prev_r {
+                if matches!(c.op(prev), Op::UpdateDelete | Op::Delete)
+                    && matches!(c.op(curr), Op::UpdateInsert | Op::Insert)
+                    && c.row_ref(prev) == c.row_ref(curr)
+                {
+                    c.set_vis(prev, false);
+                    c.set_vis(curr, false);
+                    prev_r = None;
+                } else {
+                    prev_r = Some(curr)
+                }
+            } else {
+                prev_r = Some(curr);
+            }
+        }
+        c.into()
+    }
+
     /// Reorder columns and set visibility.
     pub fn project_with_vis(&self, indices: &[usize], vis: Bitmap) -> Self {
         Self {
@@ -317,6 +358,11 @@ impl StreamChunk {
             ops: self.ops.clone(),
             data: self.data.with_visibility(vis),
         }
+    }
+
+    // Compute the required permits of this chunk for rate limiting.
+    pub fn compute_rate_limit_chunk_permits(&self) -> u64 {
+        self.capacity() as _
     }
 }
 
@@ -492,6 +538,22 @@ impl OpRowMutRef<'_> {
 }
 
 impl StreamChunkMut {
+    pub fn capacity(&self) -> usize {
+        self.vis.len()
+    }
+
+    pub fn vis(&self, i: usize) -> bool {
+        self.vis.is_set(i)
+    }
+
+    pub fn op(&self, i: usize) -> Op {
+        self.ops.get(i)
+    }
+
+    pub fn row_ref(&self, i: usize) -> RowRef<'_> {
+        RowRef::with_columns(self.columns(), i)
+    }
+
     pub fn set_vis(&mut self, n: usize, val: bool) {
         self.vis.set(n, val);
     }
@@ -537,8 +599,8 @@ impl StreamChunk {
     ///
     /// # Example
     /// ```
-    /// use risingwave_common::array::stream_chunk::StreamChunkTestExt as _;
     /// use risingwave_common::array::StreamChunk;
+    /// use risingwave_common::array::stream_chunk::StreamChunkTestExt as _;
     /// let chunk = StreamChunk::from_pretty(
     ///     "  I I I I      // type chars
     ///     U- 2 5 . .      // '.' means NULL
@@ -619,11 +681,7 @@ impl StreamChunk {
         let data_types = chunks[0].data_types();
         let size = chunks.iter().map(|c| c.cardinality()).sum::<usize>();
 
-        // `append_row` will cause the builder to finish immediately once capacity is met.
-        // Hence, we allocate an extra row here, to avoid the builder finishing prematurely.
-        // This just makes the code cleaner, since we can loop through all rows, and consume it finally.
-        // TODO: introduce `new_unlimited` to decouple memory reservation from builder capacity.
-        let mut builder = StreamChunkBuilder::new(size + 1, data_types);
+        let mut builder = StreamChunkBuilder::unlimited(data_types, Some(size));
 
         for chunk in chunks {
             // TODO: directly append chunks.
@@ -688,7 +746,7 @@ impl StreamChunk {
             let mut rng = SmallRng::from_seed([0; 32]);
             let mut ops = vec![];
             for _ in 0..chunk_size {
-                ops.push(if rng.gen_bool(inserts_percent) {
+                ops.push(if rng.random_bool(inserts_percent) {
                     Op::Insert
                 } else {
                     Op::Delete
@@ -788,6 +846,36 @@ mod tests {
             "\
 +---+---+---+
 | - | 2 |   |
++---+---+---+"
+        );
+    }
+
+    #[test]
+    fn test_eliminate_adjacent_noop_update() {
+        let c = StreamChunk::from_pretty(
+            "  I I
+            - 1 6 D
+            - 2 2
+            + 2 3
+            - 2 3
+            + 1 6
+            - 1 7
+            + 1 10 D
+            + 1 7
+            U- 3 7
+            U+ 3 7
+            + 2 3",
+        );
+        let c = c.eliminate_adjacent_noop_update();
+        assert_eq!(
+            c.to_pretty().to_string(),
+            "\
++---+---+---+
+| - | 2 | 2 |
+| + | 2 | 3 |
+| - | 2 | 3 |
+| + | 1 | 6 |
+| + | 2 | 3 |
 +---+---+---+"
         );
     }

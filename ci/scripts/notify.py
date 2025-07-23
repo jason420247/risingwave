@@ -11,17 +11,55 @@ import sys
 MAIN_CRON_TEST_MAP = {
     "test-notify": ["noelkwan", "noelkwan"],
     "test-notify-2": ["noelkwan", "noelkwan"],
-    "backfill-tests": ["noelkwan"],
-    "backwards-compat-tests": ["noelkwan"],
+    "test-notify-timeout": ["noelkwan", "noelkwan"],
+    "docslt": ["tianxiao"],
+    "e2e-test-release": ["zhi", "Eric"],
+    "e2e-meta-backup-test-release": ["zhi", "Eric"],
+    "e2e-test-release-parallel": ["zhi", "Eric"],
+    "e2e-test-release-parallel-memory": ["zhi", "Eric"],
+    "e2e-test-release-source": ["bohan", "siyuan"],
+    "e2e-test-release-sink": ["bohan", "siyuan"],
     "fuzz-test": ["noelkwan"],
-    "e2e-test-release": ["zhi"],
-    "e2e-iceberg-sink-tests": ["renjie"],
+    "unit-test": ["zhi", "Eric"],
+    "unit-test-deterministic": ["zhi", "Eric"],
+    "integration-test-deterministic-scale": ["ziqi", "Eric"],
+    "integration-test-deterministic-recovery": ["ziqi", "Eric"],
+    "integration-test-deterministic-backfill": ["ziqi", "Eric"],
+    "integration-test-deterministic-storage": ["ziqi", "Eric"],
+    "integration-test-deterministic-sink": ["ziqi", "Eric"],
+    "e2e-test-deterministic": ["runji", "noelkwan"],
+    "recovery-test-deterministic": ["runji", "noelkwan"],
+    "background-ddl-arrangement-backfill-recovery-test-deterministic": [
+        "runji",
+        "noelkwan",
+    ],
+    "background-ddl-recovery-test-deterministic": ["runji", "noelkwan"],
+    "e2e-iceberg-test": ["zilin", "xinhao", "tianxiao"],
     "e2e-java-binding-tests": ["yiming"],
-    "e2e-clickhouse-sink-tests": ["bohan"],
-    "e2e-pulsar-sink-tests": ["renjie"],
+    "s3-source-check-aws": ["bohan"],
+    "s3-source-check-aws-json-parser": ["bohan"],
+    "s3-source-check-aws-csv-parser": ["bohan"],
+    "s3-v2-source-check-aws-json-parser": ["bohan"],
+    "s3-v2-source-batch-read-check-aws-json-parser": ["bohan"],
+    "s3-v2-source-check-aws-csv-parser": ["bohan"],
+    "s3-source-test-for-opendal-fs-engine-csv-parser": ["congyi", "kexiang"],
     "s3-source-test-for-opendal-fs-engine": ["congyi", "kexiang"],
-    "s3-source-tests": ["congyi", "kexiang"],
-    "pulsar-source-tests": ["renjie"],
+    "pulsar-source-tests": ["bohan"],
+    "run-micro-benchmarks": ["noelkwan"],
+    "upload-micro-benchmarks": ["noelkwan"],
+    "backwards-compat-tests": ["yuchao"],
+    "sqlsmith-differential-tests": ["noelkwan"],
+    "backfill-tests": ["noelkwan", "yiming"],
+    "e2e-standalone-binary-tests": ["noelkwan"],
+    "e2e-single-node-binary-tests": ["pin", "peng", "noelkwan"],
+    "e2e-test-opendal-parallel": ["congyi"],
+    "e2e-deltalake-sink-rust-tests": ["xinhao"],
+    "e2e-redis-sink-tests": ["xinhao"],
+    "e2e-starrocks-sink-tests": ["xinhao"],
+    "e2e-cassandra-sink-tests": ["xinhao"],
+    "e2e-clickhouse-sink-tests": ["bohan", "xinhao"],
+    "e2e-pulsar-sink-tests": ["bohan"],
+    "e2e-mqtt-sink-tests": ["xinhao"],
     "connector-node-integration-test": ["siyuan"],
 }
 
@@ -37,9 +75,12 @@ INTEGRATION_TEST_MAP = {
     "schema-registry-json": ["bohan"],
     "mysql-cdc-json": ["siyuan"],
     "postgres-cdc-json": ["siyuan"],
+    "mongodb-cdc-json": ["siyuan"],
     "mysql-sink-json": ["siyuan"],
     "postgres-sink-json": ["siyuan"],
-    "iceberg-cdc-json": ["renjie"],
+    "iceberg-cdc-json": ["zilin"],
+    "iceberg-sink-none": ["zilin"],
+    'iceberg-source-none': ["zilin"],
     "twitter-json": ["bohan"],
     "twitter-protobuf": ["bohan"],
     "twitter-pulsar-json": ["bohan"],
@@ -51,24 +92,37 @@ INTEGRATION_TEST_MAP = {
     "kinesis-s3-source-json": ["bohan"],
     "clickhouse-sink-json": ["xinhao"],
     "cockroach-sink-json": ["bohan"],
-    "kafka-cdc-sink-json": ["renjie"],
+    "kafka-cdc-sink-json": ["bohan"],
     "cassandra-and-scylladb-sink-json": ["xinhao"],
     "elasticsearch-sink-json": ["xinhao"],
     "redis-sink-json": ["xinhao"],
     "big-query-sink-json": ["xinhao"],
-    "vector-json": ["tao"],
-    "doris-sink": ["xinhao"],
-    "starrocks-sink": ["xinhao"],
-    "deltalake-sink": ["xinhao"],
-    "pinot-sink": ["yiming"],
-    "client-library": ["tao"],
+    "vector-json": ["wutao"],
+    "nats-json": ["wutao"],
+    "nats-protobuf": ["wutao"],
+    "mqtt-json": ["bohan"],
+    "doris-sink-json": ["xinhao"],
+    "starrocks-sink-json": ["xinhao"],
+    "deltalake-sink-json": ["xinhao"],
+    "pinot-sink-json": ["yiming"],
+    "presto-trino-json": ["wutao"],
+    "client-library-none": ["wutao"],
+    "kafka-cdc-json": ["bohan"],
 }
 
 def get_failed_tests(get_test_status, test_map):
     failed_test_map = {}
     for test in test_map.keys():
         test_status = get_test_status(test)
-        if test_status == "hard_failed" or test_status == "soft_failed":
+        if test_status == "hard_failed" or test_status == "soft_failed" or test_status == "errored":
+            print(f"{test} failed with outcome: {test_status}")
+            failed_test_map[test] = test_map[test]
+        elif test_status == "passed":
+            print(f"{test} passed with outcome: {test_status}")
+        elif test_status is None or test_status == "":
+            print(f"{test} no outcome, skipping")
+        else:
+            print(f"{test} failed with unknown outcome: {test_status}")
             failed_test_map[test] = test_map[test]
     return failed_test_map
 
@@ -93,14 +147,14 @@ def get_mock_test_status(test):
         "backwards-compat-tests": "",
         "fuzz-test": "",
         "e2e-test-release": "",
-        "e2e-iceberg-sink-tests": "passed",
+        "e2e-iceberg-tests": "passed",
         "e2e-java-binding-tests": "soft_failed",
         "e2e-clickhouse-sink-tests": "hard_failed",
         "e2e-pulsar-sink-tests": "",
         "s3-source-test-for-opendal-fs-engine": "",
         "s3-source-tests": "",
         "pulsar-source-tests": "",
-        "connector-node-integration-test": ""
+        "connector-node-integration-test": "",
     }
     return mock_test_map[test]
 
@@ -108,7 +162,7 @@ def format_cmd(messages):
     cmd=f"""
 cat <<- YAML | buildkite-agent pipeline upload
 steps:
-  - label: "Test"
+  - label: "trigger failed test notification"
     command: echo "running failed test notification" && exit 1
     notify:
       - slack:
@@ -146,14 +200,14 @@ def run_test_1():
 
 def main():
     test_map = get_test_map()
+    print("--- Getting failed tests")
     failed_test_map = get_failed_tests(get_buildkite_test_status, test_map)
     message = generate_test_status_message(failed_test_map)
     if message == "":
-        print("All tests passed, no need to notify")
+        print("--- Tests passed, no need to notify")
         return
     else:
-        print("Some tests failed, notify users")
-        print(message)
+        print("--- Some tests failed, notify users")
         cmd = format_cmd(message)
         print(cmd)
         subprocess.run(cmd, shell=True)

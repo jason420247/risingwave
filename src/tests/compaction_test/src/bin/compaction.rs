@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(coverage, feature(coverage_attribute))]
+#![feature(coverage_attribute)]
 
-#[cfg_attr(coverage, coverage(off))]
 fn main() {
     use clap::Parser;
 
@@ -22,5 +21,5 @@ fn main() {
 
     risingwave_rt::init_risingwave_logger(risingwave_rt::LoggerSettings::default());
 
-    risingwave_rt::main_okk(risingwave_compaction_test::start(opts))
+    risingwave_rt::main_okk(|_| risingwave_compaction_test::start(opts))
 }

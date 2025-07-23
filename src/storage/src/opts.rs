@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use risingwave_common::config::{
-    extract_storage_memory_config, ObjectStoreConfig, RwConfig, StorageMemoryConfig,
+    EvictionConfig, ObjectStoreConfig, RwConfig, StorageMemoryConfig, extract_storage_memory_config,
 };
-use risingwave_common::system_param::reader::SystemParamsReader;
+use risingwave_common::system_param::reader::{SystemParamsRead, SystemParamsReader};
 use risingwave_common::system_param::system_params_for_test;
 
 #[derive(Clone, Debug)]
@@ -24,6 +24,8 @@ pub struct StorageOpts {
     pub parallel_compact_size_mb: u32,
     /// Target size of the Sstable.
     pub sstable_size_mb: u32,
+    /// Minimal target size of the Sstable to store data of different state-table in independent files as soon as possible.
+    pub min_sstable_size_mb: u32,
     /// Size of each block in bytes in SST.
     pub block_size_kb: u32,
     /// False positive probability of bloom filter.
@@ -39,50 +41,61 @@ pub struct StorageOpts {
     /// The shared buffer will start flushing data to object when the ratio of memory usage to the
     /// shared buffer capacity exceed such ratio.
     pub shared_buffer_flush_ratio: f32,
-    /// The threshold for the number of immutable memtables to merge to a new imm.
-    pub imm_merge_threshold: usize,
+    /// The minimum total flush size of shared buffer spill. When a shared buffer spill is trigger,
+    /// the total flush size across multiple epochs should be at least higher than this size.
+    pub shared_buffer_min_batch_flush_size_mb: usize,
     /// Remote directory for storing data and metadata objects.
     pub data_directory: String,
     /// Whether to enable write conflict detection
     pub write_conflict_detection_enabled: bool,
     /// Capacity of sstable block cache.
     pub block_cache_capacity_mb: usize,
+    /// the number of block-cache shard. Less shard means that more concurrent-conflict.
+    pub block_cache_shard_num: usize,
+    /// Eviction config for block cache.
+    pub block_cache_eviction_config: EvictionConfig,
     /// Capacity of sstable meta cache.
     pub meta_cache_capacity_mb: usize,
-    /// Percent of the ratio of high priority data in block-cache
-    pub high_priority_ratio: usize,
+    /// the number of meta-cache shard. Less shard means that more concurrent-conflict.
+    pub meta_cache_shard_num: usize,
+    /// Eviction config for meta cache.
+    pub meta_cache_eviction_config: EvictionConfig,
     /// max memory usage for large query.
     pub prefetch_buffer_capacity_mb: usize,
+
+    pub max_cached_recent_versions_number: usize,
+
+    pub max_prefetch_block_number: usize,
+
     pub disable_remote_compactor: bool,
     /// Number of tasks shared buffer can upload in parallel.
     pub share_buffer_upload_concurrency: usize,
     /// Capacity of sstable meta cache.
     pub compactor_memory_limit_mb: usize,
     /// compactor streaming iterator recreate timeout.
+    /// deprecated
     pub compact_iter_recreate_timeout_ms: u64,
     /// Number of SST ids fetched from meta per RPC
     pub sstable_id_remote_fetch_number: u32,
     /// Whether to enable streaming upload for sstable.
     pub min_sst_size_for_streaming_upload: u64,
-    /// Max sub compaction task numbers
-    pub max_sub_compaction: u32,
     pub max_concurrent_compaction_task_number: u64,
     pub max_version_pinning_duration_sec: u64,
+    pub compactor_iter_max_io_retry_times: usize,
 
     pub data_file_cache_dir: String,
     pub data_file_cache_capacity_mb: usize,
     pub data_file_cache_file_capacity_mb: usize,
-    pub data_file_cache_device_align: usize,
-    pub data_file_cache_device_io_size: usize,
     pub data_file_cache_flushers: usize,
     pub data_file_cache_reclaimers: usize,
+    pub data_file_cache_recover_mode: foyer::RecoverMode,
     pub data_file_cache_recover_concurrency: usize,
-    pub data_file_cache_lfu_window_to_cache_size_ratio: usize,
-    pub data_file_cache_lfu_tiny_lru_capacity_ratio: f64,
-    pub data_file_cache_insert_rate_limit_mb: usize,
-    pub data_file_cache_ring_buffer_capacity_mb: usize,
-    pub data_file_cache_catalog_bits: usize,
-    pub data_file_cache_compression: String,
+    pub data_file_cache_indexer_shards: usize,
+    pub data_file_cache_compression: foyer::Compression,
+    pub data_file_cache_flush_buffer_threshold_mb: usize,
+    pub data_file_cache_fifo_probation_ratio: f64,
+    pub data_file_cache_runtime_config: foyer::RuntimeOptions,
+    pub data_file_cache_throttle: foyer::Throttle,
 
     pub cache_refill_data_refill_levels: Vec<u32>,
     pub cache_refill_timeout_ms: u64,
@@ -95,17 +108,24 @@ pub struct StorageOpts {
     pub meta_file_cache_dir: String,
     pub meta_file_cache_capacity_mb: usize,
     pub meta_file_cache_file_capacity_mb: usize,
-    pub meta_file_cache_device_align: usize,
-    pub meta_file_cache_device_io_size: usize,
     pub meta_file_cache_flushers: usize,
     pub meta_file_cache_reclaimers: usize,
+    pub meta_file_cache_recover_mode: foyer::RecoverMode,
     pub meta_file_cache_recover_concurrency: usize,
-    pub meta_file_cache_lfu_window_to_cache_size_ratio: usize,
-    pub meta_file_cache_lfu_tiny_lru_capacity_ratio: f64,
-    pub meta_file_cache_insert_rate_limit_mb: usize,
-    pub meta_file_cache_ring_buffer_capacity_mb: usize,
-    pub meta_file_cache_catalog_bits: usize,
-    pub meta_file_cache_compression: String,
+    pub meta_file_cache_indexer_shards: usize,
+    pub meta_file_cache_compression: foyer::Compression,
+    pub meta_file_cache_flush_buffer_threshold_mb: usize,
+    pub meta_file_cache_fifo_probation_ratio: f64,
+    pub meta_file_cache_runtime_config: foyer::RuntimeOptions,
+    pub meta_file_cache_throttle: foyer::Throttle,
+
+    pub vector_file_block_size_kb: usize,
+    pub vector_block_cache_capacity_mb: usize,
+    pub vector_block_cache_shard_num: usize,
+    pub vector_block_cache_eviction_config: EvictionConfig,
+    pub vector_meta_cache_capacity_mb: usize,
+    pub vector_meta_cache_shard_num: usize,
+    pub vector_meta_cache_eviction_config: EvictionConfig,
 
     /// The storage url for storing backups.
     pub backup_storage_url: String,
@@ -113,27 +133,35 @@ pub struct StorageOpts {
     pub backup_storage_directory: String,
     /// max time which wait for preload. 0 represent do not do any preload.
     pub max_preload_wait_time_mill: u64,
-    /// object store streaming read timeout.
-    pub object_store_streaming_read_timeout_ms: u64,
-    /// object store streaming upload timeout.
-    pub object_store_streaming_upload_timeout_ms: u64,
-    /// object store upload timeout.
-    pub object_store_upload_timeout_ms: u64,
-    /// object store read timeout.
-    pub object_store_read_timeout_ms: u64,
 
     pub compactor_max_sst_key_count: u64,
     pub compactor_max_task_multiplier: f32,
     pub compactor_max_sst_size: u64,
-    /// enable FastCompactorRunner.
+    /// enable `FastCompactorRunner`.
     pub enable_fast_compaction: bool,
+    pub check_compaction_result: bool,
     pub max_preload_io_retry_times: usize,
     pub compactor_fast_max_compact_delete_ratio: u32,
     pub compactor_fast_max_compact_task_size: u64,
 
     pub mem_table_spill_threshold: usize,
 
+    pub compactor_concurrent_uploading_sst_count: Option<usize>,
+
+    pub compactor_max_overlap_sst_count: usize,
+
+    /// The maximum number of meta files that can be preloaded.
+    pub compactor_max_preload_meta_file_count: usize,
+
     pub object_store_config: ObjectStoreConfig,
+    pub time_travel_version_cache_capacity: u64,
+
+    pub iceberg_compaction_target_file_size_mb: u32,
+    pub iceberg_compaction_enable_validate: bool,
+    pub iceberg_compaction_max_record_batch_rows: usize,
+    pub iceberg_compaction_write_parquet_max_row_group_rows: usize,
+    pub iceberg_compaction_min_size_per_partition_mb: u32,
+    pub iceberg_compaction_max_file_count_per_partition: u32,
 }
 
 impl Default for StorageOpts {
@@ -147,9 +175,23 @@ impl Default for StorageOpts {
 
 impl From<(&RwConfig, &SystemParamsReader, &StorageMemoryConfig)> for StorageOpts {
     fn from((c, p, s): (&RwConfig, &SystemParamsReader, &StorageMemoryConfig)) -> Self {
+        let mut data_file_cache_throttle = c.storage.data_file_cache.throttle.clone();
+        if data_file_cache_throttle.write_throughput.is_none() {
+            data_file_cache_throttle = data_file_cache_throttle.with_write_throughput(
+                c.storage.data_file_cache.insert_rate_limit_mb * 1024 * 1024,
+            );
+        }
+        let mut meta_file_cache_throttle = c.storage.meta_file_cache.throttle.clone();
+        if meta_file_cache_throttle.write_throughput.is_none() {
+            meta_file_cache_throttle = meta_file_cache_throttle.with_write_throughput(
+                c.storage.meta_file_cache.insert_rate_limit_mb * 1024 * 1024,
+            );
+        }
+
         Self {
             parallel_compact_size_mb: p.parallel_compact_size_mb(),
             sstable_size_mb: p.sstable_size_mb(),
+            min_sstable_size_mb: c.storage.min_sstable_size_mb,
             block_size_kb: p.block_size_kb(),
             bloom_false_positive: p.bloom_false_positive(),
             share_buffers_sync_parallelism: c.storage.share_buffers_sync_parallelism,
@@ -158,67 +200,51 @@ impl From<(&RwConfig, &SystemParamsReader, &StorageMemoryConfig)> for StorageOpt
                 .share_buffer_compaction_worker_threads_number,
             shared_buffer_capacity_mb: s.shared_buffer_capacity_mb,
             shared_buffer_flush_ratio: c.storage.shared_buffer_flush_ratio,
-            imm_merge_threshold: c.storage.imm_merge_threshold,
-            data_directory: p.data_directory().to_string(),
+            shared_buffer_min_batch_flush_size_mb: c.storage.shared_buffer_min_batch_flush_size_mb,
+            data_directory: p.data_directory().to_owned(),
             write_conflict_detection_enabled: c.storage.write_conflict_detection_enabled,
-            high_priority_ratio: s.high_priority_ratio_in_percent,
             block_cache_capacity_mb: s.block_cache_capacity_mb,
-            prefetch_buffer_capacity_mb: s.prefetch_buffer_capacity_mb,
+            block_cache_shard_num: s.block_cache_shard_num,
+            block_cache_eviction_config: s.block_cache_eviction_config.clone(),
             meta_cache_capacity_mb: s.meta_cache_capacity_mb,
+            meta_cache_shard_num: s.meta_cache_shard_num,
+            meta_cache_eviction_config: s.meta_cache_eviction_config.clone(),
+            prefetch_buffer_capacity_mb: s.prefetch_buffer_capacity_mb,
+            max_cached_recent_versions_number: c.storage.max_cached_recent_versions_number,
+            max_prefetch_block_number: c.storage.max_prefetch_block_number,
             disable_remote_compactor: c.storage.disable_remote_compactor,
             share_buffer_upload_concurrency: c.storage.share_buffer_upload_concurrency,
             compactor_memory_limit_mb: s.compactor_memory_limit_mb,
             sstable_id_remote_fetch_number: c.storage.sstable_id_remote_fetch_number,
             min_sst_size_for_streaming_upload: c.storage.min_sst_size_for_streaming_upload,
-            max_sub_compaction: c.storage.max_sub_compaction,
             max_concurrent_compaction_task_number: c.storage.max_concurrent_compaction_task_number,
             max_version_pinning_duration_sec: c.storage.max_version_pinning_duration_sec,
             data_file_cache_dir: c.storage.data_file_cache.dir.clone(),
             data_file_cache_capacity_mb: c.storage.data_file_cache.capacity_mb,
             data_file_cache_file_capacity_mb: c.storage.data_file_cache.file_capacity_mb,
-            data_file_cache_device_align: c.storage.data_file_cache.device_align,
-            data_file_cache_device_io_size: c.storage.data_file_cache.device_io_size,
             data_file_cache_flushers: c.storage.data_file_cache.flushers,
             data_file_cache_reclaimers: c.storage.data_file_cache.reclaimers,
+            data_file_cache_recover_mode: c.storage.data_file_cache.recover_mode,
             data_file_cache_recover_concurrency: c.storage.data_file_cache.recover_concurrency,
-            data_file_cache_lfu_window_to_cache_size_ratio: c
-                .storage
-                .data_file_cache
-                .lfu_window_to_cache_size_ratio,
-            data_file_cache_lfu_tiny_lru_capacity_ratio: c
-                .storage
-                .data_file_cache
-                .lfu_tiny_lru_capacity_ratio,
-            data_file_cache_insert_rate_limit_mb: c.storage.data_file_cache.insert_rate_limit_mb,
-            data_file_cache_ring_buffer_capacity_mb: c
-                .storage
-                .data_file_cache
-                .ring_buffer_capacity_mb,
-            data_file_cache_catalog_bits: c.storage.data_file_cache.catalog_bits,
-            data_file_cache_compression: c.storage.data_file_cache.compression.clone(),
+            data_file_cache_indexer_shards: c.storage.data_file_cache.indexer_shards,
+            data_file_cache_compression: c.storage.data_file_cache.compression,
+            data_file_cache_flush_buffer_threshold_mb: s.block_file_cache_flush_buffer_threshold_mb,
+            data_file_cache_fifo_probation_ratio: c.storage.data_file_cache.fifo_probation_ratio,
+            data_file_cache_runtime_config: c.storage.data_file_cache.runtime_config.clone(),
+            data_file_cache_throttle,
             meta_file_cache_dir: c.storage.meta_file_cache.dir.clone(),
             meta_file_cache_capacity_mb: c.storage.meta_file_cache.capacity_mb,
             meta_file_cache_file_capacity_mb: c.storage.meta_file_cache.file_capacity_mb,
-            meta_file_cache_device_align: c.storage.meta_file_cache.device_align,
-            meta_file_cache_device_io_size: c.storage.meta_file_cache.device_io_size,
             meta_file_cache_flushers: c.storage.meta_file_cache.flushers,
             meta_file_cache_reclaimers: c.storage.meta_file_cache.reclaimers,
+            meta_file_cache_recover_mode: c.storage.meta_file_cache.recover_mode,
             meta_file_cache_recover_concurrency: c.storage.meta_file_cache.recover_concurrency,
-            meta_file_cache_lfu_window_to_cache_size_ratio: c
-                .storage
-                .meta_file_cache
-                .lfu_window_to_cache_size_ratio,
-            meta_file_cache_lfu_tiny_lru_capacity_ratio: c
-                .storage
-                .meta_file_cache
-                .lfu_tiny_lru_capacity_ratio,
-            meta_file_cache_insert_rate_limit_mb: c.storage.meta_file_cache.insert_rate_limit_mb,
-            meta_file_cache_ring_buffer_capacity_mb: c
-                .storage
-                .meta_file_cache
-                .ring_buffer_capacity_mb,
-            meta_file_cache_catalog_bits: c.storage.meta_file_cache.catalog_bits,
-            meta_file_cache_compression: c.storage.meta_file_cache.compression.clone(),
+            meta_file_cache_indexer_shards: c.storage.meta_file_cache.indexer_shards,
+            meta_file_cache_compression: c.storage.meta_file_cache.compression,
+            meta_file_cache_flush_buffer_threshold_mb: s.meta_file_cache_flush_buffer_threshold_mb,
+            meta_file_cache_fifo_probation_ratio: c.storage.meta_file_cache.fifo_probation_ratio,
+            meta_file_cache_runtime_config: c.storage.meta_file_cache.runtime_config.clone(),
+            meta_file_cache_throttle,
             cache_refill_data_refill_levels: c.storage.cache_refill.data_refill_levels.clone(),
             cache_refill_timeout_ms: c.storage.cache_refill.timeout_ms,
             cache_refill_concurrency: c.storage.cache_refill.concurrency,
@@ -230,30 +256,53 @@ impl From<(&RwConfig, &SystemParamsReader, &StorageMemoryConfig)> for StorageOpt
             cache_refill_unit: c.storage.cache_refill.unit,
             cache_refill_threshold: c.storage.cache_refill.threshold,
             max_preload_wait_time_mill: c.storage.max_preload_wait_time_mill,
-            object_store_streaming_read_timeout_ms: c
-                .storage
-                .object_store
-                .object_store_streaming_read_timeout_ms,
             compact_iter_recreate_timeout_ms: c.storage.compact_iter_recreate_timeout_ms,
-            object_store_streaming_upload_timeout_ms: c
-                .storage
-                .object_store
-                .object_store_streaming_upload_timeout_ms,
-            object_store_read_timeout_ms: c.storage.object_store.object_store_read_timeout_ms,
-            object_store_upload_timeout_ms: c.storage.object_store.object_store_upload_timeout_ms,
+
             max_preload_io_retry_times: c.storage.max_preload_io_retry_times,
-            backup_storage_url: p.backup_storage_url().to_string(),
-            backup_storage_directory: p.backup_storage_directory().to_string(),
+            backup_storage_url: p.backup_storage_url().to_owned(),
+            backup_storage_directory: p.backup_storage_directory().to_owned(),
             compactor_max_sst_key_count: c.storage.compactor_max_sst_key_count,
             compactor_max_task_multiplier: c.storage.compactor_max_task_multiplier,
             compactor_max_sst_size: c.storage.compactor_max_sst_size,
             enable_fast_compaction: c.storage.enable_fast_compaction,
+            check_compaction_result: c.storage.check_compaction_result,
             mem_table_spill_threshold: c.storage.mem_table_spill_threshold,
             object_store_config: c.storage.object_store.clone(),
             compactor_fast_max_compact_delete_ratio: c
                 .storage
                 .compactor_fast_max_compact_delete_ratio,
             compactor_fast_max_compact_task_size: c.storage.compactor_fast_max_compact_task_size,
+            compactor_iter_max_io_retry_times: c.storage.compactor_iter_max_io_retry_times,
+            compactor_concurrent_uploading_sst_count: c
+                .storage
+                .compactor_concurrent_uploading_sst_count,
+            time_travel_version_cache_capacity: c.storage.time_travel_version_cache_capacity,
+            compactor_max_overlap_sst_count: c.storage.compactor_max_overlap_sst_count,
+            compactor_max_preload_meta_file_count: c.storage.compactor_max_preload_meta_file_count,
+
+            iceberg_compaction_target_file_size_mb: c
+                .storage
+                .iceberg_compaction_target_file_size_mb,
+            iceberg_compaction_enable_validate: c.storage.iceberg_compaction_enable_validate,
+            iceberg_compaction_max_record_batch_rows: c
+                .storage
+                .iceberg_compaction_max_record_batch_rows,
+            iceberg_compaction_write_parquet_max_row_group_rows: c
+                .storage
+                .iceberg_compaction_write_parquet_max_row_group_rows,
+            iceberg_compaction_min_size_per_partition_mb: c
+                .storage
+                .iceberg_compaction_min_size_per_partition_mb,
+            iceberg_compaction_max_file_count_per_partition: c
+                .storage
+                .iceberg_compaction_max_file_count_per_partition,
+            vector_file_block_size_kb: c.storage.vector_file_block_size_kb,
+            vector_block_cache_capacity_mb: s.vector_block_cache_capacity_mb,
+            vector_block_cache_shard_num: s.vector_block_cache_shard_num,
+            vector_block_cache_eviction_config: s.vector_block_cache_eviction_config.clone(),
+            vector_meta_cache_capacity_mb: s.vector_meta_cache_capacity_mb,
+            vector_meta_cache_shard_num: s.vector_meta_cache_shard_num,
+            vector_meta_cache_eviction_config: s.vector_meta_cache_eviction_config.clone(),
         }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -92,7 +92,7 @@ impl VisitPlan for Counter {
     where
         F: FnMut(&mut Self),
     {
-        if !self.counts.get(&plan.id()).is_some_and(|c| *c > 1) {
+        if self.counts.get(&plan.id()).is_none_or(|c| *c <= 1) {
             f(self);
         }
     }

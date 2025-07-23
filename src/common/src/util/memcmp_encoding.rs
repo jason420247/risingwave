@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,15 @@ use std::ops::Deref;
 
 use bytes::{Buf, BufMut};
 use itertools::Itertools;
+use risingwave_common_estimate_size::EstimateSize;
 use serde::{Deserialize, Serialize};
 
 use super::iter_util::{ZipEqDebug, ZipEqFast};
 use crate::array::{ArrayImpl, DataChunk};
-use crate::estimate_size::EstimateSize;
 use crate::row::{OwnedRow, Row};
 use crate::types::{
-    DataType, Date, Datum, Int256, ScalarImpl, Serial, Time, Timestamp, Timestamptz, ToDatumRef,
-    F32, F64,
+    DataType, Date, Datum, F32, F64, Int256, ScalarImpl, Serial, Time, Timestamp, Timestamptz,
+    ToDatumRef,
 };
 use crate::util::sort_util::{ColumnOrder, OrderType};
 
@@ -151,9 +151,10 @@ fn calculate_encoded_size_inner(
                 deserializer.deserialize_decimal()?;
                 0 // the len is not used since decimal is not a fixed length type
             }
-            // these two types is var-length and should only be determine at runtime.
+            // these types are var-length and should only be determine at runtime.
             // TODO: need some test for this case (e.g. e2e test)
-            DataType::List { .. } => deserializer.skip_bytes()?,
+            DataType::List { .. } | DataType::Map(_) => deserializer.skip_bytes()?,
+            DataType::Vector(_) => todo!("VECTOR_PLACEHOLDER"),
             DataType::Struct(t) => t
                 .types()
                 .map(|field| {
@@ -333,15 +334,12 @@ pub fn decode_row(
 mod tests {
     use std::ops::Neg;
 
-    use itertools::Itertools;
-    use rand::thread_rng;
+    use rand::rng as thread_rng;
 
     use super::*;
-    use crate::array::{DataChunk, ListValue, StructValue};
-    use crate::row::{OwnedRow, RowExt};
-    use crate::types::{DataType, FloatExt, ScalarImpl, F32};
-    use crate::util::iter_util::ZipEqFast;
-    use crate::util::sort_util::{ColumnOrder, OrderType};
+    use crate::array::{ListValue, StructValue};
+    use crate::row::RowExt;
+    use crate::types::FloatExt;
 
     #[test]
     fn test_memcomparable() {
@@ -546,7 +544,7 @@ mod tests {
         use rand::seq::SliceRandom;
 
         fn serialize(f: F32) -> MemcmpEncoded {
-            encode_value(&Some(ScalarImpl::from(f)), OrderType::default()).unwrap()
+            encode_value(Some(ScalarImpl::from(f)), OrderType::default()).unwrap()
         }
 
         fn deserialize(data: MemcmpEncoded) -> F32 {
@@ -621,6 +619,46 @@ mod tests {
 
         let encoded_row2 = encode_row(row2.project(&order_col_indices), &order_types).unwrap();
         assert!(encoded_row1 < encoded_row2);
+    }
+
+    // See also `row_value_encode_decode()` in `src/common/src/row/owned_row.rs`
+    #[test]
+    fn test_decode_row() {
+        let encoded: Vec<u8> = vec![
+            0, 128, 0, 0, 42, 255, 127, 255, 255, 255, 255, 255, 255, 213, 1, 0, 193, 186, 163,
+            215, 255, 254, 153, 144, 144, 144, 144, 144, 255, 255, 249, 0, 1, 98, 97, 97, 97, 97,
+            114, 0, 0, 6,
+        ];
+
+        let order_types = vec![
+            OrderType::ascending(),
+            OrderType::descending(),
+            OrderType::ascending(),
+            OrderType::ascending(),
+            OrderType::descending(),
+            OrderType::ascending(),
+        ];
+        let data_types = vec![
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Timestamp,
+            DataType::Float32,
+            DataType::Varchar,
+            DataType::Bytea,
+        ];
+
+        let result = decode_row(&encoded, &data_types, &order_types).unwrap();
+        // println!("{:?}", &result);
+
+        let expected = OwnedRow::new(vec![
+            Some(ScalarImpl::Int32(42)),
+            Some(ScalarImpl::Int64(42)),
+            None,
+            Some(ScalarImpl::Float32(23.33.into())),
+            Some(ScalarImpl::Utf8("fooooo".into())),
+            Some(ScalarImpl::Bytea("baaaar".as_bytes().into())),
+        ]);
+        assert_eq!(&result, &expected);
     }
 
     #[test]

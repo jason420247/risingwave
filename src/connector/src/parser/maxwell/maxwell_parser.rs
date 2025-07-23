@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::error::{ErrorCode, Result, RwError};
+use risingwave_common::bail;
 
+use crate::error::ConnectorResult;
 use crate::only_parse_payload;
 use crate::parser::unified::maxwell::MaxwellChangeEvent;
 use crate::parser::unified::util::apply_row_operation_on_stream_chunk_writer;
 use crate::parser::{
-    AccessBuilderImpl, ByteStreamSourceParser, EncodingProperties, EncodingType, ParserFormat,
+    AccessBuilderImpl, ByteStreamSourceParser, EncodingProperties, ParserFormat,
     SourceStreamChunkRowWriter, SpecificParserConfig,
 };
 use crate::source::{SourceColumnDesc, SourceContext, SourceContextRef};
@@ -35,21 +36,17 @@ impl MaxwellParser {
         props: SpecificParserConfig,
         rw_columns: Vec<SourceColumnDesc>,
         source_ctx: SourceContextRef,
-    ) -> Result<Self> {
+    ) -> ConnectorResult<Self> {
         match props.encoding_config {
             EncodingProperties::Json(_) => {
-                let payload_builder =
-                    AccessBuilderImpl::new_default(props.encoding_config, EncodingType::Value)
-                        .await?;
+                let payload_builder = AccessBuilderImpl::new_default(props.encoding_config).await?;
                 Ok(Self {
                     payload_builder,
                     rw_columns,
                     source_ctx,
                 })
             }
-            _ => Err(RwError::from(ErrorCode::ProtocolError(
-                "unsupported encoding for Maxwell".to_string(),
-            ))),
+            _ => bail!("unsupported encoding for Maxwell"),
         }
     }
 
@@ -57,8 +54,9 @@ impl MaxwellParser {
         &mut self,
         payload: Vec<u8>,
         mut writer: SourceStreamChunkRowWriter<'_>,
-    ) -> Result<()> {
-        let payload_accessor = self.payload_builder.generate_accessor(payload).await?;
+    ) -> ConnectorResult<()> {
+        let m = writer.source_meta();
+        let payload_accessor = self.payload_builder.generate_accessor(payload, m).await?;
         let row_op = MaxwellChangeEvent::new(payload_accessor);
 
         apply_row_operation_on_stream_chunk_writer(row_op, &mut writer).map_err(Into::into)
@@ -83,7 +81,7 @@ impl ByteStreamSourceParser for MaxwellParser {
         _key: Option<Vec<u8>>,
         payload: Option<Vec<u8>>,
         writer: SourceStreamChunkRowWriter<'a>,
-    ) -> Result<()> {
+    ) -> ConnectorResult<()> {
         // restrict the behaviours since there is no corresponding
         // key/value test for maxwell yet.
         only_parse_payload!(self, payload, writer)

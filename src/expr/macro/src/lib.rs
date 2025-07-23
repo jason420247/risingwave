@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,25 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lint_reasons)]
 #![feature(let_chains)]
 
 use std::vec;
 
-use context::{generate_captured_function, CaptureContextAttr, DefineContextAttr};
+use context::{CaptureContextAttr, DefineContextAttr, generate_captured_function};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use syn::{Error, ItemFn, Result};
 
 mod context;
-mod gen;
+mod r#gen;
 mod parse;
 mod types;
 mod utils;
 
 /// Defining the RisingWave SQL function from a Rust function.
 ///
-/// [Online version of this doc.](https://risingwavelabs.github.io/risingwave/risingwave_expr_macro/attr.function.html)
+/// [Online version of this doc.](https://risingwavelabs.github.io/risingwave/rustdoc/risingwave_expr_macro/attr.function.html)
 ///
 /// # Table of Contents
 ///
@@ -70,8 +69,8 @@ mod utils;
 /// name ( [arg_types],* [...] ) [ -> [setof] return_type ]
 /// ```
 ///
-/// Where `name` is the function name in `snake_case`, which must match the function name defined
-/// in `prost`.
+/// Where `name` is the function name in `snake_case`, which must match the function name (in `UPPER_CASE`) defined
+/// in `proto/expr.proto`.
 ///
 /// `arg_types` is a comma-separated list of argument types. The allowed data types are listed in
 /// in the `name` column of the appendix's [type matrix]. Wildcards or `auto` can also be used, as
@@ -98,7 +97,7 @@ mod utils;
 /// }
 /// ```
 ///
-/// ## Type Expansion
+/// ## Type Expansion with `*`
 ///
 /// Types can be automatically expanded to multiple types using wildcards. Here are some examples:
 ///
@@ -115,13 +114,17 @@ mod utils;
 /// #[function("cast(varchar) -> int64")]
 /// ```
 ///
-/// Please note the difference between `*` and `any`. `*` will generate a function for each type,
+/// Please note the difference between `*` and `any`: `*` will generate a function for each type,
 /// whereas `any` will only generate one function with a dynamic data type `Scalar`.
+/// This is similar to `impl T` and `dyn T` in Rust. The performance of using `*` would be much better than `any`.
+/// But we do not always prefer `*` due to better performance. In some cases, using `any` is more convenient.
+/// For example, in array functions, the element type of `ListValue` is `Scalar(Ref)Impl`.
+/// It is unnecessary to convert it from/into various `T`.
 ///
-/// ## Automatic Type Inference
+/// ## Automatic Type Inference with `auto`
 ///
 /// Correspondingly, the return type can be denoted as `auto` to be automatically inferred based on
-/// the input types. It will be inferred as the smallest type that can accommodate all input types.
+/// the input types. It will be inferred as the _smallest type_ that can accommodate all input types.
 ///
 /// For example, `#[function("add(*int, *int) -> auto")]` will be expanded to:
 ///
@@ -142,10 +145,10 @@ mod utils;
 /// #[function("neg(int64) -> int64")]
 /// ```
 ///
-/// ## Custom Type Inference Function
+/// ## Custom Type Inference Function with `type_infer`
 ///
 /// A few functions might have a return type that dynamically changes based on the input argument
-/// types, such as `unnest`.
+/// types, such as `unnest`. This is mainly for composite types like `anyarray`, `struct`, and `anymap`.
 ///
 /// In such cases, the `type_infer` option can be used to specify a function to infer the return
 /// type based on the input argument types. Its function signature is
@@ -163,7 +166,7 @@ mod utils;
 /// )]
 /// ```
 ///
-/// This type inference function will be invoked at the frontend.
+/// This type inference function will be invoked at the frontend (`infer_type_with_sigmap`).
 ///
 /// # Rust Function Signature
 ///
@@ -182,22 +185,22 @@ mod utils;
 ///
 /// ## Nullable Arguments
 ///
-/// The functions above will only be called when all arguments are not null. If null arguments need
-/// to be considered, the `Option` type can be used:
+/// The functions above will only be called when all arguments are not null.
+/// It will return null if any argument is null.
+/// If null arguments need to be considered, the `Option` type can be used:
 ///
 /// ```ignore
 /// #[function("trim_array(anyarray, int32) -> anyarray")]
-/// fn trim_array(array: Option<ListRef<'_>>, n: Option<i32>) -> ListValue {...}
+/// fn trim_array(array: ListRef<'_>, n: Option<i32>) -> ListValue {...}
 /// ```
 ///
-/// Note that we currently only support all arguments being either `Option` or non-`Option`. Mixed
-/// cases are not supported.
+/// This function will be called when `n` is null, but not when `array` is null.
 ///
-/// ## Return Value
+/// ## Return `NULL`s and Errors
 ///
 /// Similarly, the return value type can be one of the following:
 ///
-/// - `T`: Indicates that a non-null value is always returned, and errors will not occur.
+/// - `T`: Indicates that a non-null value is always returned (for non-null inputs), and errors will not occur.
 /// - `Option<T>`: Indicates that a null value may be returned, but errors will not occur.
 /// - `Result<T>`: Indicates that an error may occur, but a null value will not be returned.
 /// - `Result<Option<T>>`: Indicates that a null value may be returned, and an error may also occur.
@@ -278,11 +281,11 @@ mod utils;
 /// }
 /// ```
 ///
-/// The `prebuild` argument can be specified, and its value is a Rust expression used to construct a
-/// new variable from the input arguments of the function. Here `$1`, `$2` represent the second and
-/// third arguments of the function (indexed from 0), and their types are `&str`. In the Rust
-/// function signature, these positions of parameters will be omitted, replaced by an extra new
-/// variable at the end.
+/// The `prebuild` argument can be specified, and its value is a Rust expression `Type::method(...)`
+/// used to construct a new variable of `Type` from the input arguments of the function.
+/// Here `$1`, `$2` represent the second and third arguments of the function (indexed from 0),
+/// and their types are `&str`. In the Rust function signature, these positions of parameters will
+/// be omitted, replaced by an extra new variable at the end.
 ///
 /// This macro generates two versions of the function. If all the input parameters that `prebuild`
 /// depends on are constants, it will precompute them during the build function. Otherwise, it will
@@ -397,7 +400,7 @@ mod utils;
 /// | anyarray               | `any[]`              | `ListValue`   | `ListRef<'_>`      |
 /// | struct                 | `record`             | `StructValue` | `StructRef<'_>`    |
 /// | T[^1][]                | `T[]`                | `ListValue`   | `ListRef<'_>`      |
-/// | struct<name T[^1], ..> | `struct<name T, ..>` | `(T, ..)`     | `(&T, ..)`         |
+/// | struct<`name_T`[^1], ..> | `struct<name T, ..>` | `(T, ..)`     | `(&T, ..)`         |
 ///
 /// [^1]: `T` could be any base type
 ///
@@ -420,6 +423,16 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Different from `#[function]`, which implements the `Expression` trait for a rust scalar function,
+/// `#[build_function]` is used when you already implemented `Expression` manually.
+///
+/// The expected input is a "build" function:
+/// ```ignore
+/// fn(data_type: DataType, children: Vec<BoxedExpression>) -> Result<BoxedExpression>
+/// ```
+///
+/// It generates the function descriptor using the "build" function and
+/// registers the description to the `FUNC_SIG_MAP`.
 #[proc_macro_attribute]
 pub fn build_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     fn inner(attr: TokenStream, item: TokenStream) -> Result<TokenStream2> {
@@ -522,8 +535,8 @@ struct UserFunctionAttr {
     write: bool,
     /// Whether the last argument type is `retract: bool`.
     retract: bool,
-    /// The argument type are `Option`s.
-    arg_option: bool,
+    /// Whether each argument type is `Option<T>`.
+    args_option: Vec<bool>,
     /// If the first argument type is `&mut T`, then `Some(T)`.
     first_mut_ref_arg: Option<String>,
     /// The return type kind.
@@ -610,7 +623,7 @@ impl UserFunctionAttr {
         !self.async_
             && !self.write
             && !self.context
-            && !self.arg_option
+            && self.args_option.iter().all(|b| !b)
             && self.return_type_kind == ReturnTypeKind::T
     }
 }
@@ -620,7 +633,7 @@ impl UserFunctionAttr {
 pub fn define_context(def: TokenStream) -> TokenStream {
     fn inner(def: TokenStream) -> Result<TokenStream2> {
         let attr: DefineContextAttr = syn::parse(def)?;
-        attr.gen()
+        attr.r#gen()
     }
 
     match inner(def) {
@@ -638,6 +651,8 @@ pub fn capture_context(attr: TokenStream, item: TokenStream) -> TokenStream {
     fn inner(attr: TokenStream, item: TokenStream) -> Result<TokenStream2> {
         let attr: CaptureContextAttr = syn::parse(attr)?;
         let user_fn: ItemFn = syn::parse(item)?;
+
+        // Generate captured function
         generate_captured_function(attr, user_fn)
     }
     match inner(attr, item) {

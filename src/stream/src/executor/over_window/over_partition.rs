@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,221 +15,88 @@
 //! Types and functions that store or manipulate state/cache inside one single over window
 //! partition.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeInclusive};
 
 use delta_btree_map::{Change, DeltaBTreeMap};
+use educe::Educe;
 use futures_async_stream::for_await;
 use risingwave_common::array::stream_record::Record;
-use risingwave_common::estimate_size::collections::EstimatedBTreeMap;
-use risingwave_common::row::{OwnedRow, Row};
+use risingwave_common::row::{OwnedRow, Row, RowExt};
 use risingwave_common::session_config::OverWindowCachePolicy as CachePolicy;
-use risingwave_common::types::Sentinelled;
-use risingwave_expr::window_function::{FrameBounds, StateKey, WindowFuncCall};
-use risingwave_storage::store::PrefetchOptions;
+use risingwave_common::types::{Datum, Sentinelled};
+use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_expr::window_function::{StateKey, WindowStates, create_window_state};
 use risingwave_storage::StateStore;
+use risingwave_storage::store::PrefetchOptions;
 
-use super::general::RowConverter;
-use crate::executor::test_utils::prelude::StateTable;
+use super::general::{Calls, RowConverter};
+use super::range_cache::{CacheKey, PartitionCache};
+use crate::common::table::state_table::StateTable;
+use crate::consistency::{consistency_error, enable_strict_consistency};
 use crate::executor::StreamExecutorResult;
-
-pub(super) type CacheKey = Sentinelled<StateKey>;
-
-/// Range cache for one over window partition.
-/// The cache entries can be:
-///
-/// - `(Normal)*`
-/// - `Smallest, (Normal)*, Largest`
-/// - `(Normal)+, Largest`
-/// - `Smallest, (Normal)+`
-///
-/// This means it's impossible to only have one sentinel in the cache without any normal entry,
-/// and, each of the two types of sentinel can only appear once. Also, since sentinels are either
-/// smallest or largest, they always appear at the beginning or the end of the cache.
-pub(super) type PartitionCache = EstimatedBTreeMap<CacheKey, OwnedRow>;
+use crate::executor::over_window::frame_finder::*;
 
 /// Changes happened in one over window partition.
 pub(super) type PartitionDelta = BTreeMap<CacheKey, Change<OwnedRow>>;
 
-pub(super) fn new_empty_partition_cache() -> PartitionCache {
-    let mut cache = PartitionCache::new();
-    cache.insert(CacheKey::Smallest, OwnedRow::empty());
-    cache.insert(CacheKey::Largest, OwnedRow::empty());
-    cache
-}
-
-const MAGIC_CACHE_SIZE: usize = 1024;
-const MAGIC_JITTER_PREVENTION: usize = MAGIC_CACHE_SIZE / 8;
-
-pub(super) fn shrink_partition_cache(
-    this_partition_key: &OwnedRow,
-    range_cache: &mut PartitionCache,
-    cache_policy: CachePolicy,
-    recently_accessed_range: RangeInclusive<StateKey>,
-) {
-    tracing::trace!(
-        this_partition_key=?this_partition_key,
-        cache_policy=?cache_policy,
-        recently_accessed_range=?recently_accessed_range,
-        "find the range to retain in the range cache"
-    );
-
-    let (start, end) = match cache_policy {
-        CachePolicy::Full => {
-            // evict nothing if the policy is to cache full partition
-            return;
-        }
-        CachePolicy::Recent => {
-            let (sk_start, sk_end) = recently_accessed_range.into_inner();
-            let (ck_start, ck_end) = (CacheKey::from(sk_start), CacheKey::from(sk_end));
-
-            let mut cursor = range_cache.inner().upper_bound(Bound::Excluded(&ck_start));
-            for _ in 0..MAGIC_JITTER_PREVENTION {
-                if cursor.key().is_none() {
-                    break;
-                }
-                cursor.move_prev();
-            }
-            let start = cursor
-                .key()
-                .unwrap_or_else(|| range_cache.first_key_value().unwrap().0)
-                .clone();
-
-            let mut cursor = range_cache.inner().lower_bound(Bound::Excluded(&ck_end));
-            for _ in 0..MAGIC_JITTER_PREVENTION {
-                if cursor.key().is_none() {
-                    break;
-                }
-                cursor.move_next();
-            }
-            let end = cursor
-                .key()
-                .unwrap_or_else(|| range_cache.last_key_value().unwrap().0)
-                .clone();
-
-            (start, end)
-        }
-        CachePolicy::RecentFirstN => {
-            if range_cache.len() <= MAGIC_CACHE_SIZE {
-                // no need to evict if cache len <= N
-                return;
-            } else {
-                let (sk_start, _sk_end) = recently_accessed_range.into_inner();
-                let ck_start = CacheKey::from(sk_start);
-
-                let mut capacity_remain = MAGIC_CACHE_SIZE; // precision is not important here, code simplicity is first
-
-                let mut cursor = range_cache.inner().upper_bound(Bound::Excluded(&ck_start));
-                // go back for at most `MAGIC_JITTER_PREVENTION` entries
-                for _ in 0..MAGIC_JITTER_PREVENTION {
-                    if cursor.key().is_none() {
-                        break;
-                    }
-                    cursor.move_prev();
-                    capacity_remain -= 1;
-                }
-                let start = cursor
-                    .key()
-                    .unwrap_or_else(|| range_cache.first_key_value().unwrap().0)
-                    .clone();
-
-                let mut cursor = range_cache.inner().lower_bound(Bound::Included(&ck_start));
-                // go forward for at most `capacity_remain` entries
-                for _ in 0..capacity_remain {
-                    if cursor.key().is_none() {
-                        break;
-                    }
-                    cursor.move_next();
-                }
-                let end = cursor
-                    .key()
-                    .unwrap_or_else(|| range_cache.last_key_value().unwrap().0)
-                    .clone();
-
-                (start, end)
-            }
-        }
-        CachePolicy::RecentLastN => {
-            if range_cache.len() <= MAGIC_CACHE_SIZE {
-                // no need to evict if cache len <= N
-                return;
-            } else {
-                let (_sk_start, sk_end) = recently_accessed_range.into_inner();
-                let ck_end = CacheKey::from(sk_end);
-
-                let mut capacity_remain = MAGIC_CACHE_SIZE; // precision is not important here, code simplicity is first
-
-                let mut cursor = range_cache.inner().lower_bound(Bound::Excluded(&ck_end));
-                // go forward for at most `MAGIC_JITTER_PREVENTION` entries
-                for _ in 0..MAGIC_JITTER_PREVENTION {
-                    if cursor.key().is_none() {
-                        break;
-                    }
-                    cursor.move_next();
-                    capacity_remain -= 1;
-                }
-                let end = cursor
-                    .key()
-                    .unwrap_or_else(|| range_cache.last_key_value().unwrap().0)
-                    .clone();
-
-                let mut cursor = range_cache.inner().upper_bound(Bound::Included(&ck_end));
-                // go back for at most `capacity_remain` entries
-                for _ in 0..capacity_remain {
-                    if cursor.key().is_none() {
-                        break;
-                    }
-                    cursor.move_prev();
-                }
-                let start = cursor
-                    .key()
-                    .unwrap_or_else(|| range_cache.first_key_value().unwrap().0)
-                    .clone();
-
-                (start, end)
-            }
-        }
-    };
-
-    tracing::trace!(
-        this_partition_key=?this_partition_key,
-        retain_range=?(&start..=&end),
-        "retain range in the range cache"
-    );
-
-    let (left_removed, right_removed) = range_cache.retain_range(&start..=&end);
-    if range_cache.is_empty() {
-        if !left_removed.is_empty() || !right_removed.is_empty() {
-            range_cache.insert(CacheKey::Smallest, OwnedRow::empty());
-            range_cache.insert(CacheKey::Largest, OwnedRow::empty());
-        }
-    } else {
-        if !left_removed.is_empty() {
-            range_cache.insert(CacheKey::Smallest, OwnedRow::empty());
-        }
-        if !right_removed.is_empty() {
-            range_cache.insert(CacheKey::Largest, OwnedRow::empty());
-        }
-    }
-}
-
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(super) struct OverPartitionStats {
+    // stats for range cache operations
     pub lookup_count: u64,
     pub left_miss_count: u64,
     pub right_miss_count: u64,
+
+    // stats for window function state computation
+    pub accessed_entry_count: u64,
+    pub compute_count: u64,
+    pub same_output_count: u64,
+}
+
+/// [`AffectedRange`] represents a range of keys that are affected by a delta.
+/// The [`CacheKey`] fields are keys in the partition range cache + delta, which is
+/// represented by [`DeltaBTreeMap`].
+///
+/// - `first_curr_key` and `last_curr_key` are the current keys of the first and the last
+///   windows affected. They are used to pinpoint the bounds where state needs to be updated.
+/// - `first_frame_start` and `last_frame_end` are the frame start and end of the first and
+///   the last windows affected. They are used to pinpoint the bounds where state needs to be
+///   included for computing the new state.
+#[derive(Debug, Educe)]
+#[educe(Clone, Copy)]
+pub(super) struct AffectedRange<'a> {
+    pub first_frame_start: &'a CacheKey,
+    pub first_curr_key: &'a CacheKey,
+    pub last_curr_key: &'a CacheKey,
+    pub last_frame_end: &'a CacheKey,
+}
+
+impl<'a> AffectedRange<'a> {
+    fn new(
+        first_frame_start: &'a CacheKey,
+        first_curr_key: &'a CacheKey,
+        last_curr_key: &'a CacheKey,
+        last_frame_end: &'a CacheKey,
+    ) -> Self {
+        Self {
+            first_frame_start,
+            first_curr_key,
+            last_curr_key,
+            last_frame_end,
+        }
+    }
 }
 
 /// A wrapper of [`PartitionCache`] that provides helper methods to manipulate the cache.
 /// By putting this type inside `private` module, we can avoid misuse of the internal fields and
 /// methods.
 pub(super) struct OverPartition<'a, S: StateStore> {
-    this_partition_key: &'a OwnedRow,
+    deduped_part_key: &'a OwnedRow,
     range_cache: &'a mut PartitionCache,
     cache_policy: CachePolicy,
 
-    calls: &'a [WindowFuncCall],
+    calls: &'a Calls,
     row_conv: RowConverter<'a>,
 
     stats: OverPartitionStats,
@@ -242,14 +109,14 @@ const MAGIC_BATCH_SIZE: usize = 512;
 impl<'a, S: StateStore> OverPartition<'a, S> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        this_partition_key: &'a OwnedRow,
+        deduped_part_key: &'a OwnedRow,
         cache: &'a mut PartitionCache,
         cache_policy: CachePolicy,
-        calls: &'a [WindowFuncCall],
+        calls: &'a Calls,
         row_conv: RowConverter<'a>,
     ) -> Self {
         Self {
-            this_partition_key,
+            deduped_part_key,
             range_cache: cache,
             cache_policy,
 
@@ -271,55 +138,189 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
 
     /// Get the number of cached entries ignoring sentinels.
     pub fn cache_real_len(&self) -> usize {
-        let len = self.range_cache.inner().len();
-        if len <= 1 {
-            debug_assert!(self
-                .range_cache
-                .inner()
-                .first_key_value()
-                .map(|(k, _)| k.is_normal())
-                .unwrap_or(true));
-            return len;
+        self.range_cache.normal_len()
+    }
+
+    /// Build changes for the partition, with the given `delta`. Necessary maintenance of the range
+    /// cache will be done during this process, like loading rows from the `table` into the cache.
+    pub async fn build_changes(
+        &mut self,
+        table: &StateTable<S>,
+        mut delta: PartitionDelta,
+    ) -> StreamExecutorResult<(
+        BTreeMap<StateKey, Record<OwnedRow>>,
+        Option<RangeInclusive<StateKey>>,
+    )> {
+        let calls = self.calls;
+        let input_schema_len = table.get_data_types().len() - calls.len();
+        let numbering_only = calls.numbering_only;
+        let has_rank = calls.has_rank;
+
+        // return values
+        let mut part_changes = BTreeMap::new();
+        let mut accessed_range: Option<RangeInclusive<StateKey>> = None;
+
+        // stats
+        let mut accessed_entry_count = 0;
+        let mut compute_count = 0;
+        let mut same_output_count = 0;
+
+        // Find affected ranges, this also ensures that all rows in the affected ranges are loaded into the cache.
+        let (part_with_delta, affected_ranges) =
+            self.find_affected_ranges(table, &mut delta).await?;
+
+        let snapshot = part_with_delta.snapshot();
+        let delta = part_with_delta.delta();
+        let last_delta_key = delta.last_key_value().map(|(k, _)| k.as_normal_expect());
+
+        // Generate delete changes first, because deletes are skipped during iteration over
+        // `part_with_delta` in the next step.
+        for (key, change) in delta {
+            if change.is_delete() {
+                part_changes.insert(
+                    key.as_normal_expect().clone(),
+                    Record::Delete {
+                        old_row: snapshot.get(key).unwrap().clone(),
+                    },
+                );
+            }
         }
-        // len >= 2
-        let cache_inner = self.range_cache.inner();
-        let sentinels = [
-            // sentinels only appear at the beginning and/or the end
-            cache_inner.first_key_value().unwrap().0.is_sentinel(),
-            cache_inner.last_key_value().unwrap().0.is_sentinel(),
-        ];
-        len - sentinels.into_iter().filter(|x| *x).count()
-    }
 
-    fn cache_real_first_key(&self) -> Option<&StateKey> {
-        self.range_cache
-            .inner()
-            .iter()
-            .find(|(k, _)| k.is_normal())
-            .map(|(k, _)| k.as_normal_expect())
-    }
+        for AffectedRange {
+            first_frame_start,
+            first_curr_key,
+            last_curr_key,
+            last_frame_end,
+        } in affected_ranges
+        {
+            assert!(first_frame_start <= first_curr_key);
+            assert!(first_curr_key <= last_curr_key);
+            assert!(last_curr_key <= last_frame_end);
+            assert!(first_frame_start.is_normal());
+            assert!(first_curr_key.is_normal());
+            assert!(last_curr_key.is_normal());
+            assert!(last_frame_end.is_normal());
 
-    fn cache_real_last_key(&self) -> Option<&StateKey> {
-        self.range_cache
-            .inner()
-            .iter()
-            .rev()
-            .find(|(k, _)| k.is_normal())
-            .map(|(k, _)| k.as_normal_expect())
-    }
+            let last_delta_key = last_delta_key.unwrap();
 
-    fn cache_left_is_sentinel(&self) -> bool {
-        self.range_cache
-            .first_key_value()
-            .map(|(k, _)| k.is_sentinel())
-            .unwrap_or(false)
-    }
+            if let Some(accessed_range) = accessed_range.as_mut() {
+                let min_start = first_frame_start
+                    .as_normal_expect()
+                    .min(accessed_range.start())
+                    .clone();
+                let max_end = last_frame_end
+                    .as_normal_expect()
+                    .max(accessed_range.end())
+                    .clone();
+                *accessed_range = min_start..=max_end;
+            } else {
+                accessed_range = Some(
+                    first_frame_start.as_normal_expect().clone()
+                        ..=last_frame_end.as_normal_expect().clone(),
+                );
+            }
 
-    fn cache_right_is_sentinel(&self) -> bool {
-        self.range_cache
-            .last_key_value()
-            .map(|(k, _)| k.is_sentinel())
-            .unwrap_or(false)
+            let mut states =
+                WindowStates::new(calls.iter().map(create_window_state).try_collect()?);
+
+            // Populate window states with the affected range of rows.
+            {
+                let mut cursor = part_with_delta
+                    .before(first_frame_start)
+                    .expect("first frame start key must exist");
+
+                while let Some((key, row)) = cursor.next() {
+                    accessed_entry_count += 1;
+
+                    for (call, state) in calls.iter().zip_eq_fast(states.iter_mut()) {
+                        // TODO(rc): batch appending
+                        // TODO(rc): append not only the arguments but also the old output for optimization
+                        state.append(
+                            key.as_normal_expect().clone(),
+                            row.project(call.args.val_indices())
+                                .into_owned_row()
+                                .as_inner()
+                                .into(),
+                        );
+                    }
+
+                    if key == last_frame_end {
+                        break;
+                    }
+                }
+            }
+
+            // Slide to the first affected key. We can safely pass in `first_curr_key` here
+            // because it definitely exists in the states by the definition of affected range.
+            states.just_slide_to(first_curr_key.as_normal_expect())?;
+            let mut curr_key_cursor = part_with_delta.before(first_curr_key).unwrap();
+            assert_eq!(
+                states.curr_key(),
+                curr_key_cursor
+                    .peek_next()
+                    .map(|(k, _)| k)
+                    .map(CacheKey::as_normal_expect)
+            );
+
+            // Slide and generate changes.
+            while let Some((key, row)) = curr_key_cursor.next() {
+                let mut should_stop = false;
+
+                let output = states.slide_no_evict_hint()?;
+                compute_count += 1;
+
+                let old_output = &row.as_inner()[input_schema_len..];
+                if !old_output.is_empty() && old_output == output {
+                    same_output_count += 1;
+
+                    if numbering_only {
+                        if has_rank {
+                            // It's possible that an `Insert` doesn't affect it's ties but affects
+                            // all the following rows, so we need to check the `order_key`.
+                            if key.as_normal_expect().order_key > last_delta_key.order_key {
+                                // there won't be any more changes after this point, we can stop early
+                                should_stop = true;
+                            }
+                        } else if key.as_normal_expect() >= last_delta_key {
+                            // there won't be any more changes after this point, we can stop early
+                            should_stop = true;
+                        }
+                    }
+                }
+
+                let new_row = OwnedRow::new(
+                    row.as_inner()
+                        .iter()
+                        .take(input_schema_len)
+                        .cloned()
+                        .chain(output)
+                        .collect(),
+                );
+
+                if let Some(old_row) = snapshot.get(key).cloned() {
+                    // update
+                    if old_row != new_row {
+                        part_changes.insert(
+                            key.as_normal_expect().clone(),
+                            Record::Update { old_row, new_row },
+                        );
+                    }
+                } else {
+                    // insert
+                    part_changes.insert(key.as_normal_expect().clone(), Record::Insert { new_row });
+                }
+
+                if should_stop || key == last_curr_key {
+                    break;
+                }
+            }
+        }
+
+        self.stats.accessed_entry_count += accessed_entry_count;
+        self.stats.compute_count += compute_count;
+        self.stats.same_output_count += same_output_count;
+
+        Ok((part_changes, accessed_range))
     }
 
     /// Write a change record to state table and cache.
@@ -339,7 +340,7 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
             Record::Delete { .. } => {
                 self.range_cache.remove(&CacheKey::from(key));
 
-                if self.cache_real_len() == 0 && self.range_cache.len() == 1 {
+                if self.range_cache.normal_len() == 0 && self.range_cache.len() == 1 {
                     // only one sentinel remains, should insert the other
                     self.range_cache
                         .insert(CacheKey::Smallest, OwnedRow::empty());
@@ -352,23 +353,86 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
 
     /// Find all ranges in the partition that are affected by the given delta.
     /// The returned ranges are guaranteed to be sorted and non-overlapping. All keys in the ranges
-    /// are guaranteed to be cached.
-    pub async fn find_affected_ranges<'s, 'cache>(
+    /// are guaranteed to be cached, which means they should be [`Sentinelled::Normal`]s.
+    async fn find_affected_ranges<'s, 'delta>(
         &'s mut self,
-        table: &'_ StateTable<S>,
-        delta: &'cache PartitionDelta,
+        table: &StateTable<S>,
+        delta: &'delta mut PartitionDelta,
     ) -> StreamExecutorResult<(
-        DeltaBTreeMap<'cache, CacheKey, OwnedRow>,
-        Vec<(
-            &'cache CacheKey,
-            &'cache CacheKey,
-            &'cache CacheKey,
-            &'cache CacheKey,
-        )>,
+        DeltaBTreeMap<'delta, CacheKey, OwnedRow>,
+        Vec<AffectedRange<'delta>>,
     )>
     where
-        's: 'cache,
+        'a: 'delta,
+        's: 'delta,
     {
+        if delta.is_empty() {
+            return Ok((DeltaBTreeMap::new(self.range_cache.inner(), delta), vec![]));
+        }
+
+        self.ensure_delta_in_cache(table, delta).await?;
+        let delta = &*delta; // let's make it immutable
+
+        let delta_first = delta.first_key_value().unwrap().0.as_normal_expect();
+        let delta_last = delta.last_key_value().unwrap().0.as_normal_expect();
+
+        let range_frame_logical_curr =
+            calc_logical_curr_for_range_frames(&self.calls.range_frames, delta_first, delta_last);
+
+        loop {
+            // TERMINATEABILITY: `extend_cache_leftward_by_n` and `extend_cache_rightward_by_n` keep
+            // pushing the cache to the boundary of current partition. In these two methods, when
+            // any side of boundary is reached, the sentinel key will be removed, so finally
+            // `Self::find_affected_ranges_readonly` will return `Ok`.
+
+            // SAFETY: Here we shortly borrow the range cache and turn the reference into a
+            // `'delta` one to bypass the borrow checker. This is safe because we only return
+            // the reference once we don't need to do any further mutation.
+            let cache_inner = unsafe { &*(self.range_cache.inner() as *const _) };
+            let part_with_delta = DeltaBTreeMap::new(cache_inner, delta);
+
+            self.stats.lookup_count += 1;
+            let res = self
+                .find_affected_ranges_readonly(part_with_delta, range_frame_logical_curr.as_ref());
+
+            let (need_extend_leftward, need_extend_rightward) = match res {
+                Ok(ranges) => return Ok((part_with_delta, ranges)),
+                Err(cache_extend_hint) => cache_extend_hint,
+            };
+
+            if need_extend_leftward {
+                self.stats.left_miss_count += 1;
+                tracing::trace!(partition=?self.deduped_part_key, "partition cache left extension triggered");
+                let left_most = self
+                    .range_cache
+                    .first_normal_key()
+                    .unwrap_or(delta_first)
+                    .clone();
+                self.extend_cache_leftward_by_n(table, &left_most).await?;
+            }
+            if need_extend_rightward {
+                self.stats.right_miss_count += 1;
+                tracing::trace!(partition=?self.deduped_part_key, "partition cache right extension triggered");
+                let right_most = self
+                    .range_cache
+                    .last_normal_key()
+                    .unwrap_or(delta_last)
+                    .clone();
+                self.extend_cache_rightward_by_n(table, &right_most).await?;
+            }
+            tracing::trace!(partition=?self.deduped_part_key, "partition cache extended");
+        }
+    }
+
+    async fn ensure_delta_in_cache(
+        &mut self,
+        table: &StateTable<S>,
+        delta: &mut PartitionDelta,
+    ) -> StreamExecutorResult<()> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+
         let delta_first = delta.first_key_value().unwrap().0.as_normal_expect();
         let delta_last = delta.last_key_value().unwrap().0.as_normal_expect();
 
@@ -376,55 +440,231 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
             // ensure everything is in the cache
             self.extend_cache_to_boundary(table).await?;
         } else {
+            // TODO(rc): later we should extend cache using `self.calls.super_rows_frame_bounds` and
+            // `range_frame_logical_curr` as hints.
+
             // ensure the cache covers all delta (if possible)
             self.extend_cache_by_range(table, delta_first..=delta_last)
                 .await?;
         }
 
-        loop {
-            // Terminateability: `extend_cache_leftward_by_n` and `extend_cache_rightward_by_n` keep
-            // pushing the cache to the boundary of current partition. In these two methods, when
-            // any side of boundary is reached, the sentinel key will be removed, so finally
-            // `self::find_affected_ranges` will return ranges without any sentinels.
-
-            let (left_reached_sentinel, right_reached_sentinel) = {
-                // SAFETY: Here we shortly borrow the range cache and turn the reference into a
-                // `'cache` one to bypass the borrow checker. This is safe because we only return
-                // the reference once we don't need to do any further mutation.
-                let cache_inner = unsafe { &*(self.range_cache.inner() as *const _) };
-                let ranges =
-                    self::find_affected_ranges(self.calls, DeltaBTreeMap::new(cache_inner, delta));
-                self.stats.lookup_count += 1;
-
-                if ranges.is_empty() {
-                    // no ranges affected, we're done
-                    return Ok((DeltaBTreeMap::new(cache_inner, delta), ranges));
+        if !enable_strict_consistency() {
+            // in non-strict mode, we should ensure the delta is consistent with the cache
+            let cache = self.range_cache.inner();
+            delta.retain(|key, change| match &*change {
+                Change::Insert(_) => {
+                    // this also includes the case of double-insert and ghost-update,
+                    // but since we already lost the information, let's just ignore it
+                    true
                 }
-
-                let left_reached_sentinel = ranges.first().unwrap().0.is_sentinel();
-                let right_reached_sentinel = ranges.last().unwrap().3.is_sentinel();
-
-                if !left_reached_sentinel && !right_reached_sentinel {
-                    // all affected ranges are already cached, we're done
-                    return Ok((DeltaBTreeMap::new(cache_inner, delta), ranges));
+                Change::Delete => {
+                    // if the key is not in the cache, it's a ghost-delete
+                    let consistent = cache.contains_key(key);
+                    if !consistent {
+                        consistency_error!(?key, "removing a row with non-existing key");
+                    }
+                    consistent
                 }
+            });
+        }
 
-                (left_reached_sentinel, right_reached_sentinel)
-            };
+        Ok(())
+    }
 
-            if left_reached_sentinel {
-                self.stats.left_miss_count += 1;
-                tracing::trace!(partition=?self.this_partition_key, "partition cache left extension triggered");
-                let left_most = self.cache_real_first_key().unwrap_or(delta_first).clone();
-                self.extend_cache_leftward_by_n(table, &left_most).await?;
+    /// Try to find affected ranges on immutable range cache + delta. If the algorithm reaches
+    /// any sentinel node in the cache, which means some entries in the affected range may be
+    /// in the state table, it returns an `Err((bool, bool))` to notify the caller that the
+    /// left side or the right side or both sides of the cache should be extended.
+    ///
+    /// TODO(rc): Currently at most one range will be in the result vector. Ideally we should
+    /// recognize uncontinuous changes in the delta and find multiple ranges, but that will be
+    /// too complex for now.
+    fn find_affected_ranges_readonly<'delta>(
+        &self,
+        part_with_delta: DeltaBTreeMap<'delta, CacheKey, OwnedRow>,
+        range_frame_logical_curr: Option<&(Sentinelled<Datum>, Sentinelled<Datum>)>,
+    ) -> std::result::Result<Vec<AffectedRange<'delta>>, (bool, bool)> {
+        if part_with_delta.first_key().is_none() {
+            // nothing is left after applying the delta, meaning all entries are deleted
+            return Ok(vec![]);
+        }
+
+        let delta_first_key = part_with_delta.delta().first_key_value().unwrap().0;
+        let delta_last_key = part_with_delta.delta().last_key_value().unwrap().0;
+        let cache_key_pk_len = delta_first_key.as_normal_expect().pk.len();
+
+        if part_with_delta.snapshot().is_empty() {
+            // all existing keys are inserted in the delta
+            return Ok(vec![AffectedRange::new(
+                delta_first_key,
+                delta_first_key,
+                delta_last_key,
+                delta_last_key,
+            )]);
+        }
+
+        let first_key = part_with_delta.first_key().unwrap();
+        let last_key = part_with_delta.last_key().unwrap();
+
+        let first_curr_key = if self.calls.end_is_unbounded || delta_first_key == first_key {
+            // If the frame end is unbounded, or, the first key is in delta, then the frame corresponding
+            // to the first key is always affected.
+            first_key
+        } else {
+            let mut key = find_first_curr_for_rows_frame(
+                &self.calls.super_rows_frame_bounds,
+                part_with_delta,
+                delta_first_key,
+            );
+
+            if let Some((logical_first_curr, _)) = range_frame_logical_curr {
+                let logical_curr = logical_first_curr.as_normal_expect(); // otherwise should go `end_is_unbounded` branch
+                let new_key = find_left_for_range_frames(
+                    &self.calls.range_frames,
+                    part_with_delta,
+                    logical_curr,
+                    cache_key_pk_len,
+                );
+                key = std::cmp::min(key, new_key);
             }
-            if right_reached_sentinel {
-                self.stats.right_miss_count += 1;
-                tracing::trace!(partition=?self.this_partition_key, "partition cache right extension triggered");
-                let right_most = self.cache_real_last_key().unwrap_or(delta_last).clone();
-                self.extend_cache_rightward_by_n(table, &right_most).await?;
+
+            key
+        };
+
+        let last_curr_key = if self.calls.start_is_unbounded || delta_last_key == last_key {
+            // similar to `first_curr_key`
+            last_key
+        } else {
+            let mut key = find_last_curr_for_rows_frame(
+                &self.calls.super_rows_frame_bounds,
+                part_with_delta,
+                delta_last_key,
+            );
+
+            if let Some((_, logical_last_curr)) = range_frame_logical_curr {
+                let logical_curr = logical_last_curr.as_normal_expect(); // otherwise should go `start_is_unbounded` branch
+                let new_key = find_right_for_range_frames(
+                    &self.calls.range_frames,
+                    part_with_delta,
+                    logical_curr,
+                    cache_key_pk_len,
+                );
+                key = std::cmp::max(key, new_key);
             }
-            tracing::trace!(partition=?self.this_partition_key, "partition cache extended");
+
+            key
+        };
+
+        {
+            // We quickly return if there's any sentinel in `[first_curr_key, last_curr_key]`,
+            // just for the sake of simplicity.
+            let mut need_extend_leftward = false;
+            let mut need_extend_rightward = false;
+            for key in [first_curr_key, last_curr_key] {
+                if key.is_smallest() {
+                    need_extend_leftward = true;
+                } else if key.is_largest() {
+                    need_extend_rightward = true;
+                }
+            }
+            if need_extend_leftward || need_extend_rightward {
+                return Err((need_extend_leftward, need_extend_rightward));
+            }
+        }
+
+        // From now on we definitely have two normal `curr_key`s.
+
+        if first_curr_key > last_curr_key {
+            // Note that we cannot move the this check before the above block, because for example,
+            // if the range cache contains `[Smallest, 5, Largest]`, and the delta contains only
+            // `Delete 5`, the frame is `RANGE BETWEEN CURRENT ROW AND CURRENT ROW`, then
+            // `first_curr_key` will be `Largest`, `last_curr_key` will be `Smallest`, in this case
+            // there may be some other entries with order value `5` in the table, which should be
+            // *affected*.
+            return Ok(vec![]);
+        }
+
+        let range_frame_logical_boundary = calc_logical_boundary_for_range_frames(
+            &self.calls.range_frames,
+            first_curr_key.as_normal_expect(),
+            last_curr_key.as_normal_expect(),
+        );
+
+        let first_frame_start = if self.calls.start_is_unbounded || first_curr_key == first_key {
+            // If the frame start is unbounded, or, the first curr key is the first key, then the first key
+            // always need to be included in the affected range.
+            first_key
+        } else {
+            let mut key = find_frame_start_for_rows_frame(
+                &self.calls.super_rows_frame_bounds,
+                part_with_delta,
+                first_curr_key,
+            );
+
+            if let Some((logical_first_start, _)) = range_frame_logical_boundary.as_ref() {
+                let logical_boundary = logical_first_start.as_normal_expect(); // otherwise should go `end_is_unbounded` branch
+                let new_key = find_left_for_range_frames(
+                    &self.calls.range_frames,
+                    part_with_delta,
+                    logical_boundary,
+                    cache_key_pk_len,
+                );
+                key = std::cmp::min(key, new_key);
+            }
+
+            key
+        };
+        assert!(first_frame_start <= first_curr_key);
+
+        let last_frame_end = if self.calls.end_is_unbounded || last_curr_key == last_key {
+            // similar to `first_frame_start`
+            last_key
+        } else {
+            let mut key = find_frame_end_for_rows_frame(
+                &self.calls.super_rows_frame_bounds,
+                part_with_delta,
+                last_curr_key,
+            );
+
+            if let Some((_, logical_last_end)) = range_frame_logical_boundary.as_ref() {
+                let logical_boundary = logical_last_end.as_normal_expect(); // otherwise should go `end_is_unbounded` branch
+                let new_key = find_right_for_range_frames(
+                    &self.calls.range_frames,
+                    part_with_delta,
+                    logical_boundary,
+                    cache_key_pk_len,
+                );
+                key = std::cmp::max(key, new_key);
+            }
+
+            key
+        };
+        assert!(last_frame_end >= last_curr_key);
+
+        let mut need_extend_leftward = false;
+        let mut need_extend_rightward = false;
+        for key in [
+            first_curr_key,
+            last_curr_key,
+            first_frame_start,
+            last_frame_end,
+        ] {
+            if key.is_smallest() {
+                need_extend_leftward = true;
+            } else if key.is_largest() {
+                need_extend_rightward = true;
+            }
+        }
+
+        if need_extend_leftward || need_extend_rightward {
+            Err((need_extend_leftward, need_extend_rightward))
+        } else {
+            Ok(vec![AffectedRange::new(
+                first_frame_start,
+                first_curr_key,
+                last_curr_key,
+                last_frame_end,
+            )])
         }
     }
 
@@ -432,21 +672,17 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         &mut self,
         table: &StateTable<S>,
     ) -> StreamExecutorResult<()> {
-        if self.cache_real_len() == self.range_cache.len() {
+        if self.range_cache.normal_len() == self.range_cache.len() {
             // no sentinel in the cache, meaning we already cached all entries of this partition
             return Ok(());
         }
 
-        tracing::trace!(partition=?self.this_partition_key, "loading the whole partition into cache");
+        tracing::trace!(partition=?self.deduped_part_key, "loading the whole partition into cache");
 
-        let mut new_cache = PartitionCache::new(); // shouldn't use `new_empty_partition_cache` here because we don't want sentinels
+        let mut new_cache = PartitionCache::new_without_sentinels(); // shouldn't use `new` here because we are extending to boundary
         let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Bound::Unbounded, Bound::Unbounded);
         let table_iter = table
-            .iter_with_prefix(
-                self.this_partition_key,
-                sub_range,
-                PrefetchOptions::default(),
-            )
+            .iter_with_prefix(self.deduped_part_key, sub_range, PrefetchOptions::default())
             .await?;
 
         #[for_await]
@@ -467,27 +703,27 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         table: &StateTable<S>,
         range: RangeInclusive<&StateKey>,
     ) -> StreamExecutorResult<()> {
-        if self.cache_real_len() == self.range_cache.len() {
+        if self.range_cache.normal_len() == self.range_cache.len() {
             // no sentinel in the cache, meaning we already cached all entries of this partition
             return Ok(());
         }
         assert!(self.range_cache.len() >= 2);
 
-        let cache_real_first_key = self.cache_real_first_key();
-        let cache_real_last_key = self.cache_real_last_key();
+        let cache_first_normal_key = self.range_cache.first_normal_key();
+        let cache_last_normal_key = self.range_cache.last_normal_key();
 
-        if cache_real_first_key.is_some() && *range.end() < cache_real_first_key.unwrap()
-            || cache_real_last_key.is_some() && *range.start() > cache_real_last_key.unwrap()
+        if cache_first_normal_key.is_some() && *range.end() < cache_first_normal_key.unwrap()
+            || cache_last_normal_key.is_some() && *range.start() > cache_last_normal_key.unwrap()
         {
             // completely not overlapping, for the sake of simplicity, we re-init the cache
             tracing::debug!(
-                partition=?self.this_partition_key,
-                cache_first=?cache_real_first_key,
-                cache_last=?cache_real_last_key,
+                partition=?self.deduped_part_key,
+                cache_first=?cache_first_normal_key,
+                cache_last=?cache_last_normal_key,
                 range=?range,
                 "modified range is completely non-overlapping with the cached range, re-initializing the cache"
             );
-            *self.range_cache = new_empty_partition_cache();
+            *self.range_cache = PartitionCache::new();
         }
 
         if self.cache_real_len() == 0 {
@@ -497,7 +733,7 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
                 Bound::Included(self.row_conv.state_key_to_table_sub_pk(range.end())?),
             );
             tracing::debug!(
-                partition=?self.this_partition_key,
+                partition=?self.deduped_part_key,
                 table_sub_range=?table_sub_range,
                 "cache is empty, just loading the given range"
             );
@@ -507,9 +743,10 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         }
 
         let cache_real_first_key = self
-            .cache_real_first_key()
+            .range_cache
+            .first_normal_key()
             .expect("cache real len is not 0");
-        if self.cache_left_is_sentinel() && *range.start() < cache_real_first_key {
+        if self.range_cache.left_is_sentinel() && *range.start() < cache_real_first_key {
             // extend leftward only if there's smallest sentinel
             let table_sub_range = (
                 Bound::Included(self.row_conv.state_key_to_table_sub_pk(range.start())?),
@@ -519,7 +756,7 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
                 ),
             );
             tracing::trace!(
-                partition=?self.this_partition_key,
+                partition=?self.deduped_part_key,
                 table_sub_range=?table_sub_range,
                 "loading the left half of given range"
             );
@@ -527,8 +764,11 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
                 .await?;
         }
 
-        let cache_real_last_key = self.cache_real_last_key().expect("cache real len is not 0");
-        if self.cache_right_is_sentinel() && *range.end() > cache_real_last_key {
+        let cache_real_last_key = self
+            .range_cache
+            .last_normal_key()
+            .expect("cache real len is not 0");
+        if self.range_cache.right_is_sentinel() && *range.end() > cache_real_last_key {
             // extend rightward only if there's largest sentinel
             let table_sub_range = (
                 Bound::Excluded(
@@ -538,7 +778,7 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
                 Bound::Included(self.row_conv.state_key_to_table_sub_pk(range.end())?),
             );
             tracing::trace!(
-                partition=?self.this_partition_key,
+                partition=?self.deduped_part_key,
                 table_sub_range=?table_sub_range,
                 "loading the right half of given range"
             );
@@ -546,35 +786,12 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
                 .await?;
         }
 
-        // TODO(rc): Uncomment the following to enable prefetching rows before the start of the
-        // range once we have STATE TABLE REVERSE ITERATOR.
-        // self.extend_cache_leftward_by_n(table, range.start()).await?;
+        // prefetch rows before the start of the range
+        self.extend_cache_leftward_by_n(table, range.start())
+            .await?;
 
         // prefetch rows after the end of the range
         self.extend_cache_rightward_by_n(table, range.end()).await
-    }
-
-    async fn extend_cache_by_range_inner(
-        &mut self,
-        table: &StateTable<S>,
-        table_sub_range: (Bound<impl Row>, Bound<impl Row>),
-    ) -> StreamExecutorResult<()> {
-        let stream = table
-            .iter_with_prefix(
-                self.this_partition_key,
-                &table_sub_range,
-                PrefetchOptions::default(),
-            )
-            .await?;
-
-        #[for_await]
-        for row in stream {
-            let row: OwnedRow = row?.into_owned_row();
-            let key = self.row_conv.row_to_state_key(&row)?;
-            self.range_cache.insert(CacheKey::from(key), row);
-        }
-
-        Ok(())
     }
 
     async fn extend_cache_leftward_by_n(
@@ -582,7 +799,7 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         table: &StateTable<S>,
         hint_key: &StateKey,
     ) -> StreamExecutorResult<()> {
-        if self.cache_real_len() == self.range_cache.len() {
+        if self.range_cache.normal_len() == self.range_cache.len() {
             // no sentinel in the cache, meaning we already cached all entries of this partition
             return Ok(());
         }
@@ -622,61 +839,12 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         Ok(())
     }
 
-    async fn extend_cache_leftward_by_n_inner(
-        &mut self,
-        table: &StateTable<S>,
-        range_to_exclusive: &StateKey,
-    ) -> StreamExecutorResult<()> {
-        let mut to_extend: VecDeque<OwnedRow> = VecDeque::with_capacity(MAGIC_BATCH_SIZE);
-        {
-            let sub_range = (
-                Bound::<OwnedRow>::Unbounded,
-                Bound::Excluded(
-                    self.row_conv
-                        .state_key_to_table_sub_pk(range_to_exclusive)?,
-                ),
-            );
-            let stream = table
-                .iter_with_prefix(
-                    self.this_partition_key,
-                    &sub_range,
-                    PrefetchOptions::default(),
-                )
-                .await?;
-
-            #[for_await]
-            for row in stream {
-                let row: OwnedRow = row?.into_owned_row();
-
-                // For leftward extension, we now must iterate the table in order from the beginning
-                // of this partition and fill only the last n rows to the cache.
-                // TODO(rc): WE NEED STATE TABLE REVERSE ITERATOR!!
-                if to_extend.len() == MAGIC_BATCH_SIZE {
-                    to_extend.pop_front();
-                }
-                to_extend.push_back(row);
-            }
-        }
-
-        let n_extended = to_extend.len();
-        for row in to_extend {
-            let key = self.row_conv.row_to_state_key(&row)?;
-            self.range_cache.insert(CacheKey::from(key), row);
-        }
-        if n_extended < MAGIC_BATCH_SIZE && self.cache_real_len() > 0 {
-            // we reached the beginning of this partition in the table
-            self.range_cache.remove(&CacheKey::Smallest);
-        }
-
-        Ok(())
-    }
-
     async fn extend_cache_rightward_by_n(
         &mut self,
         table: &StateTable<S>,
         hint_key: &StateKey,
     ) -> StreamExecutorResult<()> {
-        if self.cache_real_len() == self.range_cache.len() {
+        if self.range_cache.normal_len() == self.range_cache.len() {
             // no sentinel in the cache, meaning we already cached all entries of this partition
             return Ok(());
         }
@@ -716,6 +884,73 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         Ok(())
     }
 
+    async fn extend_cache_by_range_inner(
+        &mut self,
+        table: &StateTable<S>,
+        table_sub_range: (Bound<impl Row>, Bound<impl Row>),
+    ) -> StreamExecutorResult<()> {
+        let stream = table
+            .iter_with_prefix(
+                self.deduped_part_key,
+                &table_sub_range,
+                PrefetchOptions::default(),
+            )
+            .await?;
+
+        #[for_await]
+        for row in stream {
+            let row: OwnedRow = row?.into_owned_row();
+            let key = self.row_conv.row_to_state_key(&row)?;
+            self.range_cache.insert(CacheKey::from(key), row);
+        }
+
+        Ok(())
+    }
+
+    async fn extend_cache_leftward_by_n_inner(
+        &mut self,
+        table: &StateTable<S>,
+        range_to_exclusive: &StateKey,
+    ) -> StreamExecutorResult<()> {
+        let mut n_extended = 0usize;
+        {
+            let sub_range = (
+                Bound::<OwnedRow>::Unbounded,
+                Bound::Excluded(
+                    self.row_conv
+                        .state_key_to_table_sub_pk(range_to_exclusive)?,
+                ),
+            );
+            let rev_stream = table
+                .rev_iter_with_prefix(
+                    self.deduped_part_key,
+                    &sub_range,
+                    PrefetchOptions::default(),
+                )
+                .await?;
+
+            #[for_await]
+            for row in rev_stream {
+                let row: OwnedRow = row?.into_owned_row();
+
+                let key = self.row_conv.row_to_state_key(&row)?;
+                self.range_cache.insert(CacheKey::from(key), row);
+
+                n_extended += 1;
+                if n_extended == MAGIC_BATCH_SIZE {
+                    break;
+                }
+            }
+        }
+
+        if n_extended < MAGIC_BATCH_SIZE && self.cache_real_len() > 0 {
+            // we reached the beginning of this partition in the table
+            self.range_cache.remove(&CacheKey::Smallest);
+        }
+
+        Ok(())
+    }
+
     async fn extend_cache_rightward_by_n_inner(
         &mut self,
         table: &StateTable<S>,
@@ -732,7 +967,7 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
             );
             let stream = table
                 .iter_with_prefix(
-                    self.this_partition_key,
+                    self.deduped_part_key,
                     &sub_range,
                     PrefetchOptions::default(),
                 )
@@ -758,561 +993,5 @@ impl<'a, S: StateStore> OverPartition<'a, S> {
         }
 
         Ok(())
-    }
-}
-
-/// Find all affected ranges in the given partition with delta.
-///
-/// # Returns
-///
-/// `Vec<(first_frame_start, first_curr_key, last_curr_key, last_frame_end_incl)>`
-///
-/// Each affected range is a union of many small window frames affected by some adajcent
-/// keys in the delta.
-///
-/// Example:
-/// - frame 1: `rows between 2 preceding and current row`
-/// - frame 2: `rows between 1 preceding and 2 following`
-/// - partition: `[1, 2, 4, 5, 7, 8, 9, 10, 11, 12, 14]`
-/// - delta: `[3, 4, 15]`
-/// - affected ranges: `[(1, 1, 7, 9), (10, 12, 15, 15)]`
-///
-/// TODO(rc):
-/// Note that, since we assume input chunks have data locality on order key columns, we now only
-/// calculate one single affected range. So the affected ranges in the above example will be
-/// `(1, 1, 15, 15)`. Later we may optimize this.
-fn find_affected_ranges<'cache>(
-    calls: &'_ [WindowFuncCall],
-    part_with_delta: DeltaBTreeMap<'cache, CacheKey, OwnedRow>,
-) -> Vec<(
-    &'cache CacheKey,
-    &'cache CacheKey,
-    &'cache CacheKey,
-    &'cache CacheKey,
-)> {
-    // XXX(rc): NOTE FOR DEVS
-    // Must carefully consider the sentinel keys in the cache when extending this function to
-    // support `RANGE` and `GROUPS` frames later. May introduce a return value variant to clearly
-    // tell the caller that there exists at least one affected range that touches the sentinel.
-
-    let delta = part_with_delta.delta();
-
-    if part_with_delta.first_key().is_none() {
-        // all keys are deleted in the delta
-        return vec![];
-    }
-
-    if part_with_delta.snapshot().is_empty() {
-        // all existing keys are inserted in the delta
-        return vec![(
-            delta.first_key_value().unwrap().0,
-            delta.first_key_value().unwrap().0,
-            delta.last_key_value().unwrap().0,
-            delta.last_key_value().unwrap().0,
-        )];
-    }
-
-    let first_key = part_with_delta.first_key().unwrap();
-    let last_key = part_with_delta.last_key().unwrap();
-
-    let start_is_unbounded = calls
-        .iter()
-        .any(|call| call.frame.bounds.start_is_unbounded());
-    let end_is_unbounded = calls
-        .iter()
-        .any(|call| call.frame.bounds.end_is_unbounded());
-
-    let first_curr_key = if end_is_unbounded {
-        // If the frame end is unbounded, the frame corresponding to the first key is always
-        // affected.
-        first_key
-    } else {
-        calls
-            .iter()
-            .map(|call| match &call.frame.bounds {
-                FrameBounds::Rows(_start, end) => {
-                    let mut cursor = part_with_delta
-                        .lower_bound(Bound::Included(delta.first_key_value().unwrap().0));
-                    for _ in 0..end.n_following_rows().unwrap() {
-                        // Note that we have to move before check, to handle situation where the
-                        // cursor is at ghost position at first.
-                        cursor.move_prev();
-                        if cursor.position().is_ghost() {
-                            break;
-                        }
-                    }
-                    cursor.key().unwrap_or(first_key)
-                }
-            })
-            .min()
-            .expect("# of window function calls > 0")
-    };
-
-    let first_frame_start = if start_is_unbounded {
-        // If the frame start is unbounded, the first key always need to be included in the affected
-        // range.
-        first_key
-    } else {
-        calls
-            .iter()
-            .map(|call| match &call.frame.bounds {
-                FrameBounds::Rows(start, _end) => {
-                    let mut cursor = part_with_delta.find(first_curr_key).unwrap();
-                    for _ in 0..start.n_preceding_rows().unwrap() {
-                        cursor.move_prev();
-                        if cursor.position().is_ghost() {
-                            break;
-                        }
-                    }
-                    cursor.key().unwrap_or(first_key)
-                }
-            })
-            .min()
-            .expect("# of window function calls > 0")
-    };
-
-    let last_curr_key = if start_is_unbounded {
-        last_key
-    } else {
-        calls
-            .iter()
-            .map(|call| match &call.frame.bounds {
-                FrameBounds::Rows(start, _end) => {
-                    let mut cursor = part_with_delta
-                        .upper_bound(Bound::Included(delta.last_key_value().unwrap().0));
-                    for _ in 0..start.n_preceding_rows().unwrap() {
-                        cursor.move_next();
-                        if cursor.position().is_ghost() {
-                            break;
-                        }
-                    }
-                    cursor.key().unwrap_or(last_key)
-                }
-            })
-            .max()
-            .expect("# of window function calls > 0")
-    };
-
-    let last_frame_end = if end_is_unbounded {
-        last_key
-    } else {
-        calls
-            .iter()
-            .map(|call| match &call.frame.bounds {
-                FrameBounds::Rows(_start, end) => {
-                    let mut cursor = part_with_delta.find(last_curr_key).unwrap();
-                    for _ in 0..end.n_following_rows().unwrap() {
-                        cursor.move_next();
-                        if cursor.position().is_ghost() {
-                            break;
-                        }
-                    }
-                    cursor.key().unwrap_or(last_key)
-                }
-            })
-            .max()
-            .expect("# of window function calls > 0")
-    };
-
-    if first_curr_key > last_curr_key {
-        // all affected keys are deleted in the delta
-        return vec![];
-    }
-
-    vec![(
-        first_frame_start,
-        first_curr_key,
-        last_curr_key,
-        last_frame_end,
-    )]
-}
-
-#[cfg(test)]
-mod find_affected_ranges_tests {
-    //! Function `find_affected_ranges` is important enough to deserve its own test module. We must
-    //! test it thoroughly.
-
-    use itertools::Itertools;
-    use risingwave_common::types::{DataType, ScalarImpl};
-    use risingwave_expr::aggregate::{AggArgs, AggKind};
-    use risingwave_expr::window_function::{Frame, FrameBound, WindowFuncKind};
-
-    use super::*;
-
-    fn create_call(frame: Frame) -> WindowFuncCall {
-        WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::Sum),
-            args: AggArgs::Unary(DataType::Int32, 0),
-            return_type: DataType::Int32,
-            frame,
-        }
-    }
-
-    macro_rules! create_cache {
-        (..., $( $pk:literal ),* , ...) => {
-            {
-                let mut cache = create_cache!( $( $pk ),* );
-                cache.insert(CacheKey::Smallest, OwnedRow::empty().into());
-                cache.insert(CacheKey::Largest, OwnedRow::empty().into());
-                cache
-            }
-        };
-        (..., $( $pk:literal ),*) => {
-            {
-                let mut cache = create_cache!( $( $pk ),* );
-                cache.insert(CacheKey::Smallest, OwnedRow::empty().into());
-                cache
-            }
-        };
-        ($( $pk:literal ),* , ...) => {
-            {
-                let mut cache = create_cache!( $( $pk ),* );
-                cache.insert(CacheKey::Largest, OwnedRow::empty().into());
-                cache
-            }
-        };
-        ($( $pk:literal ),*) => {
-            {
-                #[allow(unused_mut)]
-                let mut cache = BTreeMap::new();
-                $(
-                    cache.insert(
-                        CacheKey::Normal(
-                            StateKey {
-                                // order key doesn't matter here
-                                order_key: vec![].into(),
-                                pk: OwnedRow::new(vec![Some($pk.into())]).into(),
-                            },
-                        ),
-                        // value row doesn't matter here
-                        OwnedRow::empty(),
-                    );
-                )*
-                cache
-            }
-        };
-    }
-
-    macro_rules! create_change {
-        (Delete) => {
-            Change::Delete
-        };
-        (Insert) => {
-            Change::Insert(OwnedRow::empty())
-        };
-    }
-
-    macro_rules! create_delta {
-        ($(( $pk:literal, $change:ident )),* $(,)?) => {
-            {
-                #[allow(unused_mut)]
-                let mut delta = BTreeMap::new();
-                $(
-                    delta.insert(
-                        CacheKey::Normal(
-                            StateKey {
-                                // order key doesn't matter here
-                                order_key: vec![].into(),
-                                pk: OwnedRow::new(vec![Some($pk.into())]).into(),
-                            },
-                        ),
-                        // value row doesn't matter here
-                        create_change!( $change ),
-                    );
-                )*
-                delta
-            }
-        };
-    }
-
-    fn assert_ranges_eq(
-        result: Vec<(&CacheKey, &CacheKey, &CacheKey, &CacheKey)>,
-        expected: impl IntoIterator<Item = (ScalarImpl, ScalarImpl, ScalarImpl, ScalarImpl)>,
-    ) {
-        result
-            .into_iter()
-            .zip_eq(expected)
-            .for_each(|(result, expected)| {
-                assert_eq!(
-                    result.0.as_normal_expect().pk.0,
-                    OwnedRow::new(vec![Some(expected.0)])
-                );
-                assert_eq!(
-                    result.1.as_normal_expect().pk.0,
-                    OwnedRow::new(vec![Some(expected.1)])
-                );
-                assert_eq!(
-                    result.2.as_normal_expect().pk.0,
-                    OwnedRow::new(vec![Some(expected.2)])
-                );
-                assert_eq!(
-                    result.3.as_normal_expect().pk.0,
-                    OwnedRow::new(vec![Some(expected.3)])
-                );
-            })
-    }
-
-    #[test]
-    fn test_all_empty() {
-        let cache = create_cache!();
-        let delta = create_delta!();
-        let calls = vec![create_call(Frame::rows(
-            FrameBound::Preceding(2),
-            FrameBound::Preceding(1),
-        ))];
-        assert_ranges_eq(
-            find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-            [],
-        );
-    }
-
-    #[test]
-    fn test_insert_delta_only() {
-        let cache = create_cache!();
-        let delta = create_delta!((1, Insert), (2, Insert), (3, Insert));
-        let calls = vec![create_call(Frame::rows(
-            FrameBound::Preceding(2),
-            FrameBound::Preceding(1),
-        ))];
-        let affected_ranges = find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta));
-        assert_ranges_eq(affected_ranges, [(1.into(), 1.into(), 3.into(), 3.into())]);
-    }
-
-    #[test]
-    fn test_simple() {
-        let cache = create_cache!(1, 2, 3, 4, 5, 6);
-        let delta = create_delta!((2, Insert), (3, Delete));
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Preceding(2),
-                FrameBound::Preceding(1),
-            ))];
-            assert_ranges_eq(
-                find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-                [(1.into(), 2.into(), 5.into(), 5.into())],
-            );
-        }
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Preceding(1),
-                FrameBound::Following(2),
-            ))];
-            assert_ranges_eq(
-                find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-                [(1.into(), 1.into(), 4.into(), 6.into())],
-            );
-        }
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::CurrentRow,
-                FrameBound::Following(2),
-            ))];
-            assert_ranges_eq(
-                find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-                [(1.into(), 1.into(), 2.into(), 5.into())],
-            );
-        }
-    }
-
-    #[test]
-    fn test_multiple_calls() {
-        let cache = create_cache!(1, 2, 3, 4, 5, 6);
-        let delta = create_delta!((2, Insert), (3, Delete));
-        let calls = vec![
-            create_call(Frame::rows(
-                FrameBound::Preceding(1),
-                FrameBound::Preceding(1),
-            )),
-            create_call(Frame::rows(
-                FrameBound::Following(1),
-                FrameBound::Following(1),
-            )),
-        ];
-        assert_ranges_eq(
-            find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-            [(1.into(), 1.into(), 4.into(), 5.into())],
-        );
-    }
-
-    #[test]
-    fn test_lag_corner_case() {
-        let cache = create_cache!(1, 2, 3, 4, 5, 6);
-        let delta = create_delta!((1, Delete), (2, Delete), (3, Delete));
-        let calls = vec![create_call(Frame::rows(
-            FrameBound::Preceding(1),
-            FrameBound::Preceding(1),
-        ))];
-        assert_ranges_eq(
-            find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-            [(4.into(), 4.into(), 4.into(), 4.into())],
-        );
-    }
-
-    #[test]
-    fn test_lead_corner_case() {
-        let cache = create_cache!(1, 2, 3, 4, 5, 6);
-        let delta = create_delta!((4, Delete), (5, Delete), (6, Delete));
-        let calls = vec![create_call(Frame::rows(
-            FrameBound::Following(1),
-            FrameBound::Following(1),
-        ))];
-        assert_ranges_eq(
-            find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-            [(3.into(), 3.into(), 3.into(), 3.into())],
-        );
-    }
-
-    #[test]
-    fn test_lag_lead_offset_0_corner_case_1() {
-        let cache = create_cache!(1, 2, 3, 4);
-        let delta = create_delta!((2, Delete), (3, Delete));
-        let calls = vec![create_call(Frame::rows(
-            FrameBound::CurrentRow,
-            FrameBound::CurrentRow,
-        ))];
-        assert_ranges_eq(
-            find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-            [],
-        );
-    }
-
-    #[test]
-    fn test_lag_lead_offset_0_corner_case_2() {
-        let cache = create_cache!(1, 2, 3, 4, 5);
-        let delta = create_delta!((2, Delete), (3, Insert), (4, Delete));
-        let calls = vec![create_call(Frame::rows(
-            FrameBound::CurrentRow,
-            FrameBound::CurrentRow,
-        ))];
-        assert_ranges_eq(
-            find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-            [(3.into(), 3.into(), 3.into(), 3.into())],
-        );
-    }
-
-    #[test]
-    fn test_empty_with_sentinels() {
-        let cache: BTreeMap<Sentinelled<StateKey>, OwnedRow> = create_cache!(..., , ...);
-        let delta = create_delta!((1, Insert), (2, Insert));
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::CurrentRow,
-                FrameBound::CurrentRow,
-            ))];
-            assert_ranges_eq(
-                find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-                [(1.into(), 1.into(), 2.into(), 2.into())],
-            );
-        }
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Preceding(1),
-                FrameBound::Preceding(1),
-            ))];
-            let range = find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta))[0];
-            assert!(range.0.is_smallest());
-            assert_eq!(
-                range.1.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(1.into())])
-            );
-            assert!(range.2.is_largest());
-            assert!(range.3.is_largest());
-        }
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Following(1),
-                FrameBound::Following(3),
-            ))];
-            let range = find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta))[0];
-            assert!(range.0.is_smallest());
-            assert!(range.1.is_smallest());
-            assert_eq!(
-                range.2.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(2.into())])
-            );
-            assert!(range.3.is_largest());
-        }
-    }
-
-    #[test]
-    fn test_with_left_sentinel() {
-        let cache = create_cache!(..., 2, 4, 5, 8);
-        let delta = create_delta!((3, Insert), (4, Insert), (8, Delete));
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Following(1),
-                FrameBound::Following(1),
-            ))];
-            assert_ranges_eq(
-                find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-                [(2.into(), 2.into(), 5.into(), 5.into())],
-            );
-        }
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Preceding(1),
-                FrameBound::Following(1),
-            ))];
-            let range = find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta))[0];
-            assert!(range.0.is_smallest());
-            assert_eq!(
-                range.1.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(2.into())])
-            );
-            assert_eq!(
-                range.2.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(5.into())])
-            );
-            assert_eq!(
-                range.3.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(5.into())])
-            );
-        }
-    }
-
-    #[test]
-    fn test_with_right_sentinel() {
-        let cache = create_cache!(1, 2, 4, 5, 8, ...);
-        let delta = create_delta!((3, Insert), (4, Insert), (5, Delete));
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Preceding(1),
-                FrameBound::Preceding(1),
-            ))];
-            assert_ranges_eq(
-                find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta)),
-                [(2.into(), 3.into(), 8.into(), 8.into())],
-            );
-        }
-
-        {
-            let calls = vec![create_call(Frame::rows(
-                FrameBound::Preceding(1),
-                FrameBound::Following(1),
-            ))];
-            let range = find_affected_ranges(&calls, DeltaBTreeMap::new(&cache, &delta))[0];
-            assert_eq!(
-                range.0.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(1.into())])
-            );
-            assert_eq!(
-                range.1.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(2.into())])
-            );
-            assert_eq!(
-                range.2.as_normal_expect().pk.0,
-                OwnedRow::new(vec![Some(8.into())])
-            );
-            assert!(range.3.is_largest());
-        }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,21 +14,26 @@
 
 use std::fmt::Display;
 
+use FrameBound::{CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding};
 use enum_as_inner::EnumAsInner;
-use risingwave_common::bail;
+use parse_display::Display;
 use risingwave_common::types::DataType;
-use risingwave_pb::expr::window_frame::{PbBound, PbExclusion};
+use risingwave_common::{bail, must_match};
+use risingwave_pb::expr::window_frame::{PbBounds, PbExclusion};
 use risingwave_pb::expr::{PbWindowFrame, PbWindowFunction};
 
-use super::WindowFuncKind;
-use crate::aggregate::AggArgs;
+use super::{
+    RangeFrameBounds, RowsFrameBound, RowsFrameBounds, SessionFrameBounds, WindowFuncKind,
+};
 use crate::Result;
+use crate::aggregate::AggArgs;
 
 #[derive(Debug, Clone)]
 pub struct WindowFuncCall {
     pub kind: WindowFuncKind,
-    pub args: AggArgs,
     pub return_type: DataType,
+    pub args: AggArgs,
+    pub ignore_nulls: bool,
     pub frame: Frame,
 }
 
@@ -36,8 +41,9 @@ impl WindowFuncCall {
     pub fn from_protobuf(call: &PbWindowFunction) -> Result<Self> {
         let call = WindowFuncCall {
             kind: WindowFuncKind::from_protobuf(call.get_type()?)?,
-            args: AggArgs::from_protobuf(call.get_args())?,
             return_type: DataType::from(call.get_return_type()?),
+            args: AggArgs::from_protobuf(call.get_args())?,
+            ignore_nulls: call.get_ignore_nulls(),
             frame: Frame::from_protobuf(call.get_frame()?)?,
         };
         Ok(call)
@@ -61,26 +67,22 @@ impl Display for Frame {
 }
 
 impl Frame {
-    pub fn rows(start: FrameBound<usize>, end: FrameBound<usize>) -> Self {
+    pub fn rows(start: RowsFrameBound, end: RowsFrameBound) -> Self {
         Self {
-            bounds: FrameBounds::Rows(start, end),
+            bounds: FrameBounds::Rows(RowsFrameBounds { start, end }),
             exclusion: FrameExclusion::default(),
         }
     }
 
     pub fn rows_with_exclusion(
-        start: FrameBound<usize>,
-        end: FrameBound<usize>,
+        start: RowsFrameBound,
+        end: RowsFrameBound,
         exclusion: FrameExclusion,
     ) -> Self {
         Self {
-            bounds: FrameBounds::Rows(start, end),
+            bounds: FrameBounds::Rows(RowsFrameBounds { start, end }),
             exclusion,
         }
-    }
-
-    pub fn is_unbounded(&self) -> bool {
-        self.bounds.is_unbounded()
     }
 }
 
@@ -89,10 +91,25 @@ impl Frame {
         use risingwave_pb::expr::window_frame::PbType;
         let bounds = match frame.get_type()? {
             PbType::Unspecified => bail!("unspecified type of `WindowFrame`"),
+            PbType::RowsLegacy => {
+                #[expect(deprecated)]
+                {
+                    let start = FrameBound::<usize>::from_protobuf_legacy(frame.get_start()?)?;
+                    let end = FrameBound::<usize>::from_protobuf_legacy(frame.get_end()?)?;
+                    FrameBounds::Rows(RowsFrameBounds { start, end })
+                }
+            }
             PbType::Rows => {
-                let start = FrameBound::from_protobuf(frame.get_start()?)?;
-                let end = FrameBound::from_protobuf(frame.get_end()?)?;
-                FrameBounds::Rows(start, end)
+                let bounds = must_match!(frame.get_bounds()?, PbBounds::Rows(bounds) => bounds);
+                FrameBounds::Rows(RowsFrameBounds::from_protobuf(bounds)?)
+            }
+            PbType::Range => {
+                let bounds = must_match!(frame.get_bounds()?, PbBounds::Range(bounds) => bounds);
+                FrameBounds::Range(RangeFrameBounds::from_protobuf(bounds)?)
+            }
+            PbType::Session => {
+                let bounds = must_match!(frame.get_bounds()?, PbBounds::Session(bounds) => bounds);
+                FrameBounds::Session(SessionFrameBounds::from_protobuf(bounds)?)
             }
         };
         let exclusion = FrameExclusion::from_protobuf(frame.get_exclusion()?)?;
@@ -102,33 +119,64 @@ impl Frame {
     pub fn to_protobuf(&self) -> PbWindowFrame {
         use risingwave_pb::expr::window_frame::PbType;
         let exclusion = self.exclusion.to_protobuf() as _;
+        #[expect(deprecated)] // because of `start` and `end` fields
         match &self.bounds {
-            FrameBounds::Rows(start, end) => PbWindowFrame {
+            FrameBounds::Rows(bounds) => PbWindowFrame {
                 r#type: PbType::Rows as _,
-                start: Some(start.to_protobuf()),
-                end: Some(end.to_protobuf()),
+                start: None, // deprecated
+                end: None,   // deprecated
                 exclusion,
+                bounds: Some(PbBounds::Rows(bounds.to_protobuf())),
+            },
+            FrameBounds::Range(bounds) => PbWindowFrame {
+                r#type: PbType::Range as _,
+                start: None, // deprecated
+                end: None,   // deprecated
+                exclusion,
+                bounds: Some(PbBounds::Range(bounds.to_protobuf())),
+            },
+            FrameBounds::Session(bounds) => PbWindowFrame {
+                r#type: PbType::Session as _,
+                start: None, // deprecated
+                end: None,   // deprecated
+                exclusion,
+                bounds: Some(PbBounds::Session(bounds.to_protobuf())),
             },
         }
     }
 }
 
+#[derive(Display, Debug, Clone, Eq, PartialEq, Hash, EnumAsInner)]
+#[display("{0}")]
+pub enum FrameBounds {
+    Rows(RowsFrameBounds),
+    // Groups(GroupsFrameBounds),
+    Range(RangeFrameBounds),
+    Session(SessionFrameBounds),
+}
+
 impl FrameBounds {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Rows(start, end) => FrameBound::validate_bounds(start, end),
+            Self::Rows(bounds) => bounds.validate(),
+            Self::Range(bounds) => bounds.validate(),
+            Self::Session(bounds) => bounds.validate(),
         }
     }
 
     pub fn start_is_unbounded(&self) -> bool {
         match self {
-            Self::Rows(start, _) => matches!(start, FrameBound::UnboundedPreceding),
+            Self::Rows(RowsFrameBounds { start, .. }) => start.is_unbounded_preceding(),
+            Self::Range(RangeFrameBounds { start, .. }) => start.is_unbounded_preceding(),
+            Self::Session(_) => false,
         }
     }
 
     pub fn end_is_unbounded(&self) -> bool {
         match self {
-            Self::Rows(_, end) => matches!(end, FrameBound::UnboundedFollowing),
+            Self::Rows(RowsFrameBounds { end, .. }) => end.is_unbounded_following(),
+            Self::Range(RangeFrameBounds { end, .. }) => end.is_unbounded_following(),
+            Self::Session(_) => false,
         }
     }
 
@@ -137,39 +185,40 @@ impl FrameBounds {
     }
 }
 
-impl Display for FrameBounds {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rows(start, end) => {
-                write!(f, "ROWS BETWEEN {} AND {}", start, end)?;
-            }
-        }
-        Ok(())
-    }
+pub trait FrameBoundsImpl {
+    fn validate(&self) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum FrameBounds {
-    Rows(FrameBound<usize>, FrameBound<usize>),
-    // Groups(FrameBound<usize>, FrameBound<usize>),
-    // Range(FrameBound<ScalarImpl>, FrameBound<ScalarImpl>),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Display, Debug, Clone, Eq, PartialEq, Hash, EnumAsInner)]
+#[display(style = "TITLE CASE")]
 pub enum FrameBound<T> {
     UnboundedPreceding,
+    #[display("{0} PRECEDING")]
     Preceding(T),
     CurrentRow,
+    #[display("{0} FOLLOWING")]
     Following(T),
     UnboundedFollowing,
 }
 
 impl<T> FrameBound<T> {
-    fn validate_bounds(start: &Self, end: &Self) -> Result<()> {
-        use FrameBound::*;
+    fn offset_value(&self) -> Option<&T> {
+        match self {
+            UnboundedPreceding | UnboundedFollowing | CurrentRow => None,
+            Preceding(offset) | Following(offset) => Some(offset),
+        }
+    }
+
+    pub(super) fn validate_bounds(
+        start: &Self,
+        end: &Self,
+        offset_checker: impl Fn(&T) -> Result<()>,
+    ) -> Result<()> {
         match (start, end) {
             (_, UnboundedPreceding) => bail!("frame end cannot be UNBOUNDED PRECEDING"),
-            (UnboundedFollowing, _) => bail!("frame start cannot be UNBOUNDED FOLLOWING"),
+            (UnboundedFollowing, _) => {
+                bail!("frame start cannot be UNBOUNDED FOLLOWING")
+            }
             (Following(_), CurrentRow) | (Following(_), Preceding(_)) => {
                 bail!("frame starting from following row cannot have preceding rows")
             }
@@ -178,84 +227,44 @@ impl<T> FrameBound<T> {
             }
             _ => {}
         }
+
+        for bound in [start, end] {
+            if let Some(offset) = bound.offset_value() {
+                offset_checker(offset)?;
+            }
+        }
+
         Ok(())
     }
-}
 
-impl FrameBound<usize> {
-    pub fn from_protobuf(bound: &PbBound) -> Result<Self> {
-        use risingwave_pb::expr::window_frame::bound::PbOffset;
-        use risingwave_pb::expr::window_frame::PbBoundType;
-
-        let offset = bound.get_offset()?;
-        let bound = match offset {
-            PbOffset::Integer(offset) => match bound.get_type()? {
-                PbBoundType::Unspecified => bail!("unspecified type of `FrameBound<usize>`"),
-                PbBoundType::UnboundedPreceding => Self::UnboundedPreceding,
-                PbBoundType::Preceding => Self::Preceding(*offset as usize),
-                PbBoundType::CurrentRow => Self::CurrentRow,
-                PbBoundType::Following => Self::Following(*offset as usize),
-                PbBoundType::UnboundedFollowing => Self::UnboundedFollowing,
-            },
-            PbOffset::Datum(_) => bail!("offset of `FrameBound<usize>` must be `Integer`"),
-        };
-        Ok(bound)
-    }
-
-    pub fn to_protobuf(&self) -> PbBound {
-        use risingwave_pb::expr::window_frame::bound::PbOffset;
-        use risingwave_pb::expr::window_frame::PbBoundType;
-
-        let (r#type, offset) = match self {
-            Self::UnboundedPreceding => (PbBoundType::UnboundedPreceding, PbOffset::Integer(0)),
-            Self::Preceding(offset) => (PbBoundType::Preceding, PbOffset::Integer(*offset as _)),
-            Self::CurrentRow => (PbBoundType::CurrentRow, PbOffset::Integer(0)),
-            Self::Following(offset) => (PbBoundType::Following, PbOffset::Integer(*offset as _)),
-            Self::UnboundedFollowing => (PbBoundType::UnboundedFollowing, PbOffset::Integer(0)),
-        };
-        PbBound {
-            r#type: r#type as _,
-            offset: Some(offset),
-        }
-    }
-}
-
-impl Display for FrameBound<usize> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    pub fn map<U>(self, f: impl Fn(T) -> U) -> FrameBound<U> {
         match self {
-            FrameBound::UnboundedPreceding => write!(f, "UNBOUNDED PRECEDING")?,
-            FrameBound::Preceding(n) => write!(f, "{} PRECEDING", n)?,
-            FrameBound::CurrentRow => write!(f, "CURRENT ROW")?,
-            FrameBound::Following(n) => write!(f, "{} FOLLOWING", n)?,
-            FrameBound::UnboundedFollowing => write!(f, "UNBOUNDED FOLLOWING")?,
+            UnboundedPreceding => UnboundedPreceding,
+            Preceding(offset) => Preceding(f(offset)),
+            CurrentRow => CurrentRow,
+            Following(offset) => Following(f(offset)),
+            UnboundedFollowing => UnboundedFollowing,
         }
-        Ok(())
     }
 }
 
-impl FrameBound<usize> {
-    /// Convert the bound to sized offset from current row. `None` if the bound is unbounded.
-    pub fn to_offset(&self) -> Option<isize> {
+impl<T> FrameBound<T>
+where
+    T: Copy,
+{
+    pub(super) fn reverse(self) -> FrameBound<T> {
         match self {
-            FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => None,
-            FrameBound::CurrentRow => Some(0),
-            FrameBound::Preceding(n) => Some(-(*n as isize)),
-            FrameBound::Following(n) => Some(*n as isize),
+            UnboundedPreceding => UnboundedFollowing,
+            Preceding(offset) => Following(offset),
+            CurrentRow => CurrentRow,
+            Following(offset) => Preceding(offset),
+            UnboundedFollowing => UnboundedPreceding,
         }
-    }
-
-    /// View the bound as frame start, and get the number of preceding rows.
-    pub fn n_preceding_rows(&self) -> Option<usize> {
-        self.to_offset().map(|x| x.min(0).unsigned_abs())
-    }
-
-    /// View the bound as frame end, and get the number of following rows.
-    pub fn n_following_rows(&self) -> Option<usize> {
-        self.to_offset().map(|x| x.max(0) as usize)
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default, EnumAsInner)]
+#[derive(Display, Debug, Copy, Clone, Eq, PartialEq, Hash, Default, EnumAsInner)]
+#[display("EXCLUDE {}", style = "TITLE CASE")]
 pub enum FrameExclusion {
     CurrentRow,
     // Group,
@@ -264,18 +273,8 @@ pub enum FrameExclusion {
     NoOthers,
 }
 
-impl Display for FrameExclusion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameExclusion::CurrentRow => write!(f, "EXCLUDE CURRENT ROW")?,
-            FrameExclusion::NoOthers => write!(f, "EXCLUDE NO OTHERS")?,
-        }
-        Ok(())
-    }
-}
-
 impl FrameExclusion {
-    pub fn from_protobuf(exclusion: PbExclusion) -> Result<Self> {
+    fn from_protobuf(exclusion: PbExclusion) -> Result<Self> {
         let excl = match exclusion {
             PbExclusion::Unspecified => bail!("unspecified type of `FrameExclusion`"),
             PbExclusion::CurrentRow => Self::CurrentRow,
@@ -284,7 +283,7 @@ impl FrameExclusion {
         Ok(excl)
     }
 
-    pub fn to_protobuf(self) -> PbExclusion {
+    fn to_protobuf(self) -> PbExclusion {
         match self {
             Self::CurrentRow => PbExclusion::CurrentRow,
             Self::NoOthers => PbExclusion::NoOthers,

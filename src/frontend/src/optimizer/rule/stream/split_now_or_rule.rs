@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
 use risingwave_common::types::DataType;
 
 use crate::expr::{ExprImpl, ExprType, FunctionCall};
+use crate::optimizer::PlanRef;
 use crate::optimizer::plan_node::{LogicalFilter, LogicalShare, LogicalUnion, PlanTreeNodeUnary};
 use crate::optimizer::rule::{BoxedRule, Rule};
-use crate::optimizer::PlanRef;
 
 /// Convert `LogicalFilter` with now or others predicates to a `UNION ALL`
 ///
@@ -57,7 +57,7 @@ impl Rule for SplitNowOrRule {
             return None;
         }
 
-        let (mut now, others): (Vec<ExprImpl>, Vec<ExprImpl>) =
+        let (now, others): (Vec<ExprImpl>, Vec<ExprImpl>) =
             disjunctions.into_iter().partition(|x| x.count_nows() != 0);
 
         // Only support now in one arm of disjunctions
@@ -70,22 +70,10 @@ impl Rule for SplitNowOrRule {
         // + A & !B & !C ... &!Z
         // + B | C ... | Z
 
-        let mut arm1 = now.pop().unwrap();
-        for pred in &others {
-            let not_pred: ExprImpl =
-                FunctionCall::new_unchecked(ExprType::Not, vec![pred.clone()], DataType::Boolean)
-                    .into();
-            arm1 =
-                FunctionCall::new_unchecked(ExprType::And, vec![arm1, not_pred], DataType::Boolean)
-                    .into();
-        }
-
-        let arm2 = others
-            .into_iter()
-            .reduce(|a, b| {
-                FunctionCall::new_unchecked(ExprType::Or, vec![a, b], DataType::Boolean).into()
-            })
-            .unwrap();
+        let arm1 = ExprImpl::and(now.into_iter().chain(others.iter().map(|pred| {
+            FunctionCall::new_unchecked(ExprType::Not, vec![pred.clone()], DataType::Boolean).into()
+        })));
+        let arm2 = ExprImpl::or(others);
 
         let share = LogicalShare::create(input);
         let filter1 = LogicalFilter::create_with_expr(share.clone(), arm1);

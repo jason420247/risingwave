@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hytra::TrAdder;
 use parking_lot::Mutex;
 use risingwave_common::config::BatchConfig;
 use risingwave_common::memory::MemoryContext;
@@ -31,29 +30,23 @@ use risingwave_pb::task_service::{GetDataResponse, TaskInfoResponse};
 use tokio::sync::mpsc::Sender;
 use tonic::Status;
 
+use super::BatchTaskContext;
 use crate::error::Result;
 use crate::monitor::BatchManagerMetrics;
 use crate::rpc::service::exchange::GrpcExchangeWriter;
-use crate::task::{
-    BatchTaskExecution, ComputeNodeContext, StateReporter, TaskId, TaskOutput, TaskOutputId,
-};
+use crate::task::{BatchTaskExecution, StateReporter, TaskId, TaskOutput, TaskOutputId};
 
 /// `BatchManager` is responsible for managing all batch tasks.
 #[derive(Clone)]
 pub struct BatchManager {
     /// Every task id has a corresponding task execution.
-    tasks: Arc<Mutex<HashMap<TaskId, Arc<BatchTaskExecution<ComputeNodeContext>>>>>,
+    tasks: Arc<Mutex<HashMap<TaskId, Arc<BatchTaskExecution>>>>,
 
     /// Runtime for the batch manager.
     runtime: Arc<BackgroundShutdownRuntime>,
 
     /// Batch configuration
     config: BatchConfig,
-
-    /// Total batch memory usage in this CN.
-    /// When each task context report their own usage, it will apply the diff into this total mem
-    /// value for all tasks.
-    total_mem_val: Arc<TrAdder<i64>>,
 
     /// Memory context used for batch tasks in cn.
     mem_context: MemoryContext,
@@ -63,7 +56,7 @@ pub struct BatchManager {
 }
 
 impl BatchManager {
-    pub fn new(config: BatchConfig, metrics: Arc<BatchManagerMetrics>) -> Self {
+    pub fn new(config: BatchConfig, metrics: Arc<BatchManagerMetrics>, mem_limit: u64) -> Self {
         let runtime = {
             let mut builder = tokio::runtime::Builder::new_multi_thread();
             if let Some(worker_threads_num) = config.worker_threads_num {
@@ -76,12 +69,11 @@ impl BatchManager {
                 .unwrap()
         };
 
-        let mem_context = MemoryContext::root(metrics.batch_total_mem.clone());
+        let mem_context = MemoryContext::root(metrics.batch_total_mem.clone(), mem_limit);
         BatchManager {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             runtime: Arc::new(runtime.into()),
             config,
-            total_mem_val: TrAdder::new().into(),
             metrics,
             mem_context,
         }
@@ -100,7 +92,7 @@ impl BatchManager {
         tid: &PbTaskId,
         plan: PlanFragment,
         epoch: BatchQueryEpoch,
-        context: ComputeNodeContext,
+        context: Arc<dyn BatchTaskContext>, // ComputeNodeContext
         state_reporter: StateReporter,
         tracing_context: TracingContext,
         expr_context: ExprContext,
@@ -144,17 +136,20 @@ impl BatchManager {
         tid: &PbTaskId,
         plan: PlanFragment,
     ) -> Result<()> {
-        use risingwave_hummock_sdk::to_committed_batch_query_epoch;
+        use risingwave_hummock_sdk::test_batch_query_epoch;
+
+        use crate::task::ComputeNodeContext;
 
         self.fire_task(
             tid,
             plan,
-            to_committed_batch_query_epoch(0),
+            test_batch_query_epoch(),
             ComputeNodeContext::for_test(),
             StateReporter::new_with_test(),
             TracingContext::none(),
             ExprContext {
-                time_zone: "UTC".to_string(),
+                time_zone: "UTC".to_owned(),
+                strict_mode: false,
             },
         )
         .await
@@ -181,7 +176,7 @@ impl BatchManager {
                 .send(TaskInfoResponse {
                     task_id: Some(task_id.to_prost()),
                     task_status: TaskStatus::Ping.into(),
-                    error_message: "".to_string(),
+                    error_message: "".to_owned(),
                 })
                 .await
                 .is_err()
@@ -288,45 +283,6 @@ impl BatchManager {
     pub fn config(&self) -> &BatchConfig {
         &self.config
     }
-
-    /// Kill batch queries with larges memory consumption per task. Required to maintain task level
-    /// memory usage in the struct. Will be called by global memory manager.
-    pub fn kill_queries(&self, reason: String) {
-        let mut max_mem_task_id = None;
-        let mut max_mem = usize::MIN;
-        let guard = self.tasks.lock();
-        for (t_id, t) in &*guard {
-            // If the task has been stopped, we should not count this.
-            if t.is_end() {
-                continue;
-            }
-            // Alternatively, we can use a bool flag to indicate end of execution.
-            // Now we use only store 0 bytes in Context after execution ends.
-            let mem_usage = t.mem_usage();
-            if mem_usage > max_mem {
-                max_mem = mem_usage;
-                max_mem_task_id = Some(t_id.clone());
-            }
-        }
-        if let Some(id) = max_mem_task_id {
-            let t = guard.get(&id).unwrap();
-            // FIXME: `Abort` will not report error but truncated results to user. We should
-            // consider throw error.
-            t.abort(reason);
-        }
-    }
-
-    /// Called by global memory manager for total usage of batch tasks. This op is designed to be
-    /// light-weight
-    pub fn total_mem_usage(&self) -> usize {
-        self.total_mem_val.get() as usize
-    }
-
-    /// Calculate the diff between this time and last time memory usage report, apply the diff for
-    /// the global counter. Due to the limitation of hytra, we need to use i64 type here.
-    pub fn apply_mem_diff(&self, diff: i64) {
-        self.total_mem_val.inc(diff)
-    }
 }
 
 #[cfg(test)]
@@ -337,22 +293,23 @@ mod tests {
     use risingwave_pb::batch_plan::exchange_info::DistributionMode;
     use risingwave_pb::batch_plan::plan_node::NodeBody;
     use risingwave_pb::batch_plan::{
-        ExchangeInfo, PbTaskId, PbTaskOutputId, PlanFragment, PlanNode, ValuesNode,
+        ExchangeInfo, PbTaskId, PbTaskOutputId, PlanFragment, PlanNode,
     };
 
     use crate::monitor::BatchManagerMetrics;
     use crate::task::{BatchManager, TaskId};
 
-    #[test]
-    fn test_task_not_found() {
+    #[tokio::test]
+    async fn test_task_not_found() {
         let manager = Arc::new(BatchManager::new(
             BatchConfig::default(),
             BatchManagerMetrics::for_test(),
+            u64::MAX,
         ));
         let task_id = TaskId {
             task_id: 0,
             stage_id: 0,
-            query_id: "abc".to_string(),
+            query_id: "abc".to_owned(),
         };
 
         let error = manager.check_if_task_running(&task_id).unwrap_err();
@@ -371,55 +328,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_id_conflict() {
-        let manager = Arc::new(BatchManager::new(
-            BatchConfig::default(),
-            BatchManagerMetrics::for_test(),
-        ));
-        let plan = PlanFragment {
-            root: Some(PlanNode {
-                children: vec![],
-                identity: "".to_string(),
-                node_body: Some(NodeBody::Values(ValuesNode {
-                    tuples: vec![],
-                    fields: vec![],
-                })),
-            }),
-            exchange_info: Some(ExchangeInfo {
-                mode: DistributionMode::Single as i32,
-                distribution: None,
-            }),
-        };
-        let task_id = PbTaskId {
-            query_id: "".to_string(),
-            stage_id: 0,
-            task_id: 0,
-        };
-        manager
-            .fire_task_for_test(&task_id, plan.clone())
-            .await
-            .unwrap();
-        let err = manager
-            .fire_task_for_test(&task_id, plan)
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("can not create duplicate task with the same id"));
-    }
-
-    #[tokio::test]
     // see https://github.com/risingwavelabs/risingwave/issues/11979
     #[ignore]
     async fn test_task_cancel_for_busy_loop() {
         let manager = Arc::new(BatchManager::new(
             BatchConfig::default(),
             BatchManagerMetrics::for_test(),
+            u64::MAX,
         ));
         let plan = PlanFragment {
             root: Some(PlanNode {
                 children: vec![],
-                identity: "".to_string(),
+                identity: "".to_owned(),
                 node_body: Some(NodeBody::BusyLoopExecutor(true)),
             }),
             exchange_info: Some(ExchangeInfo {
@@ -428,7 +348,7 @@ mod tests {
             }),
         };
         let task_id = PbTaskId {
-            query_id: "".to_string(),
+            query_id: "".to_owned(),
             stage_id: 0,
             task_id: 0,
         };
@@ -445,11 +365,12 @@ mod tests {
         let manager = Arc::new(BatchManager::new(
             BatchConfig::default(),
             BatchManagerMetrics::for_test(),
+            u64::MAX,
         ));
         let plan = PlanFragment {
             root: Some(PlanNode {
                 children: vec![],
-                identity: "".to_string(),
+                identity: "".to_owned(),
                 node_body: Some(NodeBody::BusyLoopExecutor(true)),
             }),
             exchange_info: Some(ExchangeInfo {
@@ -458,7 +379,7 @@ mod tests {
             }),
         };
         let task_id = PbTaskId {
-            query_id: "".to_string(),
+            query_id: "".to_owned(),
             stage_id: 0,
             task_id: 0,
         };

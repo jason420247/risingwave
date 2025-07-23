@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,55 +14,27 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use risingwave_common::error::anyhow_error;
-use risingwave_simulation::cluster::{Cluster, Configuration, KillOpts, Session};
+use anyhow::{Result, anyhow};
+use risingwave_common::error::AsReport;
+use risingwave_simulation::cluster::{Cluster, Configuration, Session};
 use tokio::time::sleep;
+
+use crate::utils::{
+    kill_cn_and_meta_and_wait_recover, kill_cn_and_wait_recover, kill_random_and_wait_recover,
+};
 
 const CREATE_TABLE: &str = "CREATE TABLE t(v1 int);";
 const DROP_TABLE: &str = "DROP TABLE t;";
 const SEED_TABLE_500: &str = "INSERT INTO t SELECT generate_series FROM generate_series(1, 500);";
 const SEED_TABLE_100: &str = "INSERT INTO t SELECT generate_series FROM generate_series(1, 100);";
 const SET_BACKGROUND_DDL: &str = "SET BACKGROUND_DDL=true;";
-const SET_RATE_LIMIT_2: &str = "SET STREAMING_RATE_LIMIT=2;";
-const SET_RATE_LIMIT_1: &str = "SET STREAMING_RATE_LIMIT=1;";
-const RESET_RATE_LIMIT: &str = "SET STREAMING_RATE_LIMIT=0;";
+const RESET_BACKGROUND_DDL: &str = "SET BACKGROUND_DDL=false;";
+const SET_RATE_LIMIT_2: &str = "SET BACKFILL_RATE_LIMIT=2;";
+const SET_RATE_LIMIT_1: &str = "SET BACKFILL_RATE_LIMIT=1;";
+const RESET_RATE_LIMIT: &str = "SET BACKFILL_RATE_LIMIT=DEFAULT;";
 const CREATE_MV1: &str = "CREATE MATERIALIZED VIEW mv1 as SELECT * FROM t;";
 const DROP_MV1: &str = "DROP MATERIALIZED VIEW mv1;";
 const WAIT: &str = "WAIT;";
-
-async fn kill_cn_and_wait_recover(cluster: &Cluster) {
-    cluster
-        .kill_nodes(["compute-1", "compute-2", "compute-3"], 0)
-        .await;
-    sleep(Duration::from_secs(10)).await;
-}
-
-async fn kill_cn_and_meta_and_wait_recover(cluster: &Cluster) {
-    cluster
-        .kill_nodes(
-            [
-                "compute-1",
-                "compute-2",
-                "compute-3",
-                "meta-1",
-                "meta-2",
-                "meta-3",
-            ],
-            0,
-        )
-        .await;
-    sleep(Duration::from_secs(10)).await;
-}
-
-async fn kill_random_and_wait_recover(cluster: &Cluster) {
-    // Kill it again
-    for _ in 0..3 {
-        sleep(Duration::from_secs(2)).await;
-        cluster.kill_node(&KillOpts::ALL_FAST).await;
-    }
-    sleep(Duration::from_secs(10)).await;
-}
 
 async fn cancel_stream_jobs(session: &mut Session) -> Result<Vec<u32>> {
     tracing::info!("finding streaming jobs to cancel");
@@ -78,7 +50,7 @@ async fn cancel_stream_jobs(session: &mut Session) -> Result<Vec<u32>> {
         .split('\n')
         .map(|s| {
             s.parse::<u32>()
-                .map_err(|_e| anyhow_error!("failed to parse {}", s))
+                .map_err(|_e| anyhow!("failed to parse {}", s))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ids)
@@ -212,24 +184,24 @@ async fn test_ddl_cancel() -> Result<()> {
 
     // Test cancel after kill cn
     kill_cn_and_wait_recover(&cluster).await;
-
     let ids = cancel_stream_jobs(&mut session).await?;
     assert_eq!(ids.len(), 1);
+    tracing::info!("tested cancel background_ddl after recovery");
 
     sleep(Duration::from_secs(2)).await;
 
     create_mv(&mut session).await?;
 
-    // Test cancel after kill meta
+    // Test cancel after kill random nodes
     kill_random_and_wait_recover(&cluster).await;
-
     let ids = cancel_stream_jobs(&mut session).await?;
     assert_eq!(ids.len(), 1);
+    tracing::info!("tested cancel background_ddl after recovery from random node kill");
 
-    // Test cancel by sigkill
-
+    // Test cancel by sigkill (only works for foreground mv)
     let mut session2 = cluster.start_session();
     tokio::spawn(async move {
+        session2.run(RESET_BACKGROUND_DDL).await.unwrap();
         session2.run(SET_RATE_LIMIT_1).await.unwrap();
         let _ = create_mv(&mut session2).await;
     });
@@ -241,9 +213,12 @@ async fn test_ddl_cancel() -> Result<()> {
             .lines()
             .find(|line| line.to_lowercase().contains("mv1"))
         {
-            let pid = line.split_whitespace().next().unwrap();
-            let pid = pid.parse::<usize>().unwrap();
-            session.run(format!("kill {};", pid)).await?;
+            tracing::info!("found mv1 process: {}", line);
+            let mut splits = line.split_whitespace();
+            let _worker_id = splits.next().unwrap();
+            let pid = splits.next().unwrap();
+            session.run(format!("kill '{}';", pid)).await?;
+            sleep(Duration::from_secs(10)).await;
             break;
         }
         sleep(Duration::from_secs(2)).await;
@@ -258,7 +233,7 @@ async fn test_ddl_cancel() -> Result<()> {
         let result = create_mv(&mut session).await;
         match result {
             Ok(_) => break,
-            Err(e) if e.to_string().contains("in creating procedure") => {
+            Err(e) if e.to_string().contains("under creation") => {
                 tracing::info!("create mv failed, retrying: {}", e);
             }
             Err(e) => {
@@ -278,29 +253,27 @@ async fn test_ddl_cancel() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_high_barrier_latency_cancel() -> Result<()> {
+/// When cancelling a stream job under high latency,
+/// the cancel should take a long time to take effect.
+/// If we trigger a recovery however, the cancel should take effect immediately,
+/// since cancel will immediately drop the table fragment.
+async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
     init_logger();
-    let mut cluster = Cluster::start(Configuration::for_scale()).await?;
+    let mut cluster = Cluster::start(config).await?;
     let mut session = cluster.start_session();
 
-    // 100,000 fact records
-    session.run("CREATE TABLE fact (v1 int)").await?;
+    // Join 2 fact tables together to create a high barrier latency scenario.
+
+    session.run("CREATE TABLE fact1 (v1 int)").await?;
     session
-        .run("INSERT INTO fact select 1 from generate_series(1, 100000)")
+        .run("INSERT INTO fact1 select 1 from generate_series(1, 10000)")
         .await?;
 
-    // Amplification factor of 1000 per record.
-    session.run("CREATE TABLE dimension (v1 int)").await?;
+    session.run("CREATE TABLE fact2 (v1 int)").await?;
     session
-        .run("INSERT INTO dimension select 1 from generate_series(1, 1000)")
+        .run("INSERT INTO fact2 select 1 from generate_series(1, 10000)")
         .await?;
     session.flush().await?;
-
-    // With 10 rate limit, and amplification factor of 1000,
-    // We should expect 10,000 rows / s.
-    // That should be enough to cause barrier latency to spike.
-    session.run("SET STREAMING_RATE_LIMIT=10").await?;
 
     tracing::info!("seeded base tables");
 
@@ -308,11 +281,17 @@ async fn test_high_barrier_latency_cancel() -> Result<()> {
     // Keep creating mv1, if it's not created.
     loop {
         session.run(SET_BACKGROUND_DDL).await?;
-        session.run("CREATE MATERIALIZED VIEW mv1 as select fact.v1 from fact join dimension on fact.v1 = dimension.v1").await?;
+        session.run(SET_RATE_LIMIT_2).await?;
+        session.run("CREATE MATERIALIZED VIEW mv1 as select fact1.v1 from fact1 join fact2 on fact1.v1 = fact2.v1").await?;
         tracing::info!("created mv in background");
         sleep(Duration::from_secs(1)).await;
 
-        kill_cn_and_wait_recover(&cluster).await;
+        cluster
+            .kill_nodes_and_restart(["compute-1", "compute-2", "compute-3"], 2)
+            .await;
+        sleep(Duration::from_secs(2)).await;
+
+        tracing::debug!("killed cn, waiting recovery");
 
         // Check if mv stream job is created in the background
         match session
@@ -324,12 +303,7 @@ async fn test_high_barrier_latency_cancel() -> Result<()> {
                 continue;
             }
             Err(e) => {
-                if e.to_string().contains("in creating procedure") {
-                    // MV already created and recovered.
-                    break;
-                } else {
-                    return Err(e);
-                }
+                return Err(e);
             }
             Ok(s) => {
                 tracing::info!("created mv stream job with status: {}", s);
@@ -340,33 +314,69 @@ async fn test_high_barrier_latency_cancel() -> Result<()> {
 
     tracing::info!("restarted cn: trigger stream job recovery");
 
-    // Attempt to cancel
-    let mut session2 = cluster.start_session();
-    let handle = tokio::spawn(async move {
-        let result = cancel_stream_jobs(&mut session2).await;
-        assert!(result.is_err())
-    });
+    // Make sure there's some progress first.
+    loop {
+        // Wait until at least 10% of records are ingested.
+        let progress = session
+            .run("select progress from rw_catalog.rw_ddl_progress;")
+            .await
+            .unwrap();
+        tracing::info!(progress, "get progress before cancel stream job");
+        let progress = progress.split_once("%").unwrap().0;
+        let progress = progress.parse::<f64>().unwrap();
+        if progress >= 0.01 {
+            break;
+        } else {
+            sleep(Duration::from_micros(1)).await;
+        }
+    }
+    // Loop in case the cancel gets dropped after
+    // cn kill, before it drops the table fragment.
+    for iteration in 0..5 {
+        tracing::info!(iteration, "cancelling stream job");
+        let mut session2 = cluster.start_session();
+        let handle = tokio::spawn(async move {
+            let result = cancel_stream_jobs(&mut session2).await;
+            tracing::info!(?result, "cancel stream jobs");
+        });
 
-    sleep(Duration::from_secs(2)).await;
-    kill_cn_and_wait_recover(&cluster).await;
-    tracing::info!("restarted cn: cancel should take effect");
+        sleep(Duration::from_millis(500)).await;
+        kill_cn_and_wait_recover(&cluster).await;
+        tracing::info!("restarted cn: cancel should take effect");
 
-    handle.await.unwrap();
+        handle.await.unwrap();
 
-    // Create MV with same relation name should succeed,
-    // since the previous job should be cancelled.
-    tracing::info!("recreating mv");
-    session.run("SET BACKGROUND_DDL=false").await?;
-    session
-        .run("CREATE MATERIALIZED VIEW mv1 as values(1)")
-        .await?;
-    tracing::info!("recreated mv");
+        // Create MV with same relation name should succeed,
+        // since the previous job should be cancelled.
+        tracing::info!("recreating mv");
+        session.run("SET BACKGROUND_DDL=false").await?;
+        if let Err(e) = session
+            .run("CREATE MATERIALIZED VIEW mv1 as values(1)")
+            .await
+        {
+            tracing::info!(error = %e.as_report(), "Recreate mv failed");
+            continue;
+        } else {
+            tracing::info!("recreated mv");
+            break;
+        }
+    }
 
     session.run(DROP_MV1).await?;
-    session.run("DROP TABLE fact").await?;
-    session.run("DROP TABLE dimension").await?;
+    session.run("DROP TABLE fact1").await?;
+    session.run("DROP TABLE fact2").await?;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_high_barrier_latency_cancel_for_arrangement_backfill() -> Result<()> {
+    test_high_barrier_latency_cancel(Configuration::for_arrangement_backfill()).await
+}
+
+#[tokio::test]
+async fn test_high_barrier_latency_cancel_for_no_shuffle() -> Result<()> {
+    test_high_barrier_latency_cancel(Configuration::for_scale_no_shuffle()).await
 }
 
 // When cluster stop, foreground ddl job must be cancelled.
@@ -435,7 +445,7 @@ async fn test_foreground_index_cancel() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_sink_create() -> Result<()> {
+async fn test_background_sink_create() -> Result<()> {
     init_logger();
     let mut cluster = Cluster::start(Configuration::for_background_ddl()).await?;
     let mut session = cluster.start_session();
@@ -445,6 +455,7 @@ async fn test_sink_create() -> Result<()> {
 
     let mut session2 = cluster.start_session();
     tokio::spawn(async move {
+        session2.run(SET_BACKGROUND_DDL).await.unwrap();
         session2.run(SET_RATE_LIMIT_2).await.unwrap();
         session2
             .run("CREATE SINK s FROM t WITH (connector='blackhole');")

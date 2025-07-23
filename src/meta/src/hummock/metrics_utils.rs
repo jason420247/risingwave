@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,58 +13,100 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use itertools::{enumerate, Itertools};
-use risingwave_hummock_sdk::compaction_group::hummock_version_ext::{
-    object_size_map, BranchedSstInfo,
-};
+use itertools::{Itertools, enumerate};
+use prometheus::IntGauge;
+use prometheus::core::{AtomicU64, GenericCounter};
+use risingwave_hummock_sdk::compact_task::CompactTask;
+use risingwave_hummock_sdk::compaction_group::hummock_version_ext::object_size_map;
+use risingwave_hummock_sdk::level::Levels;
+use risingwave_hummock_sdk::table_stats::PbTableStatsMap;
 use risingwave_hummock_sdk::version::HummockVersion;
-use risingwave_hummock_sdk::{
-    CompactionGroupId, HummockContextId, HummockEpoch, HummockSstableObjectId, HummockVersionId,
-};
-use risingwave_pb::hummock::hummock_version::Levels;
+use risingwave_hummock_sdk::{CompactionGroupId, HummockContextId, HummockVersionId};
 use risingwave_pb::hummock::write_limits::WriteLimit;
 use risingwave_pb::hummock::{
-    CompactionConfig, HummockPinnedSnapshot, HummockPinnedVersion, HummockVersionStats, LevelType,
+    CompactionConfig, HummockPinnedVersion, HummockVersionStats, LevelType,
 };
 
-use super::compaction::get_compression_algorithm;
 use super::compaction::selector::DynamicLevelSelectorCore;
+use super::compaction::{CompactionDeveloperConfig, get_compression_algorithm};
 use crate::hummock::checkpoint::HummockVersionCheckpoint;
 use crate::hummock::compaction::CompactStatus;
 use crate::rpc::metrics::MetaMetrics;
 
-pub fn trigger_version_stat(
+pub struct LocalTableMetrics {
+    total_key_count: IntGauge,
+    total_key_size: IntGauge,
+    total_value_size: IntGauge,
+    write_throughput: GenericCounter<AtomicU64>,
+    cal_count: usize,
+    write_size: u64,
+}
+
+const MIN_FLUSH_COUNT: usize = 16;
+const MIN_FLUSH_DATA_SIZE: u64 = 128 * 1024 * 1024;
+
+impl LocalTableMetrics {
+    pub fn inc_write_throughput(&mut self, val: u64) {
+        self.write_size += val;
+        self.cal_count += 1;
+        if self.write_size > MIN_FLUSH_DATA_SIZE || self.cal_count > MIN_FLUSH_COUNT {
+            self.write_throughput.inc_by(self.write_size / 1024 / 1024);
+            self.write_size = 0;
+            self.cal_count = 0;
+        }
+    }
+}
+
+pub fn get_or_create_local_table_stat<'a>(
     metrics: &MetaMetrics,
-    current_version: &HummockVersion,
+    table_id: u32,
+    local_metrics: &'a mut HashMap<u32, LocalTableMetrics>,
+) -> &'a mut LocalTableMetrics {
+    local_metrics.entry(table_id).or_insert_with(|| {
+        let table_label = format!("{}", table_id);
+        LocalTableMetrics {
+            total_key_count: metrics
+                .version_stats
+                .with_label_values(&[table_label.as_str(), "total_key_count"]),
+            total_key_size: metrics
+                .version_stats
+                .with_label_values(&[table_label.as_str(), "total_key_size"]),
+            total_value_size: metrics
+                .version_stats
+                .with_label_values(&[table_label.as_str(), "total_value_size"]),
+            write_throughput: metrics
+                .table_write_throughput
+                .with_label_values(&[&table_label]),
+            cal_count: 0,
+            write_size: 0,
+        }
+    })
+}
+
+pub fn trigger_local_table_stat(
+    metrics: &MetaMetrics,
+    local_metrics: &mut HashMap<u32, LocalTableMetrics>,
     version_stats: &HummockVersionStats,
+    table_stats_change: &PbTableStatsMap,
 ) {
-    metrics
-        .max_committed_epoch
-        .set(current_version.max_committed_epoch as i64);
-    metrics
-        .version_size
-        .set(current_version.estimated_encode_len() as i64);
-    metrics.safe_epoch.set(current_version.safe_epoch as i64);
-    metrics.current_version_id.set(current_version.id as i64);
-    metrics.version_stats.reset();
-    for (table_id, stats) in &version_stats.table_stats {
-        let table_id = format!("{}", table_id);
-        metrics
-            .version_stats
-            .with_label_values(&[&table_id, "total_key_count"])
-            .set(stats.total_key_count);
-        metrics
-            .version_stats
-            .with_label_values(&[&table_id, "total_key_size"])
-            .set(stats.total_key_size);
-        metrics
-            .version_stats
-            .with_label_values(&[&table_id, "total_value_size"])
-            .set(stats.total_value_size);
+    for (table_id, stats) in table_stats_change {
+        if stats.total_key_size == 0 && stats.total_value_size == 0 && stats.total_key_count == 0 {
+            continue;
+        }
+        let table_metrics = get_or_create_local_table_stat(metrics, *table_id, local_metrics);
+        if let Some(table_stats) = version_stats.table_stats.get(table_id) {
+            table_metrics
+                .total_key_count
+                .set(table_stats.total_key_count);
+            table_metrics
+                .total_value_size
+                .set(table_stats.total_value_size);
+            table_metrics.total_key_size.set(table_stats.total_key_size);
+        }
     }
 }
 
@@ -83,7 +125,7 @@ pub fn trigger_mv_stat(
 
         metrics
             .materialized_view_stats
-            .with_label_values(&[&mv_id.to_string(), "materialized_view_total_size"])
+            .with_label_values(&[mv_id.to_string().as_str(), "materialized_view_total_size"])
             .set(total_size);
     }
 }
@@ -128,13 +170,13 @@ pub fn trigger_sst_stat(
             .with_label_values(&[&level_label])
             .set(level_sst_size(idx) as i64);
         if let Some(compact_status) = compact_status {
-            let compact_cnt = compact_status.level_handlers[idx].get_pending_file_count();
+            let compact_cnt = compact_status.level_handlers[idx].pending_file_count();
             metrics
                 .level_compact_cnt
                 .with_label_values(&[&level_label])
                 .set(compact_cnt as i64);
 
-            let compacting_task = compact_status.level_handlers[idx].get_pending_tasks();
+            let compacting_task = compact_status.level_handlers[idx].pending_tasks();
             let mut pending_task_ids: HashSet<u64> = HashSet::default();
             for task in compacting_task {
                 if pending_task_ids.contains(&task.task_id) {
@@ -164,46 +206,63 @@ pub fn trigger_sst_stat(
             .set(*compacting_task_count as _);
     }
 
-    if compacting_task_stat.is_empty() {
-        if let Some(levels) = current_version.levels.get(&compaction_group_id) {
-            let max_level = levels.levels.len();
-            remove_compacting_task_stat(metrics, compaction_group_id, max_level);
-        }
+    if compacting_task_stat.is_empty()
+        && let Some(levels) = current_version.levels.get(&compaction_group_id)
+    {
+        let max_level = levels.levels.len();
+        remove_compacting_task_stat(metrics, compaction_group_id, max_level);
     }
 
     {
         // sub level stat
         let overlapping_level_label =
-            build_compact_task_l0_stat_metrics_label(compaction_group_id, true);
+            build_compact_task_l0_stat_metrics_label(compaction_group_id, true, false);
         let non_overlap_level_label =
-            build_compact_task_l0_stat_metrics_label(compaction_group_id, false);
+            build_compact_task_l0_stat_metrics_label(compaction_group_id, false, false);
+        let partition_level_label =
+            build_compact_task_l0_stat_metrics_label(compaction_group_id, true, true);
 
         let overlapping_sst_num = current_version
             .levels
             .get(&compaction_group_id)
-            .and_then(|level| {
-                level.l0.as_ref().map(|l0| {
-                    l0.sub_levels
-                        .iter()
-                        .filter(|sub_level| sub_level.level_type() == LevelType::Overlapping)
-                        .count()
-                })
+            .map(|level| {
+                level
+                    .l0
+                    .sub_levels
+                    .iter()
+                    .filter(|sub_level| sub_level.level_type == LevelType::Overlapping)
+                    .count()
             })
             .unwrap_or(0);
 
         let non_overlap_sst_num = current_version
             .levels
             .get(&compaction_group_id)
-            .and_then(|level| {
-                level.l0.as_ref().map(|l0| {
-                    l0.sub_levels
-                        .iter()
-                        .filter(|sub_level| sub_level.level_type() == LevelType::Nonoverlapping)
-                        .count()
-                })
+            .map(|level| {
+                level
+                    .l0
+                    .sub_levels
+                    .iter()
+                    .filter(|sub_level| sub_level.level_type == LevelType::Nonoverlapping)
+                    .count()
             })
             .unwrap_or(0);
 
+        let partition_level_num = current_version
+            .levels
+            .get(&compaction_group_id)
+            .map(|level| {
+                level
+                    .l0
+                    .sub_levels
+                    .iter()
+                    .filter(|sub_level| {
+                        sub_level.level_type == LevelType::Nonoverlapping
+                            && sub_level.vnode_partition_count > 0
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
         metrics
             .level_sst_num
             .with_label_values(&[&overlapping_level_label])
@@ -213,6 +272,11 @@ pub fn trigger_sst_stat(
             .level_sst_num
             .with_label_values(&[&non_overlap_level_label])
             .set(non_overlap_sst_num as i64);
+
+        metrics
+            .level_sst_num
+            .with_label_values(&[&partition_level_label])
+            .set(partition_level_num as i64);
     }
 
     let previous_time = metrics.time_after_last_observation.load(Ordering::Relaxed);
@@ -230,22 +294,42 @@ pub fn trigger_sst_stat(
                 Ordering::Relaxed,
             )
             .is_ok()
+        && let Some(compact_status) = compact_status
     {
-        if let Some(compact_status) = compact_status {
-            for (idx, level_handler) in enumerate(compact_status.level_handlers.iter()) {
-                let sst_num = level_sst_cnt(idx);
-                let sst_size = level_sst_size(idx);
-                let compact_cnt = level_handler.get_pending_file_count();
-                tracing::info!(
-                    "Level {} has {} SSTs, the total size of which is {}KB, while {} of those are being compacted to bottom levels",
-                    idx,
-                    sst_num,
-                    sst_size,
-                    compact_cnt,
-                );
-            }
+        for (idx, level_handler) in enumerate(compact_status.level_handlers.iter()) {
+            let sst_num = level_sst_cnt(idx);
+            let sst_size = level_sst_size(idx);
+            let compact_cnt = level_handler.pending_file_count();
+            tracing::info!(
+                "Level {} has {} SSTs, the total size of which is {}KB, while {} of those are being compacted to bottom levels",
+                idx,
+                sst_num,
+                sst_size,
+                compact_cnt,
+            );
         }
     }
+}
+
+pub fn trigger_epoch_stat(metrics: &MetaMetrics, version: &HummockVersion) {
+    metrics.max_committed_epoch.set(
+        version
+            .state_table_info
+            .info()
+            .values()
+            .map(|i| i.committed_epoch)
+            .max()
+            .unwrap_or(0) as _,
+    );
+    metrics.min_committed_epoch.set(
+        version
+            .state_table_info
+            .info()
+            .values()
+            .map(|i| i.committed_epoch)
+            .min()
+            .unwrap_or(0) as _,
+    );
 }
 
 pub fn remove_compaction_group_in_sst_stat(
@@ -290,6 +374,7 @@ pub fn remove_compaction_group_in_sst_stat(
     remove_compacting_task_stat(metrics, compaction_group_id, max_level);
     remove_split_stat(metrics, compaction_group_id);
     remove_compact_task_metrics(metrics, compaction_group_id, max_level);
+    remove_compaction_group_stat(metrics, compaction_group_id);
 }
 
 pub fn remove_compacting_task_stat(
@@ -325,6 +410,32 @@ pub fn remove_split_stat(metrics: &MetaMetrics, compaction_group_id: CompactionG
         .ok();
 }
 
+pub fn remove_compaction_group_stat(metrics: &MetaMetrics, compaction_group_id: CompactionGroupId) {
+    let label_str = compaction_group_id.to_string();
+    metrics
+        .compaction_group_size
+        .remove_label_values(&[&label_str])
+        .ok();
+    metrics
+        .compaction_group_file_count
+        .remove_label_values(&[&label_str])
+        .ok();
+    metrics
+        .compaction_group_throughput
+        .remove_label_values(&[&label_str])
+        .ok();
+
+    metrics
+        .split_compaction_group_count
+        .remove_label_values(&[&label_str])
+        .ok();
+
+    metrics
+        .merge_compaction_group_count
+        .remove_label_values(&[&label_str])
+        .ok();
+}
+
 pub fn trigger_pin_unpin_version_state(
     metrics: &MetaMetrics,
     pinned_versions: &BTreeMap<HummockContextId, HummockPinnedVersion>,
@@ -334,32 +445,7 @@ pub fn trigger_pin_unpin_version_state(
     } else {
         metrics
             .min_pinned_version_id
-            .set(HummockVersionId::MAX as _);
-    }
-}
-
-pub fn trigger_pin_unpin_snapshot_state(
-    metrics: &MetaMetrics,
-    pinned_snapshots: &BTreeMap<HummockContextId, HummockPinnedSnapshot>,
-) {
-    if let Some(m) = pinned_snapshots
-        .values()
-        .map(|v| v.minimal_pinned_snapshot)
-        .min()
-    {
-        metrics.min_pinned_epoch.set(m as i64);
-    } else {
-        metrics.min_pinned_epoch.set(HummockEpoch::MAX as _);
-    }
-}
-
-pub fn trigger_safepoint_stat(metrics: &MetaMetrics, safepoints: &[HummockVersionId]) {
-    if let Some(sp) = safepoints.iter().min() {
-        metrics.min_safepoint_version_id.set(*sp as _);
-    } else {
-        metrics
-            .min_safepoint_version_id
-            .set(HummockVersionId::MAX as _);
+            .set(HummockVersionId::MAX.to_u64() as _);
     }
 }
 
@@ -398,10 +484,31 @@ pub fn trigger_gc_stat(
         .set(old_version_object_count as _);
     metrics.stale_object_size.set(stale_object_size as _);
     metrics.stale_object_count.set(stale_object_count as _);
-}
-
-pub fn trigger_delta_log_stats(metrics: &MetaMetrics, total_number: usize) {
-    metrics.delta_log_count.set(total_number as _);
+    // table change log
+    for (table_id, logs) in &checkpoint.version.table_change_log {
+        let object_count = logs
+            .iter()
+            .map(|l| l.old_value.len() + l.new_value.len())
+            .sum::<usize>();
+        let object_size = logs
+            .iter()
+            .map(|l| {
+                l.old_value
+                    .iter()
+                    .chain(l.new_value.iter())
+                    .map(|s| s.file_size as usize)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        metrics
+            .table_change_log_object_count
+            .with_label_values(&[&format!("{table_id}")])
+            .set(object_count as _);
+        metrics
+            .table_change_log_object_size
+            .with_label_values(&[&format!("{table_id}")])
+            .set(object_size as _);
+    }
 }
 
 // Triggers a report on compact_pending_bytes_needed
@@ -413,7 +520,11 @@ pub fn trigger_lsm_stat(
 ) {
     let group_label = compaction_group_id.to_string();
     // compact_pending_bytes
-    let dynamic_level_core = DynamicLevelSelectorCore::new(compaction_config.clone());
+    // we don't actually generate a compaction task here so developer config can be ignored.
+    let dynamic_level_core = DynamicLevelSelectorCore::new(
+        compaction_config.clone(),
+        Arc::new(CompactionDeveloperConfig::default()),
+    );
     let ctx = dynamic_level_core.calculate_level_base_size(levels);
     {
         let compact_pending_bytes_needed =
@@ -428,16 +539,16 @@ pub fn trigger_lsm_stat(
     {
         // compact_level_compression_ratio
         let level_compression_ratio = levels
-            .get_levels()
+            .levels
             .iter()
             .map(|level| {
-                let ratio = if level.get_uncompressed_file_size() == 0 {
+                let ratio = if level.uncompressed_file_size == 0 {
                     0.0
                 } else {
-                    level.get_total_file_size() as f64 / level.get_uncompressed_file_size() as f64
+                    level.total_file_size as f64 / level.uncompressed_file_size as f64
                 };
 
-                (level.get_level_idx(), ratio)
+                (level.level_idx, ratio)
             })
             .collect_vec();
 
@@ -473,36 +584,36 @@ pub fn trigger_write_stop_stats(
     }
 }
 
-pub fn trigger_split_stat(
-    metrics: &MetaMetrics,
-    compaction_group_id: CompactionGroupId,
-    member_table_id_len: usize,
-    branched_ssts: &BTreeMap<
-        // SST object id
-        HummockSstableObjectId,
-        BranchedSstInfo,
-    >,
-) {
-    let group_label = compaction_group_id.to_string();
-    metrics
-        .state_table_count
-        .with_label_values(&[&group_label])
-        .set(member_table_id_len as _);
+pub fn trigger_split_stat(metrics: &MetaMetrics, version: &HummockVersion) {
+    let branched_ssts = version.build_branched_sst_info();
 
-    let branched_sst_count: usize = branched_ssts
-        .values()
-        .map(|branched_map| {
-            branched_map
-                .keys()
-                .filter(|group_id| **group_id == compaction_group_id)
-                .count()
-        })
-        .sum();
+    for compaction_group_id in version.levels.keys() {
+        let group_label = compaction_group_id.to_string();
+        metrics
+            .state_table_count
+            .with_label_values(&[&group_label])
+            .set(
+                version
+                    .state_table_info
+                    .compaction_group_member_table_ids(*compaction_group_id)
+                    .len() as _,
+            );
 
-    metrics
-        .branched_sst_count
-        .with_label_values(&[&group_label])
-        .set(branched_sst_count as _);
+        let branched_sst_count: usize = branched_ssts
+            .values()
+            .map(|branched_map| {
+                branched_map
+                    .keys()
+                    .filter(|group_id| *group_id == compaction_group_id)
+                    .count()
+            })
+            .sum();
+
+        metrics
+            .branched_sst_count
+            .with_label_values(&[&group_label])
+            .set(branched_sst_count as _);
+    }
 }
 
 pub fn build_level_metrics_label(compaction_group_id: u64, level_idx: usize) -> String {
@@ -531,8 +642,11 @@ pub fn build_compact_task_stat_metrics_label(
 pub fn build_compact_task_l0_stat_metrics_label(
     compaction_group_id: u64,
     overlapping: bool,
+    partition: bool,
 ) -> String {
-    if overlapping {
+    if partition {
+        format!("cg{}_l0_sub_partition", compaction_group_id)
+    } else if overlapping {
         format!("cg{}_l0_sub_overlapping", compaction_group_id)
     } else {
         format!("cg{}_l0_sub_non_overlap", compaction_group_id)
@@ -577,4 +691,43 @@ pub fn remove_compact_task_metrics(
             }
         }
     }
+}
+
+pub fn trigger_compact_tasks_stat(
+    metrics: &MetaMetrics,
+    compact_tasks: &[CompactTask],
+    compact_status: &BTreeMap<CompactionGroupId, CompactStatus>,
+    current_version: &HummockVersion,
+) {
+    let mut task_status_label_map = HashMap::new();
+    let mut task_type_label_map = HashMap::new();
+    let mut group_label_map = HashMap::new();
+
+    for task in compact_tasks {
+        let task_status_label = task_status_label_map
+            .entry(task.task_status)
+            .or_insert_with(|| task.task_status.as_str_name().to_owned());
+
+        let task_type_label = task_type_label_map
+            .entry(task.task_type)
+            .or_insert_with(|| task.task_type.as_str_name().to_owned());
+
+        let group_label = group_label_map
+            .entry(task.compaction_group_id)
+            .or_insert_with(|| task.compaction_group_id.to_string());
+
+        metrics
+            .compact_frequency
+            .with_label_values(&["normal", group_label, task_type_label, task_status_label])
+            .inc();
+    }
+
+    group_label_map.keys().for_each(|group_id| {
+        trigger_sst_stat(
+            metrics,
+            compact_status.get(group_id),
+            current_version,
+            *group_id,
+        );
+    });
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 use std::collections::HashSet;
 
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::{InputLevel, SstableInfo};
+use risingwave_hummock_sdk::level::{InputLevel, Levels};
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 
 use super::CompactionInput;
 use crate::hummock::level_handler::LevelHandler;
@@ -24,7 +24,7 @@ use crate::hummock::level_handler::LevelHandler;
 // key_range and selects the appropriate files to generate compaction
 pub struct SpaceReclaimCompactionPicker {
     // config
-    pub max_space_reclaim_bytes: u64,
+    pub _max_space_reclaim_bytes: u64,
 
     // for filter
     pub all_table_ids: HashSet<u32>,
@@ -40,7 +40,7 @@ pub struct SpaceReclaimPickerState {
 impl SpaceReclaimCompactionPicker {
     pub fn new(max_space_reclaim_bytes: u64, all_table_ids: HashSet<u32>) -> Self {
         Self {
-            max_space_reclaim_bytes,
+            _max_space_reclaim_bytes: max_space_reclaim_bytes,
             all_table_ids,
         }
     }
@@ -63,9 +63,9 @@ impl SpaceReclaimCompactionPicker {
     ) -> Option<CompactionInput> {
         assert!(!levels.levels.is_empty());
         let mut select_input_ssts = vec![];
-        if let Some(l0) = levels.l0.as_ref()
-            && state.last_level == 0
-        {
+
+        if state.last_level == 0 {
+            let l0 = &levels.l0;
             // only pick trivial reclaim sstables because this kind of task could be optimized and do not need send to compactor.
             for level in &l0.sub_levels {
                 for sst in &level.table_infos {
@@ -84,7 +84,7 @@ impl SpaceReclaimCompactionPicker {
                 }
                 if !select_input_ssts.is_empty() {
                     return Some(CompactionInput {
-                        select_input_size: select_input_ssts.iter().map(|sst| sst.file_size).sum(),
+                        select_input_size: select_input_ssts.iter().map(|sst| sst.sst_size).sum(),
                         total_file_count: select_input_ssts.len() as u64,
                         input_levels: vec![
                             InputLevel {
@@ -140,7 +140,7 @@ impl SpaceReclaimCompactionPicker {
             // turn to next_round
             if !select_input_ssts.is_empty() {
                 return Some(CompactionInput {
-                    select_input_size: select_input_ssts.iter().map(|sst| sst.file_size).sum(),
+                    select_input_size: select_input_ssts.iter().map(|sst| sst.sst_size).sum(),
                     total_file_count: select_input_ssts.len() as u64,
                     input_levels: vec![
                         InputLevel {
@@ -168,13 +168,20 @@ impl SpaceReclaimCompactionPicker {
 #[cfg(test)]
 mod test {
 
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
 
     use itertools::Itertools;
+    use risingwave_common::catalog::TableId;
+    use risingwave_hummock_sdk::key_range::KeyRange;
+    use risingwave_hummock_sdk::level::Level;
+    use risingwave_hummock_sdk::sstable_info::SstableInfoInner;
+    use risingwave_hummock_sdk::version::HummockVersionStateTableInfo;
+    pub use risingwave_pb::hummock::LevelType;
     use risingwave_pb::hummock::compact_task;
-    pub use risingwave_pb::hummock::{Level, LevelType};
 
     use super::*;
+    use crate::hummock::compaction::CompactionDeveloperConfig;
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
     use crate::hummock::compaction::selector::tests::{
         assert_compaction_task, generate_l0_nonoverlapping_sublevels, generate_level,
@@ -184,6 +191,7 @@ mod test {
         CompactionSelector, LocalSelectorStatistic, SpaceReclaimCompactionSelector,
     };
     use crate::hummock::model::CompactionGroup;
+    use crate::hummock::test_utils::compaction_selector_context;
 
     #[test]
     fn test_space_reclaim_compaction_selector() {
@@ -208,7 +216,7 @@ mod test {
             ),
             Level {
                 level_idx: 4,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table_with_ids_and_epochs(2, 1, 0, 100, 1, vec![2], 0, 0),
                     generate_table_with_ids_and_epochs(3, 1, 101, 200, 1, vec![3], 0, 0),
@@ -221,24 +229,30 @@ mod test {
                     generate_table_with_ids_and_epochs(10, 1, 888, 1600, 1, vec![10], 0, 0),
                     generate_table_with_ids_and_epochs(11, 1, 1600, 1800, 1, vec![10], 0, 0),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
         ];
 
         {
             let sst_10 = levels[3].table_infos.get_mut(8).unwrap();
-            assert_eq!(10, sst_10.get_sst_id());
-            sst_10.key_range.as_mut().unwrap().right_exclusive = true;
+            assert_eq!(10, sst_10.sst_id);
+            *sst_10 = SstableInfoInner {
+                key_range: KeyRange {
+                    right_exclusive: true,
+                    ..sst_10.get_inner().key_range.clone()
+                },
+                ..sst_10.get_inner()
+            }
+            .into();
         }
 
         assert_eq!(levels.len(), 4);
-        let mut levels = Levels {
+        let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
+        let mut member_table_ids = BTreeSet::new();
         let mut levels_handler = (0..5).map(LevelHandler::new).collect_vec();
         let mut local_stats = LocalSelectorStatistic::default();
 
@@ -250,11 +264,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &member_table_ids,
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -265,11 +285,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &member_table_ids,
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_eq!(task.input.input_levels.len(), 2);
@@ -278,7 +304,7 @@ mod test {
 
             let mut start_id = 2;
             for sst in &task.input.input_levels[0].table_infos {
-                assert_eq!(start_id, sst.get_sst_id());
+                assert_eq!(start_id, sst.sst_id);
                 start_id += 1;
             }
 
@@ -294,7 +320,7 @@ mod test {
             let select_file_size: u64 = task.input.input_levels[0]
                 .table_infos
                 .iter()
-                .map(|sst| sst.file_size)
+                .map(|sst| sst.sst_size)
                 .sum();
             assert!(select_file_size > max_space_reclaim_bytes);
         }
@@ -304,11 +330,17 @@ mod test {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &member_table_ids,
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -322,20 +354,28 @@ mod test {
             ));
             let mut start_id = 8;
             for sst in &task.input.input_levels[0].table_infos {
-                assert_eq!(start_id, sst.get_sst_id());
+                assert_eq!(start_id, sst.sst_id);
                 start_id += 1;
             }
 
-            assert!(selector
-                .pick_compaction(
-                    1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
-                )
-                .is_none())
+            assert!(
+                selector
+                    .pick_compaction(
+                        1,
+                        compaction_selector_context(
+                            &group_config,
+                            &levels,
+                            &member_table_ids,
+                            &mut levels_handler,
+                            &mut local_stats,
+                            &HashMap::default(),
+                            Arc::new(CompactionDeveloperConfig::default()),
+                            &Default::default(),
+                            &HummockVersionStateTableInfo::empty(),
+                        ),
+                    )
+                    .is_none()
+            )
         }
 
         {
@@ -347,15 +387,25 @@ mod test {
                 }
             }
 
-            levels.member_table_ids = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+            member_table_ids = BTreeSet::from_iter(
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                    .into_iter()
+                    .map(TableId::new),
+            );
             // pick space reclaim
             let task = selector.pick_compaction(
                 1,
-                &group_config,
-                &levels,
-                &mut levels_handler,
-                &mut local_stats,
-                HashMap::default(),
+                compaction_selector_context(
+                    &group_config,
+                    &levels,
+                    &member_table_ids,
+                    &mut levels_handler,
+                    &mut local_stats,
+                    &HashMap::default(),
+                    Arc::new(CompactionDeveloperConfig::default()),
+                    &Default::default(),
+                    &HummockVersionStateTableInfo::empty(),
+                ),
             );
             assert!(task.is_none());
         }
@@ -367,16 +417,23 @@ mod test {
                 }
             }
 
-            levels.member_table_ids = vec![2, 3, 4, 5, 6, 7, 8, 9];
+            member_table_ids =
+                BTreeSet::from_iter([2, 3, 4, 5, 6, 7, 8, 9].into_iter().map(TableId::new));
             // pick space reclaim
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &member_table_ids,
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -401,19 +458,25 @@ mod test {
             // rebuild selector
             selector = SpaceReclaimCompactionSelector::default();
             // cut range [3,4] [6] [8,9,10]
-            levels.member_table_ids = vec![0, 1, 2, 5, 7];
+            member_table_ids = BTreeSet::from_iter([0, 1, 2, 5, 7].into_iter().map(TableId::new));
             let expect_task_file_count = [2, 1, 4];
-            let expect_task_sst_id_range = vec![vec![3, 4], vec![6], vec![8, 9, 10, 11]];
+            let expect_task_sst_id_range = [vec![3, 4], vec![6], vec![8, 9, 10, 11]];
             for (index, x) in expect_task_file_count.iter().enumerate() {
                 // // pick space reclaim
                 let task = selector
                     .pick_compaction(
                         1,
-                        &group_config,
-                        &levels,
-                        &mut levels_handler,
-                        &mut local_stats,
-                        HashMap::default(),
+                        compaction_selector_context(
+                            &group_config,
+                            &levels,
+                            &member_table_ids,
+                            &mut levels_handler,
+                            &mut local_stats,
+                            &HashMap::default(),
+                            Arc::new(CompactionDeveloperConfig::default()),
+                            &Default::default(),
+                            &HummockVersionStateTableInfo::empty(),
+                        ),
                     )
                     .unwrap();
 
@@ -425,7 +488,7 @@ mod test {
                 let select_sst = &task.input.input_levels[0]
                     .table_infos
                     .iter()
-                    .map(|sst| sst.get_sst_id())
+                    .map(|sst| sst.sst_id)
                     .collect_vec();
                 assert!(select_sst.is_sorted());
                 assert_eq!(expect_task_sst_id_range[index], *select_sst);
@@ -451,23 +514,30 @@ mod test {
             // rebuild selector
             selector = SpaceReclaimCompactionSelector::default();
             // cut range [3,4] [6] [8,9,10]
-            levels.member_table_ids = vec![0, 1, 2, 5, 7];
+
+            member_table_ids = BTreeSet::from_iter([0, 1, 2, 5, 7].into_iter().map(TableId::new));
             let expect_task_file_count = [2, 1, 5];
-            let expect_task_sst_id_range = vec![vec![3, 4], vec![6], vec![7, 8, 9, 10, 11]];
+            let expect_task_sst_id_range = [vec![3, 4], vec![6], vec![7, 8, 9, 10, 11]];
             for (index, x) in expect_task_file_count.iter().enumerate() {
                 if index == expect_task_file_count.len() - 1 {
-                    levels.member_table_ids = vec![2, 5];
+                    member_table_ids = BTreeSet::from_iter([2, 5].into_iter().map(TableId::new));
                 }
 
                 // // pick space reclaim
                 let task = selector
                     .pick_compaction(
                         1,
-                        &group_config,
-                        &levels,
-                        &mut levels_handler,
-                        &mut local_stats,
-                        HashMap::default(),
+                        compaction_selector_context(
+                            &group_config,
+                            &levels,
+                            &member_table_ids,
+                            &mut levels_handler,
+                            &mut local_stats,
+                            &HashMap::default(),
+                            Arc::new(CompactionDeveloperConfig::default()),
+                            &Default::default(),
+                            &HummockVersionStateTableInfo::empty(),
+                        ),
                     )
                     .unwrap();
 
@@ -479,7 +549,7 @@ mod test {
                 let select_sst = &task.input.input_levels[0]
                     .table_infos
                     .iter()
-                    .map(|sst| sst.get_sst_id())
+                    .map(|sst| sst.sst_id)
                     .collect_vec();
                 assert!(select_sst.is_sorted());
                 assert_eq!(expect_task_sst_id_range[index], *select_sst);

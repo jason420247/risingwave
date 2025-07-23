@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,30 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod pretty_serde;
+pub use pretty_serde::PrettySerde;
 mod column_index_mapping;
 use std::any::Any;
 use std::hash::{Hash, Hasher};
+use std::sync::LazyLock;
 
 pub use column_index_mapping::*;
 mod condition;
+pub mod data_type;
 pub use condition::*;
 mod connected_components;
 pub(crate) use connected_components::*;
 mod stream_graph_formatter;
 pub use stream_graph_formatter::*;
 mod with_options;
+use tokio::runtime::Runtime;
 pub use with_options::*;
 mod rewrite_index;
 pub use rewrite_index::*;
 mod index_set;
 pub use index_set::*;
 pub(crate) mod group_by;
-pub mod infer_stmt_row_desc;
 pub mod overwrite_options;
 pub use group_by::*;
 pub use overwrite_options::*;
 
 use crate::expr::{Expr, ExprImpl, ExprRewriter, InputRef};
+
+pub static FRONTEND_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name("rw-frontend")
+        .enable_all()
+        .build()
+        .expect("failed to build frontend runtime")
+});
 
 /// Substitute `InputRef` with corresponding `ExprImpl`.
 pub struct Substitute {
@@ -186,4 +198,18 @@ impl Hash for dyn DynHash {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.dyn_hash(state);
     }
+}
+
+pub fn ordinal(i: usize) -> String {
+    let s = i.to_string();
+    let suffix = if s.ends_with('1') && !s.ends_with("11") {
+        "st"
+    } else if s.ends_with('2') && !s.ends_with("12") {
+        "nd"
+    } else if s.ends_with('3') && !s.ends_with("13") {
+        "rd"
+    } else {
+        "th"
+    };
+    s + suffix
 }

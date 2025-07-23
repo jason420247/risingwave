@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use risingwave_common::config::meta::default::compaction_config;
 use risingwave_pb::hummock::CompactionConfig;
 
-use super::{CompactionInput, LocalPickerStatistic, MAX_COMPACT_LEVEL_COUNT};
+use super::{CompactionInput, LocalPickerStatistic};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ValidationRuleType {
@@ -77,6 +78,10 @@ impl CompactionTaskValidator {
             true
         }
     }
+
+    pub fn is_enable(&self) -> bool {
+        !self.validation_rules.is_empty()
+    }
 }
 
 pub trait CompactionTaskValidationRule {
@@ -89,14 +94,13 @@ struct TierCompactionTaskValidationRule {
 
 impl CompactionTaskValidationRule for TierCompactionTaskValidationRule {
     fn validate(&self, input: &CompactionInput, stats: &mut LocalPickerStatistic) -> bool {
-        // Limit sstable file count to avoid using too much memory.
-        let overlapping_max_compact_file_numer = std::cmp::min(
-            self.config.level0_max_compact_file_number,
-            MAX_COMPACT_LEVEL_COUNT as u64,
-        );
-
-        if input.total_file_count >= overlapping_max_compact_file_numer
-            || input.input_levels.len() >= MAX_COMPACT_LEVEL_COUNT
+        if input.total_file_count >= self.config.level0_max_compact_file_number
+            || input.input_levels.len()
+                >= self
+                    .config
+                    .max_l0_compact_level_count
+                    .unwrap_or(compaction_config::max_l0_compact_level_count())
+                    as usize
         {
             return true;
         }
@@ -118,7 +122,6 @@ impl CompactionTaskValidationRule for TierCompactionTaskValidationRule {
             stats.skip_by_count_limit += 1;
             return false;
         }
-
         true
     }
 }
@@ -129,8 +132,14 @@ struct IntraCompactionTaskValidationRule {
 
 impl CompactionTaskValidationRule for IntraCompactionTaskValidationRule {
     fn validate(&self, input: &CompactionInput, stats: &mut LocalPickerStatistic) -> bool {
-        if input.total_file_count >= self.config.level0_max_compact_file_number
-            || input.input_levels.len() >= MAX_COMPACT_LEVEL_COUNT
+        if (input.total_file_count >= self.config.level0_max_compact_file_number
+            && input.input_levels.len() > 1)
+            || input.input_levels.len()
+                >= self
+                    .config
+                    .max_l0_compact_level_count
+                    .unwrap_or(compaction_config::max_l0_compact_level_count())
+                    as usize
         {
             return true;
         }
@@ -148,7 +157,7 @@ impl CompactionTaskValidationRule for IntraCompactionTaskValidationRule {
             let level_select_size = select_level
                 .table_infos
                 .iter()
-                .map(|sst| sst.file_size)
+                .map(|sst| sst.sst_size)
                 .sum::<u64>();
 
             max_level_size = std::cmp::max(max_level_size, level_select_size);
@@ -178,7 +187,12 @@ struct BaseCompactionTaskValidationRule {
 impl CompactionTaskValidationRule for BaseCompactionTaskValidationRule {
     fn validate(&self, input: &CompactionInput, stats: &mut LocalPickerStatistic) -> bool {
         if input.total_file_count >= self.config.level0_max_compact_file_number
-            || input.input_levels.len() >= MAX_COMPACT_LEVEL_COUNT
+            || input.input_levels.len()
+                >= self
+                    .config
+                    .max_l0_compact_level_count
+                    .unwrap_or(compaction_config::max_l0_compact_level_count())
+                    as usize
         {
             return true;
         }

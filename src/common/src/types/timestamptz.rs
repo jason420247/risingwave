@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,20 +13,21 @@
 // limitations under the License.
 
 use std::error::Error;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::str::FromStr;
 
-use bytes::{Bytes, BytesMut};
-use chrono::{TimeZone, Utc};
+use anyhow::Context;
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::BytesMut;
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use chrono_tz::Tz;
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{FromSql, IsNull, ToSql, Type, accepts, to_sql_checked};
+use risingwave_common_estimate_size::ZeroHeapSize;
 use serde::{Deserialize, Serialize};
 
-use super::to_binary::ToBinary;
-use super::to_text::ToText;
 use super::DataType;
+use super::to_text::ToText;
 use crate::array::ArrayResult;
-use crate::estimate_size::ZeroHeapSize;
 
 /// Timestamp with timezone.
 #[derive(
@@ -51,15 +52,17 @@ impl ToSql for Timestamptz {
     }
 }
 
-impl ToBinary for Timestamptz {
-    fn to_binary_with_type(&self, _ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        let instant = self.to_datetime_utc();
-        let mut out = BytesMut::new();
-        // postgres_types::Type::ANY is only used as a placeholder.
-        instant
-            .to_sql(&postgres_types::Type::ANY, &mut out)
-            .unwrap();
-        Ok(Some(out.freeze()))
+impl<'a> FromSql<'a> for Timestamptz {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let instant = DateTime::<Utc>::from_sql(ty, raw)?;
+        Ok(Self::from(instant))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::TIMESTAMPTZ)
     }
 }
 
@@ -99,6 +102,11 @@ impl Timestamptz {
         Self(timestamp_micros)
     }
 
+    /// Creates a `Timestamptz` from microseconds.
+    pub fn from_nanos(timestamp_nanos: i64) -> Option<Self> {
+        timestamp_nanos.checked_div(1_000).map(Self)
+    }
+
     /// Returns the number of non-leap-microseconds since January 1, 1970 UTC.
     pub fn timestamp_micros(&self) -> i64 {
         self.0
@@ -107,6 +115,11 @@ impl Timestamptz {
     /// Returns the number of non-leap-milliseconds since January 1, 1970 UTC.
     pub fn timestamp_millis(&self) -> i64 {
         self.0.div_euclid(1_000)
+    }
+
+    /// Returns the number of non-leap-nanosseconds since January 1, 1970 UTC.
+    pub fn timestamp_nanos(&self) -> Option<i64> {
+        self.0.checked_mul(1_000)
     }
 
     /// Returns the number of non-leap seconds since January 1, 1970 0:00:00 UTC (aka "UNIX
@@ -130,10 +143,14 @@ impl Timestamptz {
 
     pub fn lookup_time_zone(time_zone: &str) -> std::result::Result<Tz, String> {
         Tz::from_str_insensitive(time_zone)
+            .map_err(|_| format!("'{time_zone}' is not a valid timezone"))
     }
 
-    pub fn from_protobuf(timestamp_micros: i64) -> ArrayResult<Self> {
-        Ok(Self(timestamp_micros))
+    pub fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Timestamptz> {
+        let micros = cur
+            .read_i64::<BigEndian>()
+            .context("failed to read i64 from Timestamptz buffer")?;
+        Ok(Self(micros))
     }
 
     pub fn to_protobuf(self, output: &mut impl Write) -> ArrayResult<usize> {
@@ -159,8 +176,8 @@ impl FromStr for Timestamptz {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         pub const ERROR_MSG: &str = concat!(
-            "Can't cast string to timestamp with time zone (expected format is YYYY-MM-DD HH:MM:SS[.D+{up to 6 digits}] followed by +hh:mm or literal Z)"
-            , "\nFor example: '2021-04-01 00:00:00+00:00'"
+            "Can't cast string to timestamp with time zone (expected format is YYYY-MM-DD HH:MM:SS[.D+{up to 6 digits}] followed by +hh:mm or literal Z)",
+            "\nFor example: '2021-04-01 00:00:00+00:00'"
         );
         // Try `speedate` first
         // * It is also used by `str_to_{date,time,timestamp}`
@@ -199,6 +216,26 @@ impl std::fmt::Display for Timestamptz {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.write(f)
     }
+}
+
+pub fn write_date_time_tz(
+    instant_local: DateTime<Tz>,
+    writer: &mut impl std::fmt::Write,
+) -> std::fmt::Result {
+    let date = instant_local.date_naive();
+    let (ce, year) = date.year_ce();
+    write!(
+        writer,
+        "{:04}-{:02}-{:02} {}",
+        year,
+        date.month(),
+        date.day(),
+        instant_local.format(if ce {
+            "%H:%M:%S%.f%:z"
+        } else {
+            "%H:%M:%S%.f%:z BC"
+        })
+    )
 }
 
 #[cfg(test)]

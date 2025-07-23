@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 use risingwave_common::types::DataType;
 use risingwave_common::util::epoch::Epoch;
-use risingwave_pb::expr::expr_node::{self, NowRexNode};
 use risingwave_pb::expr::ExprNode;
+use risingwave_pb::expr::expr_node::{self, NowRexNode};
 
 use super::{Expr, ExprImpl, ExprRewriter, FunctionCall, Literal};
 use crate::expr::ExprVisitor;
@@ -80,6 +80,19 @@ impl ExprRewriter for InlineNowProcTime {
             .map(|expr| self.rewrite_expr(expr))
             .collect();
         FunctionCall::new_unchecked(func_type, inputs, ret).into()
+    }
+}
+
+/// Expression rewriter to rewrite `NOW()` to `PROCTIME()`
+///
+/// This is applied for the sink into table query for those column with default expression containing `now()` because streaming execution can not handle `now` expression
+pub struct RewriteNowToProcTime;
+
+impl ExprRewriter for RewriteNowToProcTime {
+    fn rewrite_now(&mut self, _now: Now) -> ExprImpl {
+        FunctionCall::new(expr_node::Type::Proctime, vec![])
+            .unwrap()
+            .into()
     }
 }
 

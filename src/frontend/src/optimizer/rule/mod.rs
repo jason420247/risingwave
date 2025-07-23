@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,21 +14,106 @@
 
 //! Define all [`Rule`]
 
-use super::PlanRef;
+use std::convert::Infallible;
+use std::ops::FromResidual;
 
-/// A one-to-one transform for the [`PlanNode`](super::plan_node::PlanNode), every [`Rule`] should
-/// downcast and check if the node matches the rule.
-pub trait Rule: Send + Sync + Description {
-    /// return err(()) if not match
+use thiserror_ext::AsReport;
+
+use super::PlanRef;
+use crate::error::RwError;
+
+/// Result when applying a [`Rule`] to a [`PlanNode`](super::plan_node::PlanNode).
+pub enum ApplyResult<T = PlanRef> {
+    /// Successfully applied the rule and returned a new plan.
+    Ok(T),
+    /// The current rule is not applicable to the input.
+    /// The optimizer may try another rule.
+    NotApplicable,
+    /// An unrecoverable error occurred while applying the rule.
+    /// The optimizer should stop applying other rules and report the error to the user.
+    Err(RwError),
+}
+
+impl ApplyResult {
+    /// Unwrap the result, panicking if it's not `Ok`.
+    pub fn unwrap(self) -> PlanRef {
+        match self {
+            ApplyResult::Ok(plan) => plan,
+            ApplyResult::NotApplicable => panic!("unwrap ApplyResult::NotApplicable"),
+            ApplyResult::Err(e) => panic!("unwrap ApplyResult::Err, error: {:?}", e.as_report()),
+        }
+    }
+}
+
+/// Allow calling `?` on an `Option` in a function returning `ApplyResult`.
+impl<T> FromResidual<Option<Infallible>> for ApplyResult<T> {
+    fn from_residual(residual: Option<Infallible>) -> Self {
+        match residual {
+            Some(i) => match i {},
+            None => Self::NotApplicable,
+        }
+    }
+}
+
+/// Allow calling `?` on a `Result` in a function returning `ApplyResult`.
+impl<T, E> FromResidual<Result<Infallible, E>> for ApplyResult<T>
+where
+    E: Into<RwError>,
+{
+    fn from_residual(residual: Result<Infallible, E>) -> Self {
+        match residual {
+            Ok(i) => match i {},
+            Err(e) => Self::Err(e.into()),
+        }
+    }
+}
+
+/// An one-to-one transform for the [`PlanNode`](super::plan_node::PlanNode).
+///
+/// It's a convenient trait to implement [`FallibleRule`], thus made available only within this module.
+trait InfallibleRule: Send + Sync + Description {
+    /// Apply the rule to the plan node.
+    ///
+    /// - Returns `Some` if the apply is successful.
+    /// - Returns `None` if it's not applicable. The optimizer may try other rules.
     fn apply(&self, plan: PlanRef) -> Option<PlanRef>;
+}
+use InfallibleRule as Rule;
+
+/// An one-to-one transform for the [`PlanNode`](super::plan_node::PlanNode) that may return an
+/// unrecoverable error that stops further optimization.
+///
+/// An [`InfallibleRule`] is always a [`FallibleRule`].
+pub trait FallibleRule: Send + Sync + Description {
+    /// Apply the rule to the plan node, which may return an unrecoverable error.
+    ///
+    /// - Returns `ApplyResult::Ok` if the apply is successful.
+    /// - Returns `ApplyResult::NotApplicable` if it's not applicable. The optimizer may try other rules.
+    /// - Returns `ApplyResult::Err` if an unrecoverable error occurred. The optimizer should stop applying
+    ///   other rules and report the error to the user.
+    fn apply(&self, plan: PlanRef) -> ApplyResult;
+}
+
+impl<T> FallibleRule for T
+where
+    T: InfallibleRule,
+{
+    fn apply(&self, plan: PlanRef) -> ApplyResult {
+        match InfallibleRule::apply(self, plan) {
+            Some(plan) => ApplyResult::Ok(plan),
+            None => ApplyResult::NotApplicable,
+        }
+    }
 }
 
 pub trait Description {
     fn description(&self) -> &str;
 }
 
-pub(super) type BoxedRule = Box<dyn Rule>;
+pub(super) type BoxedRule = Box<dyn FallibleRule>;
 
+mod logical_filter_expression_simplify_rule;
+pub use logical_filter_expression_simplify_rule::*;
 mod over_window_merge_rule;
 pub use over_window_merge_rule::*;
 mod project_join_merge_rule;
@@ -90,6 +175,8 @@ pub use top_n_on_index_rule::*;
 mod stream;
 pub use stream::bushy_tree_join_ordering_rule::*;
 pub use stream::filter_with_now_to_join_rule::*;
+pub use stream::generate_series_with_now_rule::*;
+pub use stream::separate_consecutive_join::*;
 pub use stream::split_now_and_rule::*;
 pub use stream::split_now_or_rule::*;
 pub use stream::stream_project_merge_rule::*;
@@ -154,8 +241,31 @@ mod apply_hop_window_transpose_rule;
 pub use apply_hop_window_transpose_rule::*;
 mod agg_call_merge_rule;
 pub use agg_call_merge_rule::*;
+mod empty_agg_remove_rule;
+pub use empty_agg_remove_rule::*;
+mod add_logstore_rule;
+mod pull_up_correlated_predicate_agg_rule;
+mod source_to_iceberg_scan_rule;
+mod source_to_kafka_scan_rule;
+mod table_function_to_file_scan_rule;
+mod table_function_to_internal_backfill_progress;
+mod table_function_to_internal_source_backfill_progress;
+mod table_function_to_mysql_query_rule;
+mod table_function_to_postgres_query_rule;
 mod values_extract_project_rule;
+
+pub use add_logstore_rule::*;
+pub use batch::batch_iceberg_count_star::*;
+pub use batch::batch_iceberg_predicate_pushdown::*;
 pub use batch::batch_push_limit_to_scan_rule::*;
+pub use pull_up_correlated_predicate_agg_rule::*;
+pub use source_to_iceberg_scan_rule::*;
+pub use source_to_kafka_scan_rule::*;
+pub use table_function_to_file_scan_rule::*;
+pub use table_function_to_internal_backfill_progress::*;
+pub use table_function_to_internal_source_backfill_progress::*;
+pub use table_function_to_mysql_query_rule::*;
+pub use table_function_to_postgres_query_rule::*;
 pub use values_extract_project_rule::*;
 
 #[macro_export]
@@ -194,6 +304,7 @@ macro_rules! for_all_rules {
             , { SplitNowAndRule }
             , { SplitNowOrRule }
             , { FilterWithNowToJoinRule }
+            , { GenerateSeriesWithNowRule }
             , { TopNOnIndexRule }
             , { TrivialProjectToValuesRule }
             , { UnionInputValuesMergeRule }
@@ -202,6 +313,8 @@ macro_rules! for_all_rules {
             , { AlwaysFalseFilterRule }
             , { BushyTreeJoinOrderingRule }
             , { StreamProjectMergeRule }
+            , { SeparateConsecutiveJoinRule }
+            , { LogicalFilterExpressionSimplifyRule }
             , { JoinProjectTransposeRule }
             , { LimitPushDownRule }
             , { PullUpHopRule }
@@ -216,6 +329,11 @@ macro_rules! for_all_rules {
             , { CrossJoinEliminateRule }
             , { ApplyTopNTransposeRule }
             , { TableFunctionToProjectSetRule }
+            , { TableFunctionToFileScanRule }
+            , { TableFunctionToPostgresQueryRule }
+            , { TableFunctionToMySqlQueryRule }
+            , { TableFunctionToInternalBackfillProgressRule }
+            , { TableFunctionToInternalSourceBackfillProgressRule }
             , { ApplyLimitTransposeRule }
             , { CommonSubExprExtractRule }
             , { BatchProjectMergeRule }
@@ -227,6 +345,13 @@ macro_rules! for_all_rules {
             , { AggCallMergeRule }
             , { ValuesExtractProjectRule }
             , { BatchPushLimitToScanRule }
+            , { BatchIcebergPredicatePushDownRule }
+            , { BatchIcebergCountStar }
+            , { PullUpCorrelatedPredicateAggRule }
+            , { SourceToKafkaScanRule }
+            , { SourceToIcebergScanRule }
+            , { AddLogstoreRule }
+            , { EmptyAggRemoveRule }
         }
     };
 }

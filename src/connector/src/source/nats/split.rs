@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{anyhow, Ok};
 use risingwave_common::types::JsonbVal;
 use serde::{Deserialize, Serialize};
 
+use crate::error::ConnectorResult;
 use crate::source::{SplitId, SplitMetaData};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
@@ -23,7 +23,7 @@ pub enum NatsOffset {
     Earliest,
     Latest,
     SequenceNumber(String),
-    Timestamp(i128),
+    Timestamp(i64),
     None,
 }
 
@@ -43,21 +43,16 @@ impl SplitMetaData for NatsSplit {
         format!("{}", self.split_id).into()
     }
 
-    fn restore_from_json(value: JsonbVal) -> anyhow::Result<Self> {
-        serde_json::from_value(value.take()).map_err(|e| anyhow!(e))
+    fn restore_from_json(value: JsonbVal) -> ConnectorResult<Self> {
+        serde_json::from_value(value.take()).map_err(Into::into)
     }
 
     fn encode_to_json(&self) -> JsonbVal {
         serde_json::to_value(self.clone()).unwrap().into()
     }
 
-    fn update_with_offset(&mut self, start_sequence: String) -> anyhow::Result<()> {
-        let start_sequence = if start_sequence.is_empty() {
-            NatsOffset::Earliest
-        } else {
-            NatsOffset::SequenceNumber(start_sequence)
-        };
-        self.start_sequence = start_sequence;
+    fn update_offset(&mut self, _last_seen_offset: String) -> ConnectorResult<()> {
+        // we do not require to update the offset for nats, let durable consumer handle it
         Ok(())
     }
 }

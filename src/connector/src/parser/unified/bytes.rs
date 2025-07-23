@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::types::{DataType, ScalarImpl};
+use risingwave_common::types::{DataType, DatumCow, ScalarRefImpl};
 
 use super::{Access, AccessError, AccessResult};
 
@@ -29,24 +29,26 @@ impl<'a> BytesAccess<'a> {
     }
 }
 
-impl<'a> Access for BytesAccess<'a> {
+impl Access for BytesAccess<'_> {
     /// path is empty currently, `type_expected` should be `Bytea`
-    fn access(&self, path: &[&str], type_expected: Option<&DataType>) -> AccessResult {
-        if let DataType::Bytea = type_expected.unwrap() {
+    fn access<'a>(&'a self, path: &[&str], type_expected: &DataType) -> AccessResult<DatumCow<'a>> {
+        if let DataType::Bytea = type_expected {
             if self.column_name.is_none()
                 || (path.len() == 1 && self.column_name.as_ref().unwrap() == path[0])
             {
-                return Ok(Some(ScalarImpl::Bytea(Box::from(self.bytes.as_slice()))));
+                return Ok(DatumCow::Borrowed(Some(ScalarRefImpl::Bytea(
+                    self.bytes.as_slice(),
+                ))));
             }
             return Err(AccessError::Undefined {
-                name: path[0].to_string(),
-                path: self.column_name.as_ref().unwrap().to_string(),
+                name: path[0].to_owned(),
+                path: self.column_name.as_ref().unwrap().clone(),
             });
         }
         Err(AccessError::TypeError {
-            expected: "Bytea".to_string(),
+            expected: "Bytea".to_owned(),
             got: format!("{:?}", type_expected),
-            value: "".to_string(),
+            value: "".to_owned(),
         })
     }
 }

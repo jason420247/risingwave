@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ impl ProjectJoinSeparateRule {
 impl Rule for ProjectJoinSeparateRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let join = plan.as_logical_join()?;
-        if join.is_full_out() {
+        if join.output_indices_are_trivial() {
             None
         } else {
             let (left, right, on, join_type, output_indices) = join.clone().decompose();

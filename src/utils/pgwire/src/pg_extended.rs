@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@ use std::vec::IntoIter;
 
 use futures::stream::FusedStream;
 use futures::{StreamExt, TryStreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
+use postgres_types::FromSql;
 
 use crate::error::{PsqlError, PsqlResult};
 use crate::pg_message::{BeCommandCompleteMessage, BeMessage};
-use crate::pg_protocol::Conn;
+use crate::pg_protocol::{PgByteStream, PgStream};
 use crate::pg_response::{PgResponse, ValuesStream};
-use crate::types::Row;
+use crate::types::{Format, Row};
 
 pub struct ResultCache<VS>
 where
@@ -44,10 +44,10 @@ where
     }
 
     /// Return indicate whether the result is consumed completely.
-    pub async fn consume<S: AsyncWrite + AsyncRead + Unpin>(
+    pub async fn consume<S: PgByteStream>(
         &mut self,
         row_limit: usize,
-        msg_stream: &mut Conn<S>,
+        msg_stream: &mut PgStream<S>,
     ) -> PsqlResult<bool> {
         for notice in self.result.notices() {
             msg_stream.write_no_flush(&BeMessage::NoticeResponse(notice))?;
@@ -85,17 +85,18 @@ where
                         }
                     }
                 } else {
-                    self.row_cache = if let Some(rows) = self
+                    self.row_cache = match self
                         .result
                         .values_stream()
                         .try_next()
                         .await
                         .map_err(PsqlError::ExtendedExecuteError)?
                     {
-                        rows.into_iter()
-                    } else {
-                        query_end = true;
-                        break;
+                        Some(rows) => rows.into_iter(),
+                        _ => {
+                            query_end = true;
+                            break;
+                        }
                     };
                 }
             }
@@ -118,6 +119,43 @@ where
             } else {
                 msg_stream.write_no_flush(&BeMessage::PortalSuspended)?;
             }
+        } else if self.result.stmt_type().is_dml() && !self.result.stmt_type().is_returning() {
+            let first_row_set = self.result.values_stream().next().await;
+            let first_row_set = match first_row_set {
+                None => {
+                    return Err(PsqlError::Uncategorized(
+                        "no affected rows in output".into(),
+                    ));
+                }
+                Some(row) => row.map_err(PsqlError::SimpleQueryError)?,
+            };
+            let affected_rows_str = first_row_set[0].values()[0]
+                .as_ref()
+                .expect("compute node should return affected rows in output");
+
+            let affected_rows_cnt: i32 = match self.result.row_cnt_format() {
+                Some(Format::Binary) => {
+                    i64::from_sql(&postgres_types::Type::INT8, affected_rows_str)
+                        .unwrap()
+                        .try_into()
+                        .expect("affected rows count large than i64")
+                }
+                Some(Format::Text) => String::from_utf8(affected_rows_str.to_vec())
+                    .unwrap()
+                    .parse()
+                    .unwrap_or_default(),
+                None => panic!("affected rows count should be set"),
+            };
+
+            // Run the callback before sending the `CommandComplete` message.
+            self.result.run_callback().await?;
+
+            msg_stream.write_no_flush(&BeMessage::CommandComplete(BeCommandCompleteMessage {
+                stmt_type: self.result.stmt_type(),
+                rows_cnt: affected_rows_cnt,
+            }))?;
+
+            query_end = true;
         } else {
             // Run the callback before sending the `CommandComplete` message.
             self.result.run_callback().await?;

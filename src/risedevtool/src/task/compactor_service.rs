@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use std::process::Command;
 use anyhow::Result;
 
 use crate::util::{get_program_args, get_program_env_cmd, get_program_name};
-use crate::{add_meta_node, add_tempo_endpoint, CompactorConfig, ExecuteContext, Task};
+use crate::{CompactorConfig, ExecuteContext, Task, add_meta_node, add_tempo_endpoint};
 
 pub struct CompactorService {
     config: CompactorConfig,
@@ -29,20 +29,6 @@ pub struct CompactorService {
 impl CompactorService {
     pub fn new(config: CompactorConfig) -> Result<Self> {
         Ok(Self { config })
-    }
-
-    fn compactor(&self) -> Result<Command> {
-        let prefix_bin = env::var("PREFIX_BIN")?;
-
-        if let Ok(x) = env::var("ENABLE_ALL_IN_ONE")
-            && x == "true"
-        {
-            Ok(Command::new(
-                Path::new(&prefix_bin).join("risingwave").join("compactor"),
-            ))
-        } else {
-            Ok(Command::new(Path::new(&prefix_bin).join("compactor")))
-        }
     }
 
     /// Apply command args according to config
@@ -55,7 +41,9 @@ impl CompactorService {
                 config.listen_address, config.exporter_port
             ))
             .arg("--advertise-addr")
-            .arg(format!("{}:{}", config.address, config.port));
+            .arg(format!("{}:{}", config.address, config.port))
+            .arg("--compactor-mode")
+            .arg(&config.compactor_mode);
         if let Some(compaction_worker_threads_number) =
             config.compaction_worker_threads_number.as_ref()
         {
@@ -78,11 +66,7 @@ impl Task for CompactorService {
         ctx.service(self);
         ctx.pb.set_message("starting...");
 
-        let prefix_config = env::var("PREFIX_CONFIG")?;
-
-        let mut cmd = self.compactor()?;
-
-        cmd.env("RUST_BACKTRACE", "1");
+        let mut cmd = ctx.risingwave_cmd("compactor")?;
 
         if crate::util::is_env_set("RISEDEV_ENABLE_PROFILE") {
             cmd.env(
@@ -98,8 +82,6 @@ impl Task for CompactorService {
             cmd.env("MALLOC_CONF", conf); // unprefixed for linux
         }
 
-        cmd.arg("--config-path")
-            .arg(Path::new(&prefix_config).join("risingwave.toml"));
         Self::apply_command_args(&mut cmd, &self.config)?;
 
         if !self.config.user_managed {

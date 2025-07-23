@@ -1,0 +1,170 @@
+control substitution on
+
+# https://github.com/risingwavelabs/risingwave/issues/16486
+
+# cleanup
+system ok
+rpk topic delete 'avro_alter_table_test' || true; \
+(rpk sr subject delete 'avro_alter_table_test-value' && rpk sr subject delete 'avro_alter_table_test-value' --permanent) || true;
+
+# create topic and sr subject
+system ok
+rpk topic create 'avro_alter_table_test'
+
+# create a schema and produce a message
+system ok
+sr_register avro_alter_table_test-value AVRO <<< '{"type":"record","name":"Root","fields":[{"name":"bar","type":"int","default":0},{"name":"foo","type":"string"}]}'
+
+system ok
+echo '{"foo":"ABC", "bar":1}' | rpk topic produce --schema-id=topic avro_alter_table_test
+
+statement ok
+create table t (*, gen_col int as bar + 1)
+WITH (
+    ${RISEDEV_KAFKA_WITH_OPTIONS_COMMON},
+    topic = 'avro_alter_table_test'
+)
+FORMAT PLAIN ENCODE AVRO (
+    schema.registry = '${RISEDEV_SCHEMA_REGISTRY_URL}'
+);
+
+# Demonstrate purified definition
+query T
+SELECT SUBSTRING(definition, 1, POSITION(' WITH' IN definition) - 1) FROM rw_tables WHERE name = 't';
+----
+CREATE TABLE t (bar INT, foo CHARACTER VARYING, gen_col INT AS bar + 1)
+
+sleep 4s
+
+query ?
+select * from t
+----
+1 ABC 2
+
+# create a new version of schema that added a new optional nested field
+system ok
+sr_register avro_alter_table_test-value AVRO <<< '{"type":"record","name":"Root","fields":[{"name":"bar","type":"int","default":0},{"name":"foo","type":"string"},{"name":"nested","type":["null",{"type":"record","name":"Nested","fields":[{"name":"baz","type":"int"}]}],"default":null}]}'
+
+# Before refreshing schema, we create a `SINK INTO TABLE` which involves table replacement,
+# showing that this will NOT accidentally refresh the schema.
+statement ok
+CREATE SINK sk INTO t AS SELECT 8 AS bar, 'XYZ' AS foo WITH (type = 'append-only');
+
+# Demonstrate purified definition
+# Should not include the new field `nested`
+query T
+SELECT SUBSTRING(definition, 1, POSITION(' WITH' IN definition) - 1) FROM rw_tables WHERE name = 't';
+----
+CREATE TABLE t (bar INT, foo CHARACTER VARYING, gen_col INT AS bar + 1)
+
+query ? rowsort
+select * from t
+----
+1 ABC 2
+8 XYZ 9
+
+statement ok
+DROP SINK sk;
+
+# Now, refresh table schema. Should reflect the new schema.
+statement ok
+ALTER TABLE t REFRESH SCHEMA;
+
+# Demonstrate purified definition
+query T
+SELECT SUBSTRING(definition, 1, POSITION(' WITH' IN definition) - 1) FROM rw_tables WHERE name = 't';
+----
+CREATE TABLE t (bar INT, foo CHARACTER VARYING, nested STRUCT<baz INT>, gen_col INT AS bar + 1)
+
+query TTTT rowsort
+select * from t
+----
+1 ABC NULL 2
+8 XYZ NULL 9
+
+# Produce a new message with the new schema
+system ok
+echo '{"foo":"DEF", "bar":2, "nested":{"Nested":{"baz":2}}}' | rpk topic produce --schema-id=topic avro_alter_table_test
+
+sleep 4s
+
+query TTTT rowsort
+select * from t
+----
+1 ABC NULL 2
+2 DEF (2)  3
+8 XYZ NULL 9
+
+# create a new version of schema that added a new field to "nested"
+system ok
+sr_register avro_alter_table_test-value AVRO <<< '{"type":"record","name":"Root","fields":[{"name":"bar","type":"int","default":0},{"name":"foo","type":"string"},{"name":"nested","type":["null",{"type":"record","name":"Nested","fields":[{"name":"baz","type":"int"},{"name":"qux","type":"string","default":""}]}],"default":null}]}'
+
+# Since we have already supported altering column type (#20604), this should succeed.
+statement ok
+ALTER TABLE t REFRESH SCHEMA;
+
+system ok
+echo '{"foo":"GHI", "bar":4, "nested":{"Nested":{"baz":5, "qux":"hello"}}}' | rpk topic produce --schema-id=topic avro_alter_table_test
+
+sleep 4s
+
+query TTTT rowsort
+select * from t
+----
+1	ABC	NULL	    2
+2	DEF	(2,)	    3
+4	GHI	(5,hello)	5
+8	XYZ	NULL	    9
+
+# create a new version of schema that removed field bar
+system ok
+sr_register avro_alter_table_test-value AVRO <<< '{"type":"record","name":"Root","fields":[{"name":"foo","type":"string"}]}'
+
+# Refresh table schema should fail
+statement error
+ALTER TABLE t REFRESH SCHEMA;
+----
+db error: ERROR: Failed to run the query
+
+Caused by these errors (recent errors listed first):
+  1: failed to refresh schema because some of the columns to drop are referenced by a generated column "gen_col"
+  2: fail to bind expression in generated column "gen_col"
+  3: Failed to bind expression: bar + 1
+  4: Item not found: Invalid column: bar
+
+
+# Drop generated column
+statement ok
+ALTER TABLE t DROP COLUMN gen_col;
+
+# Refresh table schema
+statement ok
+ALTER TABLE t REFRESH SCHEMA;
+
+query ? rowsort
+select * from t
+----
+ABC
+DEF
+GHI
+XYZ
+
+statement ok
+drop table t;
+
+statement ok
+create table t (primary key (kafka_key))
+INCLUDE key as kafka_key
+WITH (
+    ${RISEDEV_KAFKA_WITH_OPTIONS_COMMON},
+    topic = 'avro_alter_table_test'
+)
+FORMAT UPSERT ENCODE AVRO (
+    schema.registry = '${RISEDEV_SCHEMA_REGISTRY_URL}'
+);
+
+statement ok
+ALTER TABLE t REFRESH SCHEMA;
+
+statement ok
+drop table t;

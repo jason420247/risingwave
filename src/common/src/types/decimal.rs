@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,24 +13,24 @@
 // limitations under the License.
 
 use std::fmt::Debug;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::{BufMut, BytesMut};
 use num_traits::{
     CheckedAdd, CheckedDiv, CheckedMul, CheckedNeg, CheckedRem, CheckedSub, Num, One, Zero,
 };
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{FromSql, IsNull, ToSql, Type, accepts, to_sql_checked};
+use risingwave_common_estimate_size::ZeroHeapSize;
 use rust_decimal::prelude::FromStr;
 use rust_decimal::{Decimal as RustDecimal, Error, MathematicalOps as _, RoundingStrategy};
 
-use super::to_binary::ToBinary;
-use super::to_text::ToText;
 use super::DataType;
+use super::to_text::ToText;
 use crate::array::ArrayResult;
-use crate::estimate_size::ZeroHeapSize;
-use crate::types::ordered_float::OrderedFloat;
 use crate::types::Decimal::Normalized;
+use crate::types::ordered_float::OrderedFloat;
 
 #[derive(Debug, Copy, parse_display::Display, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum Decimal {
@@ -89,19 +89,6 @@ impl Decimal {
     }
 }
 
-impl ToBinary for Decimal {
-    fn to_binary_with_type(&self, ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        match ty {
-            DataType::Decimal => {
-                let mut output = BytesMut::new();
-                self.to_sql(&Type::NUMERIC, &mut output).unwrap();
-                Ok(Some(output.freeze()))
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 impl ToSql for Decimal {
     accepts!(NUMERIC);
 
@@ -142,6 +129,28 @@ impl ToSql for Decimal {
             }
         }
         Ok(IsNull::No)
+    }
+}
+
+impl<'a> FromSql<'a> for Decimal {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + 'static + Sync + Send>> {
+        let mut rdr = Cursor::new(raw);
+        let _n_digits = rdr.read_u16::<BigEndian>()?;
+        let _weight = rdr.read_i16::<BigEndian>()?;
+        let sign = rdr.read_u16::<BigEndian>()?;
+        match sign {
+            0xC000 => Ok(Self::NaN),
+            0xD000 => Ok(Self::PositiveInf),
+            0xF000 => Ok(Self::NegativeInf),
+            _ => RustDecimal::from_sql(ty, raw).map(Self::Normalized),
+        }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::NUMERIC)
     }
 }
 
@@ -461,7 +470,7 @@ impl Decimal {
     /// Round to the left of the decimal point, for example `31.5` -> `30`.
     #[must_use]
     pub fn round_left_ties_away(&self, left: u32) -> Option<Self> {
-        let Self::Normalized(mut d) = self else {
+        let &Self::Normalized(mut d) = self else {
             return Some(*self);
         };
 
@@ -745,7 +754,9 @@ impl FromStr for Decimal {
             "nan" => Ok(Decimal::NaN),
             "inf" | "+inf" | "infinity" | "+infinity" => Ok(Decimal::PositiveInf),
             "-inf" | "-infinity" => Ok(Decimal::NegativeInf),
-            s => RustDecimal::from_str(s).map(Decimal::Normalized),
+            s => RustDecimal::from_str(s)
+                .or_else(|_| RustDecimal::from_scientific(s))
+                .map(Decimal::Normalized),
         }
     }
 }
@@ -795,9 +806,9 @@ impl From<RustDecimal> for Decimal {
 #[cfg(test)]
 mod tests {
     use itertools::Itertools as _;
+    use risingwave_common_estimate_size::EstimateSize;
 
     use super::*;
-    use crate::estimate_size::EstimateSize;
     use crate::util::iter_util::ZipEqFast;
 
     fn check(lhs: f32, rhs: f32) -> bool {

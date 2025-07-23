@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,12 @@ use crate::CtlContext;
 pub async fn trigger_full_gc(
     context: &CtlContext,
     sst_retention_time_sec: u64,
+    prefix: Option<String>,
 ) -> anyhow::Result<()> {
     let meta_client = context.meta_client().await?;
-    let result = meta_client.trigger_full_gc(sst_retention_time_sec).await;
+    let result = meta_client
+        .trigger_full_gc(sst_retention_time_sec, prefix)
+        .await;
     println!("{:#?}", result);
     Ok(())
 }

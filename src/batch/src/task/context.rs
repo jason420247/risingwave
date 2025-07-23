@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,27 +11,28 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use prometheus::core::Atomic;
 use risingwave_common::catalog::SysCatalogReaderRef;
 use risingwave_common::config::BatchConfig;
 use risingwave_common::memory::MemoryContext;
-use risingwave_common::util::addr::{is_local_address, HostAddr};
+use risingwave_common::metrics::TrAdderAtomic;
+use risingwave_common::util::addr::{HostAddr, is_local_address};
 use risingwave_connector::source::monitor::SourceMetrics;
+use risingwave_dml::dml_manager::DmlManagerRef;
 use risingwave_rpc_client::ComputeClientPoolRef;
-use risingwave_source::dml_manager::DmlManagerRef;
 use risingwave_storage::StateStoreImpl;
 
-use super::TaskId;
 use crate::error::Result;
-use crate::monitor::{BatchMetricsWithTaskLabels, BatchMetricsWithTaskLabelsInner};
+use crate::monitor::{BatchMetrics, BatchMetricsInner, BatchSpillMetrics};
 use crate::task::{BatchEnvironment, TaskOutput, TaskOutputId};
+use crate::worker_manager::worker_node_manager::WorkerNodeManagerRef;
 
 /// Context for batch task execution.
 ///
 /// This context is specific to one task execution, and should *not* be shared by different tasks.
-pub trait BatchTaskContext: Clone + Send + Sync + 'static {
+pub trait BatchTaskContext: Send + Sync + 'static {
     /// Get task output identified by `task_output_id`.
     ///
     /// Returns error if the task of `task_output_id` doesn't run in same worker as current task.
@@ -49,7 +50,9 @@ pub trait BatchTaskContext: Clone + Send + Sync + 'static {
 
     /// Get batch metrics.
     /// None indicates that not collect task metrics.
-    fn batch_metrics(&self) -> Option<BatchMetricsWithTaskLabels>;
+    fn batch_metrics(&self) -> Option<BatchMetrics>;
+
+    fn spill_metrics(&self) -> Arc<BatchSpillMetrics>;
 
     /// Get compute client pool. This is used in grpc exchange to avoid creating new compute client
     /// for each grpc call.
@@ -60,27 +63,19 @@ pub trait BatchTaskContext: Clone + Send + Sync + 'static {
 
     fn source_metrics(&self) -> Arc<SourceMetrics>;
 
-    fn store_mem_usage(&self, val: usize);
-
-    fn mem_usage(&self) -> usize;
-
     fn create_executor_mem_context(&self, executor_id: &str) -> MemoryContext;
+
+    fn worker_node_manager(&self) -> Option<WorkerNodeManagerRef>;
 }
 
 /// Batch task context on compute node.
 #[derive(Clone)]
 pub struct ComputeNodeContext {
     env: BatchEnvironment,
-    // None: Local mode don't record metrics.
-    batch_metrics: Option<BatchMetricsWithTaskLabels>,
+
+    batch_metrics: BatchMetrics,
 
     mem_context: MemoryContext,
-
-    // Last mem usage value. Init to be 0. Should be the last value of `cur_mem_val`.
-    last_mem_val: Arc<AtomicUsize>,
-    // How many memory bytes have been used in this task for the latest report value. Will be moved
-    // to `last_mem_val` if new value comes in.
-    cur_mem_val: Arc<AtomicUsize>,
 }
 
 impl BatchTaskContext for ComputeNodeContext {
@@ -106,8 +101,12 @@ impl BatchTaskContext for ComputeNodeContext {
         self.env.state_store()
     }
 
-    fn batch_metrics(&self) -> Option<BatchMetricsWithTaskLabels> {
-        self.batch_metrics.clone()
+    fn batch_metrics(&self) -> Option<BatchMetrics> {
+        Some(self.batch_metrics.clone())
+    }
+
+    fn spill_metrics(&self) -> Arc<BatchSpillMetrics> {
+        self.env.spill_metrics()
     }
 
     fn client_pool(&self) -> ComputeClientPoolRef {
@@ -122,80 +121,36 @@ impl BatchTaskContext for ComputeNodeContext {
         self.env.source_metrics()
     }
 
-    fn store_mem_usage(&self, val: usize) {
-        // Record the last mem val.
-        // Calculate the difference between old val and new value, and apply the diff to total
-        // memory usage value.
-        let old_value = self.cur_mem_val.load(Ordering::Relaxed);
-        self.last_mem_val.store(old_value, Ordering::Relaxed);
-        let diff = val as i64 - old_value as i64;
-        self.env.task_manager().apply_mem_diff(diff);
-
-        self.cur_mem_val.store(val, Ordering::Relaxed);
+    fn create_executor_mem_context(&self, _executor_id: &str) -> MemoryContext {
+        let counter = TrAdderAtomic::new(0);
+        MemoryContext::new(Some(self.mem_context.clone()), counter)
     }
 
-    fn mem_usage(&self) -> usize {
-        self.cur_mem_val.load(Ordering::Relaxed)
-    }
-
-    fn create_executor_mem_context(&self, executor_id: &str) -> MemoryContext {
-        if let Some(metrics) = &self.batch_metrics {
-            let executor_mem_usage = metrics
-                .executor_metrics()
-                .mem_usage
-                .with_guarded_label_values(&metrics.executor_labels(executor_id));
-            MemoryContext::new(Some(self.mem_context.clone()), executor_mem_usage)
-        } else {
-            MemoryContext::none()
-        }
+    fn worker_node_manager(&self) -> Option<WorkerNodeManagerRef> {
+        None
     }
 }
 
 impl ComputeNodeContext {
-    #[cfg(test)]
-    pub fn for_test() -> Self {
-        Self {
+    pub fn for_test() -> Arc<dyn BatchTaskContext> {
+        Arc::new(Self {
             env: BatchEnvironment::for_test(),
-            batch_metrics: None,
-            cur_mem_val: Arc::new(0.into()),
-            last_mem_val: Arc::new(0.into()),
+            batch_metrics: BatchMetricsInner::for_test(),
             mem_context: MemoryContext::none(),
-        }
+        })
     }
 
-    pub fn new(env: BatchEnvironment, task_id: TaskId) -> Self {
-        let batch_mem_context = env.task_manager().memory_context_ref();
-
-        let batch_metrics = Arc::new(BatchMetricsWithTaskLabelsInner::new(
+    pub fn create(env: BatchEnvironment) -> Arc<dyn BatchTaskContext> {
+        let mem_context = env.task_manager().memory_context_ref();
+        let batch_metrics = Arc::new(BatchMetricsInner::new(
             env.task_manager().metrics(),
-            env.task_metrics(),
             env.executor_metrics(),
-            task_id,
+            env.iceberg_scan_metrics(),
         ));
-        let mem_context = MemoryContext::new(
-            Some(batch_mem_context),
-            batch_metrics.task_mem_usage.clone(),
-        );
-        Self {
+        Arc::new(Self {
             env,
-            batch_metrics: Some(batch_metrics),
-            cur_mem_val: Arc::new(0.into()),
-            last_mem_val: Arc::new(0.into()),
+            batch_metrics,
             mem_context,
-        }
-    }
-
-    pub fn new_for_local(env: BatchEnvironment) -> Self {
-        Self {
-            env,
-            batch_metrics: None,
-            cur_mem_val: Arc::new(0.into()),
-            last_mem_val: Arc::new(0.into()),
-            mem_context: MemoryContext::none(),
-        }
-    }
-
-    pub fn mem_usage(&self) -> usize {
-        self.cur_mem_val.load(Ordering::Relaxed)
+        })
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,63 +13,112 @@
 // limitations under the License.
 
 mod prometheus;
-mod proxy;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path as FilePath;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
-use axum::body::{boxed, Body};
+use anyhow::{Context as _, Result, anyhow};
+use axum::Router;
 use axum::extract::{Extension, Path};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, get_service};
-use axum::Router;
-use hyper::Request;
-use parking_lot::Mutex;
+use axum::routing::get;
 use risingwave_rpc_client::ComputeClientPool;
-use tower::{ServiceBuilder, ServiceExt};
+use tokio::net::TcpListener;
+use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{self, CorsLayer};
-use tower_http::services::ServeDir;
 
-use crate::manager::diagnose::DiagnoseCommandRef;
+use crate::hummock::HummockManagerRef;
 use crate::manager::MetadataManager;
+use crate::manager::diagnose::DiagnoseCommandRef;
 
 #[derive(Clone)]
 pub struct DashboardService {
+    pub await_tree_reg: await_tree::Registry,
     pub dashboard_addr: SocketAddr,
     pub prometheus_client: Option<prometheus_http_query::Client>,
     pub prometheus_selector: String,
     pub metadata_manager: MetadataManager,
+    pub hummock_manager: HummockManagerRef,
     pub compute_clients: ComputeClientPool,
-    pub ui_path: Option<String>,
-    pub diagnose_command: Option<DiagnoseCommandRef>,
+    pub diagnose_command: DiagnoseCommandRef,
     pub trace_state: otlp_embedded::StateRef,
 }
 
 pub type Service = Arc<DashboardService>;
 
 pub(super) mod handlers {
+    use std::cmp::min;
+    use std::collections::HashMap;
+
     use anyhow::Context;
     use axum::Json;
+    use axum::extract::Query;
+    use futures::future::join_all;
     use itertools::Itertools;
-    use risingwave_common::bail;
+    use risingwave_common::catalog::{FragmentTypeFlag, TableId};
     use risingwave_common_heap_profiling::COLLAPSED_SUFFIX;
+    use risingwave_meta_model::WorkerId;
     use risingwave_pb::catalog::table::TableType;
-    use risingwave_pb::catalog::{Sink, Source, Table, View};
-    use risingwave_pb::common::{WorkerNode, WorkerType};
-    use risingwave_pb::meta::{ActorLocation, PbTableFragments};
-    use risingwave_pb::monitor_service::{
-        HeapProfilingResponse, ListHeapProfilingResponse, StackTraceResponse,
+    use risingwave_pb::catalog::{
+        Index, PbDatabase, PbFunction, PbSchema, Sink, Source, Subscription, Table, View,
     };
+    use risingwave_pb::common::{WorkerNode, WorkerType};
+    use risingwave_pb::hummock::TableStats;
+    use risingwave_pb::meta::list_object_dependencies_response::PbObjectDependencies;
+    use risingwave_pb::meta::{
+        ActorIds, FragmentIdToActorIdMap, FragmentToRelationMap, PbTableFragments, RelationIdInfos,
+    };
+    use risingwave_pb::monitor_service::stack_trace_request::ActorTracesFormat;
+    use risingwave_pb::monitor_service::{
+        GetStreamingStatsResponse, HeapProfilingResponse, ListHeapProfilingResponse,
+        StackTraceResponse,
+    };
+    use risingwave_pb::user::PbUserInfo;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use thiserror_ext::AsReport;
 
     use super::*;
-    use crate::manager::WorkerId;
-    use crate::model::MetadataModel;
+    use crate::controller::fragment::StreamingJobInfo;
+    use crate::rpc::await_tree::{dump_cluster_await_tree, dump_worker_node_await_tree};
+
+    #[derive(Serialize)]
+    pub struct TableWithStats {
+        #[serde(flatten)]
+        pub table: Table,
+        pub total_size_bytes: i64,
+        pub total_key_count: i64,
+        pub total_key_size: i64,
+        pub total_value_size: i64,
+        pub compressed_size: u64,
+    }
+
+    impl TableWithStats {
+        pub fn from_table_and_stats(table: Table, stats: Option<&TableStats>) -> Self {
+            match stats {
+                Some(stats) => Self {
+                    total_size_bytes: stats.total_key_size + stats.total_value_size,
+                    total_key_count: stats.total_key_count,
+                    total_key_size: stats.total_key_size,
+                    total_value_size: stats.total_value_size,
+                    compressed_size: stats.total_compressed_size,
+                    table,
+                },
+                None => Self {
+                    total_size_bytes: 0,
+                    total_key_count: 0,
+                    total_key_size: 0,
+                    total_value_size: 0,
+                    compressed_size: 0,
+                    table,
+                },
+            }
+        }
+    }
 
     pub struct DashboardError(anyhow::Error);
     pub type Result<T> = std::result::Result<T, DashboardError>;
@@ -87,8 +136,7 @@ pub(super) mod handlers {
     impl IntoResponse for DashboardError {
         fn into_response(self) -> axum::response::Response {
             let mut resp = Json(json!({
-                "error": format!("{}", self.0),
-                "info":  format!("{:?}", self.0),
+                "error": self.0.to_report_string(),
             }))
             .into_response();
             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -114,38 +162,95 @@ pub(super) mod handlers {
 
     async fn list_table_catalogs_inner(
         metadata_manager: &MetadataManager,
+        hummock_manager: &HummockManagerRef,
         table_type: TableType,
-    ) -> Result<Json<Vec<Table>>> {
-        let tables = match metadata_manager {
-            MetadataManager::V1(mgr) => mgr.catalog_manager.list_tables_by_type(table_type).await,
-            MetadataManager::V2(mgr) => mgr
-                .catalog_controller
-                .list_tables_by_type(table_type.into())
-                .await
-                .map_err(err)?,
-        };
+    ) -> Result<Json<Vec<TableWithStats>>> {
+        let tables = metadata_manager
+            .catalog_controller
+            .list_tables_by_type(table_type.into())
+            .await
+            .map_err(err)?;
 
-        Ok(Json(tables))
+        // Get table statistics from hummock manager
+        let version_stats = hummock_manager.get_version_stats().await;
+
+        let tables_with_stats = tables
+            .into_iter()
+            .map(|table| {
+                let stats = version_stats.table_stats.get(&table.id);
+                TableWithStats::from_table_and_stats(table, stats)
+            })
+            .collect();
+
+        Ok(Json(tables_with_stats))
     }
 
     pub async fn list_materialized_views(
         Extension(srv): Extension<Service>,
-    ) -> Result<Json<Vec<Table>>> {
-        list_table_catalogs_inner(&srv.metadata_manager, TableType::MaterializedView).await
+    ) -> Result<Json<Vec<TableWithStats>>> {
+        list_table_catalogs_inner(
+            &srv.metadata_manager,
+            &srv.hummock_manager,
+            TableType::MaterializedView,
+        )
+        .await
     }
 
-    pub async fn list_tables(Extension(srv): Extension<Service>) -> Result<Json<Vec<Table>>> {
-        list_table_catalogs_inner(&srv.metadata_manager, TableType::Table).await
+    pub async fn list_tables(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<Vec<TableWithStats>>> {
+        list_table_catalogs_inner(
+            &srv.metadata_manager,
+            &srv.hummock_manager,
+            TableType::Table,
+        )
+        .await
     }
 
-    pub async fn list_indexes(Extension(srv): Extension<Service>) -> Result<Json<Vec<Table>>> {
-        list_table_catalogs_inner(&srv.metadata_manager, TableType::Index).await
+    pub async fn list_index_tables(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<Vec<TableWithStats>>> {
+        list_table_catalogs_inner(
+            &srv.metadata_manager,
+            &srv.hummock_manager,
+            TableType::Index,
+        )
+        .await
+    }
+
+    pub async fn list_indexes(Extension(srv): Extension<Service>) -> Result<Json<Vec<Index>>> {
+        let indexes = srv
+            .metadata_manager
+            .catalog_controller
+            .list_indexes()
+            .await
+            .map_err(err)?;
+
+        Ok(Json(indexes))
+    }
+
+    pub async fn list_subscription(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<Vec<Subscription>>> {
+        let subscriptions = srv
+            .metadata_manager
+            .catalog_controller
+            .list_subscriptions()
+            .await
+            .map_err(err)?;
+
+        Ok(Json(subscriptions))
     }
 
     pub async fn list_internal_tables(
         Extension(srv): Extension<Service>,
-    ) -> Result<Json<Vec<Table>>> {
-        list_table_catalogs_inner(&srv.metadata_manager, TableType::Internal).await
+    ) -> Result<Json<Vec<TableWithStats>>> {
+        list_table_catalogs_inner(
+            &srv.metadata_manager,
+            &srv.hummock_manager,
+            TableType::Internal,
+        )
+        .await
     }
 
     pub async fn list_sources(Extension(srv): Extension<Service>) -> Result<Json<Vec<Source>>> {
@@ -155,110 +260,248 @@ pub(super) mod handlers {
     }
 
     pub async fn list_sinks(Extension(srv): Extension<Service>) -> Result<Json<Vec<Sink>>> {
-        let sinks = match &srv.metadata_manager {
-            MetadataManager::V1(mgr) => mgr.catalog_manager.list_sinks().await,
-            MetadataManager::V2(mgr) => mgr.catalog_controller.list_sinks().await.map_err(err)?,
-        };
+        let sinks = srv
+            .metadata_manager
+            .catalog_controller
+            .list_sinks()
+            .await
+            .map_err(err)?;
 
         Ok(Json(sinks))
     }
 
     pub async fn list_views(Extension(srv): Extension<Service>) -> Result<Json<Vec<View>>> {
-        let views = match &srv.metadata_manager {
-            MetadataManager::V1(mgr) => mgr.catalog_manager.list_views().await,
-            MetadataManager::V2(mgr) => mgr.catalog_controller.list_views().await.map_err(err)?,
-        };
+        let views = srv
+            .metadata_manager
+            .catalog_controller
+            .list_views()
+            .await
+            .map_err(err)?;
 
         Ok(Json(views))
     }
 
-    pub async fn list_actors(
+    pub async fn list_functions(
         Extension(srv): Extension<Service>,
-    ) -> Result<Json<Vec<ActorLocation>>> {
-        let mut node_actors = srv
+    ) -> Result<Json<Vec<PbFunction>>> {
+        let functions = srv
             .metadata_manager
-            .all_node_actors(true)
+            .catalog_controller
+            .list_functions()
             .await
             .map_err(err)?;
-        let nodes = srv
+
+        Ok(Json(functions))
+    }
+
+    pub async fn list_streaming_jobs(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<Vec<StreamingJobInfo>>> {
+        let streaming_jobs = srv
             .metadata_manager
-            .list_active_streaming_compute_nodes()
+            .catalog_controller
+            .list_streaming_job_infos()
             .await
             .map_err(err)?;
-        let actors = nodes
-            .into_iter()
-            .map(|node| ActorLocation {
-                node: Some(node.clone()),
-                actors: node_actors.remove(&node.id).unwrap_or_default(),
+
+        Ok(Json(streaming_jobs))
+    }
+
+    /// In the ddl backpressure graph, we want to compute the backpressure between relations.
+    /// So we need to know which are the fragments which are connected to external relations.
+    /// These fragments form the vertices of the graph.
+    /// We can get collection of backpressure values, keyed by vertex_id-vertex_id.
+    /// This function will return a map of fragment vertex id to relation id.
+    /// We can convert `fragment_id-fragment_id` to `relation_id-relation_id` using that.
+    /// Finally, we have a map of `relation_id-relation_id` to backpressure values.
+    pub async fn get_fragment_to_relation_map(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<FragmentToRelationMap>> {
+        let table_fragments = srv
+            .metadata_manager
+            .catalog_controller
+            .table_fragments()
+            .await
+            .map_err(err)?;
+        let mut in_map = HashMap::new();
+        let mut out_map = HashMap::new();
+        for (relation_id, tf) in table_fragments {
+            for (fragment_id, fragment) in &tf.fragments {
+                if fragment
+                    .fragment_type_mask
+                    .contains(FragmentTypeFlag::StreamScan)
+                {
+                    in_map.insert(*fragment_id, relation_id as u32);
+                }
+                if fragment
+                    .fragment_type_mask
+                    .contains(FragmentTypeFlag::Mview)
+                {
+                    out_map.insert(*fragment_id, relation_id as u32);
+                }
+            }
+        }
+        let map = FragmentToRelationMap { in_map, out_map };
+        Ok(Json(map))
+    }
+
+    /// Provides a hierarchy of relation ids to fragments to actors.
+    pub async fn get_relation_id_infos(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<RelationIdInfos>> {
+        let table_fragments = srv
+            .metadata_manager
+            .catalog_controller
+            .table_fragments()
+            .await
+            .map_err(err)?;
+        let mut map = HashMap::new();
+        for (id, tf) in table_fragments {
+            let mut fragment_id_to_actor_ids = HashMap::new();
+            for (fragment_id, fragment) in &tf.fragments {
+                let actor_ids = fragment.actors.iter().map(|a| a.actor_id).collect_vec();
+                fragment_id_to_actor_ids.insert(*fragment_id, ActorIds { ids: actor_ids });
+            }
+            map.insert(
+                id as u32,
+                FragmentIdToActorIdMap {
+                    map: fragment_id_to_actor_ids,
+                },
+            );
+        }
+        let relation_id_infos = RelationIdInfos { map };
+
+        Ok(Json(relation_id_infos))
+    }
+
+    pub async fn list_fragments_by_job_id(
+        Extension(srv): Extension<Service>,
+        Path(job_id): Path<u32>,
+    ) -> Result<Json<PbTableFragments>> {
+        let table_id = TableId::new(job_id);
+        let table_fragments = srv
+            .metadata_manager
+            .get_job_fragments_by_id(&table_id)
+            .await
+            .map_err(err)?;
+        let upstream_fragments = srv
+            .metadata_manager
+            .catalog_controller
+            .upstream_fragments(table_fragments.fragment_ids())
+            .await
+            .map_err(err)?;
+        let dispatchers = srv
+            .metadata_manager
+            .catalog_controller
+            .get_fragment_actor_dispatchers(
+                table_fragments.fragment_ids().map(|id| id as _).collect(),
+            )
+            .await
+            .map_err(err)?;
+        Ok(Json(
+            table_fragments.to_protobuf(&upstream_fragments, &dispatchers),
+        ))
+    }
+
+    pub async fn list_users(Extension(srv): Extension<Service>) -> Result<Json<Vec<PbUserInfo>>> {
+        let users = srv
+            .metadata_manager
+            .catalog_controller
+            .list_users()
+            .await
+            .map_err(err)?;
+
+        Ok(Json(users))
+    }
+
+    pub async fn list_databases(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<Vec<PbDatabase>>> {
+        let databases = srv
+            .metadata_manager
+            .catalog_controller
+            .list_databases()
+            .await
+            .map_err(err)?;
+
+        Ok(Json(databases))
+    }
+
+    pub async fn list_schemas(Extension(srv): Extension<Service>) -> Result<Json<Vec<PbSchema>>> {
+        let schemas = srv
+            .metadata_manager
+            .catalog_controller
+            .list_schemas()
+            .await
+            .map_err(err)?;
+
+        Ok(Json(schemas))
+    }
+
+    pub async fn list_object_dependencies(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<Vec<PbObjectDependencies>>> {
+        let object_dependencies = srv
+            .metadata_manager
+            .catalog_controller
+            .list_all_object_dependencies()
+            .await
+            .map_err(err)?;
+
+        Ok(Json(object_dependencies))
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct AwaitTreeDumpParams {
+        #[serde(default = "await_tree_default_format")]
+        format: String,
+    }
+
+    impl AwaitTreeDumpParams {
+        /// Parse the `format` parameter to [`ActorTracesFormat`].
+        pub fn actor_traces_format(&self) -> Result<ActorTracesFormat> {
+            Ok(match self.format.as_str() {
+                "text" => ActorTracesFormat::Text,
+                "json" => ActorTracesFormat::Json,
+                _ => {
+                    return Err(err(anyhow!(
+                        "Unsupported format `{}`, only `text` and `json` are supported for now",
+                        self.format
+                    )));
+                }
             })
-            .collect::<Vec<_>>();
-
-        Ok(Json(actors))
+        }
     }
 
-    pub async fn list_fragments(
-        Extension(srv): Extension<Service>,
-    ) -> Result<Json<Vec<PbTableFragments>>> {
-        let table_fragments = match &srv.metadata_manager {
-            MetadataManager::V1(mgr) => mgr
-                .fragment_manager
-                .get_fragment_read_guard()
-                .await
-                .table_fragments()
-                .values()
-                .map(|tf| tf.to_protobuf())
-                .collect_vec(),
-            MetadataManager::V2(mgr) => mgr
-                .catalog_controller
-                .table_fragments()
-                .await
-                .map_err(err)?
-                .values()
-                .cloned()
-                .collect_vec(),
-        };
-
-        Ok(Json(table_fragments))
-    }
-
-    async fn dump_await_tree_inner(
-        worker_nodes: impl IntoIterator<Item = &WorkerNode>,
-        compute_clients: &ComputeClientPool,
-    ) -> Result<Json<StackTraceResponse>> {
-        let mut all = Default::default();
-
-        fn merge(a: &mut StackTraceResponse, b: StackTraceResponse) {
-            a.actor_traces.extend(b.actor_traces);
-            a.rpc_traces.extend(b.rpc_traces);
-            a.compaction_task_traces.extend(b.compaction_task_traces);
-        }
-
-        for worker_node in worker_nodes {
-            let client = compute_clients.get(worker_node).await.map_err(err)?;
-            let result = client.stack_trace().await.map_err(err)?;
-
-            merge(&mut all, result);
-        }
-
-        Ok(all.into())
+    fn await_tree_default_format() -> String {
+        // In dashboard, await tree is usually for engineer to debug, so we use human-readable text format by default here.
+        "text".to_owned()
     }
 
     pub async fn dump_await_tree_all(
+        Query(params): Query<AwaitTreeDumpParams>,
         Extension(srv): Extension<Service>,
     ) -> Result<Json<StackTraceResponse>> {
-        let worker_nodes = srv
-            .metadata_manager
-            .list_worker_node(Some(WorkerType::ComputeNode), None)
-            .await
-            .map_err(err)?;
+        let actor_traces_format = params.actor_traces_format()?;
 
-        dump_await_tree_inner(&worker_nodes, &srv.compute_clients).await
+        let res = dump_cluster_await_tree(
+            &srv.metadata_manager,
+            &srv.await_tree_reg,
+            actor_traces_format,
+        )
+        .await
+        .map_err(err)?;
+
+        Ok(res.into())
     }
 
     pub async fn dump_await_tree(
         Path(worker_id): Path<WorkerId>,
+        Query(params): Query<AwaitTreeDumpParams>,
         Extension(srv): Extension<Service>,
     ) -> Result<Json<StackTraceResponse>> {
+        let actor_traces_format = params.actor_traces_format()?;
+
         let worker_node = srv
             .metadata_manager
             .get_worker_by_id(worker_id)
@@ -267,7 +510,11 @@ pub(super) mod handlers {
             .context("worker node not found")
             .map_err(err)?;
 
-        dump_await_tree_inner(std::iter::once(&worker_node), &srv.compute_clients).await
+        let res = dump_worker_node_await_tree(std::iter::once(&worker_node), actor_traces_format)
+            .await
+            .map_err(err)?;
+
+        Ok(res.into())
     }
 
     pub async fn heap_profile(
@@ -284,7 +531,7 @@ pub(super) mod handlers {
 
         let client = srv.compute_clients.get(&worker_node).await.map_err(err)?;
 
-        let result = client.heap_profile("".to_string()).await.map_err(err)?;
+        let result = client.heap_profile("".to_owned()).await.map_err(err)?;
 
         Ok(result.into())
     }
@@ -311,10 +558,6 @@ pub(super) mod handlers {
         Path((worker_id, file_path)): Path<(WorkerId, String)>,
         Extension(srv): Extension<Service>,
     ) -> Result<Response> {
-        if srv.ui_path.is_none() {
-            bail!("Should provide ui_path");
-        }
-
         let file_path =
             String::from_utf8(base64_url::decode(&file_path).map_err(err)?).map_err(err)?;
 
@@ -346,26 +589,112 @@ pub(super) mod handlers {
         let response = Response::builder()
             .header("Content-Type", "application/octet-stream")
             .header("Content-Disposition", collapsed_file_name)
-            .body(boxed(collapsed_str));
+            .body(collapsed_str.into());
 
         response.map_err(err)
     }
 
-    pub async fn diagnose(Extension(srv): Extension<Service>) -> Result<String> {
-        let report = if let Some(cmd) = &srv.diagnose_command {
-            cmd.report().await
-        } else {
-            "Not supported in sql-backend".to_string()
-        };
+    #[derive(Debug, Deserialize)]
+    pub struct DiagnoseParams {
+        #[serde(default = "await_tree_default_format")]
+        actor_traces_format: String,
+    }
 
-        Ok(report)
+    pub async fn diagnose(
+        Query(params): Query<DiagnoseParams>,
+        Extension(srv): Extension<Service>,
+    ) -> Result<String> {
+        let actor_traces_format = match params.actor_traces_format.as_str() {
+            "text" => ActorTracesFormat::Text,
+            "json" => ActorTracesFormat::Json,
+            _ => {
+                return Err(err(anyhow!(
+                    "Unsupported actor_traces_format `{}`, only `text` and `json` are supported for now",
+                    params.actor_traces_format
+                )));
+            }
+        };
+        Ok(srv.diagnose_command.report(actor_traces_format).await)
+    }
+
+    /// NOTE(kwannoel): Although we fetch the BP for the entire graph via this API,
+    /// the workload should be reasonable.
+    /// In most cases, we can safely assume each node has most 2 outgoing edges (e.g. join).
+    /// In such a scenario, the number of edges is linear to the number of nodes.
+    /// So the workload is proportional to the relation id graph we fetch in `get_relation_id_infos`.
+    pub async fn get_streaming_stats(
+        Extension(srv): Extension<Service>,
+    ) -> Result<Json<GetStreamingStatsResponse>> {
+        let worker_nodes = srv
+            .metadata_manager
+            .list_active_streaming_compute_nodes()
+            .await
+            .map_err(err)?;
+
+        let mut futures = Vec::new();
+
+        for worker_node in worker_nodes {
+            let client = srv.compute_clients.get(&worker_node).await.map_err(err)?;
+            let client = Arc::new(client);
+            let fut = async move {
+                let result = client.get_streaming_stats().await.map_err(err)?;
+                Ok::<_, DashboardError>(result)
+            };
+            futures.push(fut);
+        }
+        let results = join_all(futures).await;
+
+        let mut all = GetStreamingStatsResponse::default();
+
+        for result in results {
+            let result = result
+                .map_err(|_| anyhow!("Failed to get back pressure"))
+                .map_err(err)?;
+
+            // Aggregate fragment_stats
+            for (fragment_id, fragment_stats) in result.fragment_stats {
+                if let Some(s) = all.fragment_stats.get_mut(&fragment_id) {
+                    s.actor_count += fragment_stats.actor_count;
+                    s.current_epoch = min(s.current_epoch, fragment_stats.current_epoch);
+                } else {
+                    all.fragment_stats.insert(fragment_id, fragment_stats);
+                }
+            }
+
+            // Aggregate relation_stats
+            for (relation_id, relation_stats) in result.relation_stats {
+                if let Some(s) = all.relation_stats.get_mut(&relation_id) {
+                    s.actor_count += relation_stats.actor_count;
+                    s.current_epoch = min(s.current_epoch, relation_stats.current_epoch);
+                } else {
+                    all.relation_stats.insert(relation_id, relation_stats);
+                }
+            }
+
+            // Aggregate channel_stats
+            for (key, channel_stats) in result.channel_stats {
+                if let Some(s) = all.channel_stats.get_mut(&key) {
+                    s.actor_count += channel_stats.actor_count;
+                    s.output_blocking_duration += channel_stats.output_blocking_duration;
+                    s.recv_row_count += channel_stats.recv_row_count;
+                    s.send_row_count += channel_stats.send_row_count;
+                } else {
+                    all.channel_stats.insert(key, channel_stats);
+                }
+            }
+        }
+
+        Ok(all.into())
+    }
+
+    pub async fn get_version(Extension(_srv): Extension<Service>) -> Result<Json<String>> {
+        Ok(Json(risingwave_common::current_cluster_version()))
     }
 }
 
 impl DashboardService {
     pub async fn serve(self) -> Result<()> {
         use handlers::*;
-        let ui_path = self.ui_path.clone();
         let srv = Arc::new(self);
 
         let cors_layer = CorsLayer::new()
@@ -373,22 +702,34 @@ impl DashboardService {
             .allow_methods(vec![Method::GET]);
 
         let api_router = Router::new()
+            .route("/version", get(get_version))
             .route("/clusters/:ty", get(list_clusters))
-            .route("/actors", get(list_actors))
-            .route("/fragments2", get(list_fragments))
+            .route("/streaming_jobs", get(list_streaming_jobs))
+            .route("/fragments/job_id/:job_id", get(list_fragments_by_job_id))
+            .route("/relation_id_infos", get(get_relation_id_infos))
+            .route(
+                "/fragment_to_relation_map",
+                get(get_fragment_to_relation_map),
+            )
             .route("/views", get(list_views))
+            .route("/functions", get(list_functions))
             .route("/materialized_views", get(list_materialized_views))
             .route("/tables", get(list_tables))
-            .route("/indexes", get(list_indexes))
+            .route("/indexes", get(list_index_tables))
+            .route("/index_items", get(list_indexes))
+            .route("/subscriptions", get(list_subscription))
             .route("/internal_tables", get(list_internal_tables))
             .route("/sources", get(list_sources))
             .route("/sinks", get(list_sinks))
+            .route("/users", get(list_users))
+            .route("/databases", get(list_databases))
+            .route("/schemas", get(list_schemas))
+            .route("/object_dependencies", get(list_object_dependencies))
             .route("/metrics/cluster", get(prometheus::list_prometheus_cluster))
-            .route(
-                "/metrics/actor/back_pressures",
-                get(prometheus::list_prometheus_actor_back_pressure),
-            )
+            .route("/metrics/streaming_stats", get(get_streaming_stats))
+            // /monitor/await_tree/{worker_id}/?format={text or json}
             .route("/monitor/await_tree/:worker_id", get(dump_await_tree))
+            // /monitor/await_tree/?format={text or json}
             .route("/monitor/await_tree/", get(dump_await_tree_all))
             .route("/monitor/dump_heap_profile/:worker_id", get(heap_profile))
             .route(
@@ -396,6 +737,7 @@ impl DashboardService {
                 get(list_heap_profile),
             )
             .route("/monitor/analyze/:worker_id/*path", get(analyze_heap))
+            // /monitor/diagnose/?format={text or json}
             .route("/monitor/diagnose/", get(diagnose))
             .layer(
                 ServiceBuilder::new()
@@ -405,37 +747,21 @@ impl DashboardService {
             .layer(cors_layer);
 
         let trace_ui_router = otlp_embedded::ui_app(srv.trace_state.clone(), "/trace/");
-
-        let dashboard_router = if let Some(ui_path) = ui_path {
-            get_service(ServeDir::new(ui_path))
-                .handle_error(|e| async move { match e {} })
-                .boxed_clone()
-        } else {
-            let cache = Arc::new(Mutex::new(HashMap::new()));
-            tower::service_fn(move |req: Request<Body>| {
-                let cache = cache.clone();
-                async move {
-                    proxy::proxy(req, cache).await.or_else(|err| {
-                        Ok((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Unhandled internal error: {}", err),
-                        )
-                            .into_response())
-                    })
-                }
-            })
-            .boxed_clone()
-        };
+        let dashboard_router = risingwave_meta_dashboard::router();
 
         let app = Router::new()
             .fallback_service(dashboard_router)
             .nest("/api", api_router)
-            .nest("/trace", trace_ui_router);
+            .nest("/trace", trace_ui_router)
+            .layer(CompressionLayer::new());
 
-        axum::Server::bind(&srv.dashboard_addr)
-            .serve(app.into_make_service())
+        let listener = TcpListener::bind(&srv.dashboard_addr)
             .await
-            .map_err(|err| anyhow!(err))?;
+            .context("failed to bind dashboard address")?;
+        axum::serve(listener, app)
+            .await
+            .context("failed to serve dashboard service")?;
+
         Ok(())
     }
 }

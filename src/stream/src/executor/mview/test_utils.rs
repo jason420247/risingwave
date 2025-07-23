@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,15 @@
 use risingwave_common::catalog::{ColumnDesc, TableId};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::DataType;
-use risingwave_common::util::epoch::EpochPair;
+use risingwave_common::util::epoch::{EpochPair, test_epoch};
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_storage::memory::MemoryStateStore;
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
+use risingwave_storage::table::batch_table::BatchTable;
 
 use crate::common::table::state_table::StateTable;
+use crate::common::table::test_utils::gen_pbtable;
 
-pub async fn gen_basic_table(row_count: usize) -> StorageTable<MemoryStateStore> {
+pub async fn gen_basic_table(row_count: usize) -> BatchTable<MemoryStateStore> {
     let state_store = MemoryStateStore::new();
 
     let order_types = vec![OrderType::ascending(), OrderType::descending()];
@@ -33,15 +34,19 @@ pub async fn gen_basic_table(row_count: usize) -> StorageTable<MemoryStateStore>
         ColumnDesc::unnamed(column_ids[2], DataType::Int32),
     ];
     let pk_indices = vec![0_usize, 1_usize];
-    let mut state = StateTable::new_without_distribution(
+    let mut state = StateTable::from_table_catalog(
+        &gen_pbtable(
+            TableId::from(0x42),
+            column_descs.clone(),
+            order_types,
+            pk_indices,
+            0,
+        ),
         state_store.clone(),
-        TableId::from(0x42),
-        column_descs.clone(),
-        order_types,
-        pk_indices,
+        None,
     )
     .await;
-    let table = StorageTable::for_test(
+    let table = BatchTable::for_test(
         state_store.clone(),
         TableId::from(0x42),
         column_descs.clone(),
@@ -49,8 +54,8 @@ pub async fn gen_basic_table(row_count: usize) -> StorageTable<MemoryStateStore>
         vec![0],
         vec![0, 1, 2],
     );
-    let mut epoch = EpochPair::new_test_epoch(1);
-    state.init_epoch(epoch);
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    state.init_epoch(epoch).await.unwrap();
 
     for idx in 0..row_count {
         let idx = idx as i32;
@@ -61,8 +66,8 @@ pub async fn gen_basic_table(row_count: usize) -> StorageTable<MemoryStateStore>
         ]));
     }
 
-    epoch.inc();
-    state.commit(epoch).await.unwrap();
+    epoch.inc_for_test();
+    state.commit_for_test(epoch).await.unwrap();
 
     table
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rdkafka::ClientConfig;
 use rdkafka::config::FromClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::ClientConfig;
 
 use crate::{ExecuteContext, KafkaConfig, Task};
 
@@ -33,12 +33,16 @@ impl KafkaReadyCheckTask {
 
 impl Task for KafkaReadyCheckTask {
     fn execute(&mut self, ctx: &mut ExecuteContext<impl std::io::Write>) -> anyhow::Result<()> {
-        ctx.pb.set_message("waiting for online...");
-
+        if self.config.user_managed {
+            ctx.pb
+                .set_message("waiting for user-managed service online...");
+        } else {
+            ctx.pb.set_message("waiting for online...");
+        }
         let mut config = ClientConfig::new();
         config.set(
             "bootstrap.servers",
-            &format!("{}:{}", self.config.address, self.config.port),
+            format!("{}:{}", self.config.address, self.config.port),
         );
 
         let rt = tokio::runtime::Builder::new_current_thread()

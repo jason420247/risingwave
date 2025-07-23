@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,9 +23,6 @@ public class JniSinkCoordinatorHandler {
     private static final Logger LOG = LoggerFactory.getLogger(JniSinkCoordinatorHandler.class);
 
     public static void runJniSinkCoordinatorThread(long requestRxPtr, long responseTxPtr) {
-        // For jni.rs
-        java.lang.Thread.currentThread()
-                .setContextClassLoader(java.lang.ClassLoader.getSystemClassLoader());
         JniSinkCoordinatorResponseObserver responseObserver =
                 new JniSinkCoordinatorResponseObserver(responseTxPtr);
         SinkCoordinatorStreamObserver sinkCoordinatorStreamObserver =

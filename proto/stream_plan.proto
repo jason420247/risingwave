@@ -7,6 +7,7 @@ import "common.proto";
 import "data.proto";
 import "expr.proto";
 import "plan_common.proto";
+import "secret.proto";
 import "source.proto";
 
 option java_package = "com.risingwave.proto";
@@ -22,11 +23,15 @@ message AddMutation {
   // All actors to be added (to the main connected component of the graph) in this update.
   repeated uint32 added_actors = 3;
   // We may embed a source change split mutation here.
+  // `Source` and `SourceBackfill` are handled together here.
   // TODO: we may allow multiple mutations in a single barrier.
   map<uint32, source.ConnectorSplits> actor_splits = 2;
   // We may embed a pause mutation here.
   // TODO: we may allow multiple mutations in a single barrier.
   bool pause = 4;
+  repeated SubscriptionUpstreamInfo subscriptions_to_add = 5;
+  // nodes which should be paused initially.
+  repeated uint32 backfill_nodes_to_pause = 6;
 }
 
 message StopMutation {
@@ -55,8 +60,9 @@ message UpdateMutation {
     //   In this case, all the upstream actors should be removed and replaced by the `new` ones.
     optional uint32 new_upstream_fragment_id = 5;
     // Added upstream actors.
-    repeated uint32 added_upstream_actor_id = 3;
+    repeated common.ActorInfo added_upstream_actors = 3;
     // Removed upstream actors.
+    // Note: this is empty for replace job.
     repeated uint32 removed_upstream_actor_id = 4;
   }
   // Dispatcher updates.
@@ -68,6 +74,7 @@ message UpdateMutation {
   // All actors to be dropped in this update.
   repeated uint32 dropped_actors = 4;
   // Source updates.
+  // `Source` and `SourceBackfill` are handled together here.
   map<uint32, source.ConnectorSplits> actor_splits = 5;
   // When modifying the Materialized View, we need to recreate the Dispatcher from the old upstream to the new TableFragment.
   // Consistent with the semantics in AddMutation.
@@ -75,6 +82,7 @@ message UpdateMutation {
 }
 
 message SourceChangeSplitMutation {
+  // `Source` and `SourceBackfill` are handled together here.
   map<uint32, source.ConnectorSplits> actor_splits = 2;
 }
 
@@ -94,6 +102,27 @@ message CombinedMutation {
   repeated BarrierMutation mutations = 1;
 }
 
+message SubscriptionUpstreamInfo {
+  // can either be subscription_id or table_id of creating TableFragments
+  uint32 subscriber_id = 1;
+  uint32 upstream_mv_table_id = 2;
+}
+
+message DropSubscriptionsMutation {
+  repeated SubscriptionUpstreamInfo info = 1;
+}
+
+message ConnectorPropsChangeMutation {
+  message ConnectorPropsInfo {
+    map<string, string> connector_props_info = 1;
+  }
+  map<uint32, ConnectorPropsInfo> connector_props_infos = 1;
+}
+
+message StartFragmentBackfillMutation {
+  repeated uint32 fragment_ids = 1;
+}
+
 message BarrierMutation {
   oneof mutation {
     // Add new dispatchers to some actors, used for creating materialized views.
@@ -101,7 +130,7 @@ message BarrierMutation {
     // Stop a set of actors, used for dropping materialized views. Empty dispatchers will be
     // automatically removed.
     StopMutation stop = 4;
-    // Update outputs and hash mappings for some dispatchers, used for scaling.
+    // Update outputs and hash mappings for some dispatchers, used for scaling and replace table.
     UpdateMutation update = 5;
     // Change the split of some sources.
     SourceChangeSplitMutation splits = 6;
@@ -109,9 +138,20 @@ message BarrierMutation {
     PauseMutation pause = 7;
     // Resume the dataflow of the whole streaming graph, only used for scaling.
     ResumeMutation resume = 8;
-    // Throttle specific source exec or chain exec.
+    // Throttle specific source exec or backfill exec.
     ThrottleMutation throttle = 10;
+    // Drop subscription on mv
+    DropSubscriptionsMutation drop_subscriptions = 12;
+    // Alter sink/connector/source props
+    ConnectorPropsChangeMutation connector_props_change = 13;
+    // Start backfilling for specific fragments
+    // This is separated from `ThrottleMutation::NO_RATE_LIMIT`.
+    // This is because user may concurrently rate limit + use backfill order control.
+    // If we use rate limit to pause / resume backfill fragments, if user manually
+    // resumes some fragments, this will overwrite the backfill order configuration.
+    StartFragmentBackfillMutation start_fragment_backfill = 14;
     // Combined mutation.
+    // Currently, it can only be Add & Update, which is for sink into table.
     CombinedMutation combined = 100;
   }
 }
@@ -156,6 +196,17 @@ message StreamMessage {
   }
 }
 
+message StreamMessageBatch {
+  message BarrierBatch {
+    repeated Barrier barriers = 1;
+  }
+  oneof stream_message_batch {
+    data.StreamChunk stream_chunk = 1;
+    BarrierBatch barrier_batch = 2;
+    Watermark watermark = 3;
+  }
+}
+
 // Hash mapping for compute node. Stores mapping from virtual node to actor id.
 message ActorMapping {
   repeated uint32 original_indices = 1;
@@ -172,8 +223,9 @@ message StreamSource {
   map<string, string> with_properties = 6;
   catalog.StreamSourceInfo info = 7;
   string source_name = 8;
-  // Streaming rate limit
+  // Source rate limit
   optional uint32 rate_limit = 9;
+  map<string, secret.SecretRef> secret_refs = 10;
 }
 
 // copy contents from StreamSource to prevent compatibility issues in the future
@@ -187,8 +239,9 @@ message StreamFsFetch {
   map<string, string> with_properties = 6;
   catalog.StreamSourceInfo info = 7;
   string source_name = 8;
-  // Streaming rate limit
+  // Source rate limit
   optional uint32 rate_limit = 9;
+  map<string, secret.SecretRef> secret_refs = 10;
 }
 
 // The executor only for receiving barrier from the meta service. It always resides in the leaves
@@ -203,6 +256,25 @@ message SourceNode {
 
 message StreamFsFetchNode {
   StreamFsFetch node_inner = 1;
+}
+
+/// It's input must be a `MergeNode`, which connects to the upstream source job.
+/// See `StreamSourceScan::adhoc_to_stream_prost` for the plan.
+message SourceBackfillNode {
+  uint32 upstream_source_id = 1;
+  optional uint32 row_id_index = 2;
+  repeated plan_common.ColumnCatalog columns = 3;
+  catalog.StreamSourceInfo info = 4;
+  string source_name = 5;
+  map<string, string> with_properties = 6;
+  // Backfill rate limit
+  optional uint32 rate_limit = 7;
+
+  // fields above are the same as StreamSource
+
+  // `| partition_id | backfill_progress |`
+  catalog.Table state_table = 8;
+  map<string, secret.SecretRef> secret_refs = 9;
 }
 
 message SinkDesc {
@@ -223,6 +295,8 @@ message SinkDesc {
   string sink_from_name = 12;
   catalog.SinkFormatDesc format_desc = 13;
   optional uint32 target_table = 14;
+  optional uint64 extra_partition_col_idx = 15;
+  map<string, secret.SecretRef> secret_refs = 16;
 }
 
 enum SinkLogStoreType {
@@ -237,6 +311,7 @@ message SinkNode {
   // A sink with a kv log store should have a table.
   catalog.Table table = 2;
   SinkLogStoreType log_store_type = 3;
+  optional uint32 rate_limit = 4;
 }
 
 message ProjectNode {
@@ -247,16 +322,23 @@ message ProjectNode {
   repeated uint32 watermark_input_cols = 2;
   repeated uint32 watermark_output_cols = 3;
   repeated uint32 nondecreasing_exprs = 4;
+  // Whether there are likely no-op updates in the output chunks, so that eliminating them with
+  // `StreamChunk::eliminate_adjacent_noop_update` could be beneficial.
+  bool noop_update_hint = 5;
 }
 
 message FilterNode {
   expr.ExprNode search_condition = 1;
 }
 
+message ChangeLogNode {
+  // Whether or not there is an op in the final output.
+  bool need_op = 1;
+}
+
 message CdcFilterNode {
   expr.ExprNode search_condition = 1;
   uint32 upstream_source_id = 2;
-  repeated int32 upstream_column_ids = 3;
 }
 
 // A materialized view is regarded as a table.
@@ -306,9 +388,6 @@ enum AggNodeVersion {
 
   // https://github.com/risingwavelabs/risingwave/issues/13465#issuecomment-1821016508
   AGG_NODE_VERSION_ISSUE_13465 = 2;
-
-  // Used for test only.
-  AGG_NODE_VERSION_MAX = 2147483647;
 }
 
 message SimpleAggNode {
@@ -323,6 +402,9 @@ message SimpleAggNode {
   map<uint32, catalog.Table> distinct_dedup_tables = 6;
   uint32 row_count_index = 7;
   AggNodeVersion version = 8;
+  // Required by the downstream `RowMergeNode`,
+  // currently only used by the `approx_percentile`'s two phase plan
+  bool must_output_per_barrier = 9;
 }
 
 message HashAggNode {
@@ -374,6 +456,12 @@ message InequalityPair {
   DeltaExpression delta_expression = 4;
 }
 
+enum JoinEncodingType {
+  UNSPECIFIED = 0;
+  MEMORY_OPTIMIZED = 1;
+  CPU_OPTIMIZED = 2;
+}
+
 message HashJoinNode {
   plan_common.JoinType join_type = 1;
   repeated int32 left_key = 2;
@@ -405,6 +493,33 @@ message HashJoinNode {
   // Whether to optimize for append only stream.
   // It is true when the input is append-only
   bool is_append_only = 14;
+
+  // Which encoding will be used to encode join rows in operator cache.
+  JoinEncodingType join_encoding_type = 15;
+}
+
+message AsOfJoinNode {
+  plan_common.AsOfJoinType join_type = 1;
+  repeated int32 left_key = 2;
+  repeated int32 right_key = 3;
+  // Used for internal table states.
+  catalog.Table left_table = 4;
+  // Used for internal table states.
+  catalog.Table right_table = 5;
+  // The output indices of current node
+  repeated uint32 output_indices = 6;
+  // Left deduped input pk indices. The pk of the left_table and
+  // The pk of the left_table is  [left_join_key | left_inequality_key | left_deduped_input_pk_indices]
+  // left_inequality_key is not used but for forward compatibility.
+  repeated uint32 left_deduped_input_pk_indices = 7;
+  // Right deduped input pk indices.
+  // The pk of the right_table is  [right_join_key | right_inequality_key | right_deduped_input_pk_indices]
+  // right_inequality_key is not used but for forward compatibility.
+  repeated uint32 right_deduped_input_pk_indices = 8;
+  repeated bool null_safe = 9;
+  optional plan_common.AsOfJoinDesc asof_desc = 10;
+  // Which encoding will be used to encode join rows in operator cache.
+  JoinEncodingType join_encoding_type = 11;
 }
 
 message TemporalJoinNode {
@@ -419,6 +534,10 @@ message TemporalJoinNode {
   plan_common.StorageTableDesc table_desc = 7;
   // The output indices of the lookup side table
   repeated uint32 table_output_indices = 8;
+  // The state table used for non-append-only temporal join.
+  optional catalog.Table memo_table = 9;
+  // If it is a nested lool temporal join
+  bool is_nested_loop = 10;
 }
 
 message DynamicFilterNode {
@@ -435,7 +554,7 @@ message DynamicFilterNode {
   // When the condition changes, we will tell downstream to insert the LHS records which now match the condition.
   // If this is false, we need to store RHS records which match the condition in the internal table.
   // When the condition changes, we will tell downstream to delete the LHS records which now no longer match the condition.
-  bool condition_always_relax = 5;
+  bool condition_always_relax = 5 [deprecated = true];
 }
 
 // Delta join with two indexes. This is a pseudo plan node generated on frontend. On meta
@@ -467,7 +586,13 @@ message HopWindowNode {
 }
 
 message MergeNode {
-  repeated uint32 upstream_actor_id = 1;
+  // **WARNING**: Use this field with caution.
+  //
+  // `upstream_actor_id` stored in the plan node in `Fragment` meta model cannot be directly used.
+  // See `compose_fragment`.
+  // The field is deprecated because the upstream actor info is provided separately instead of
+  // injected here in the node.
+  repeated uint32 upstream_actor_id = 1 [deprecated = true];
   uint32 upstream_fragment_id = 2;
   // Type of the upstream dispatcher. If there's always one upstream according to this
   // type, the compute node may use the `ReceiverExecutor` as an optimization.
@@ -500,6 +625,12 @@ enum StreamScanType {
 
   // ArrangementBackfillExecutor
   STREAM_SCAN_TYPE_ARRANGEMENT_BACKFILL = 5;
+
+  // SnapshotBackfillExecutor
+  STREAM_SCAN_TYPE_SNAPSHOT_BACKFILL = 6;
+
+  // SnapshotBackfillExecutor
+  STREAM_SCAN_TYPE_CROSS_DB_SNAPSHOT_BACKFILL = 7;
 }
 
 // StreamScanNode reads data from upstream table first, and then pass all events to downstream.
@@ -532,7 +663,7 @@ message StreamScanNode {
   // Used iff `ChainType::Backfill`.
   plan_common.StorageTableDesc table_desc = 7;
 
-  // The rate limit for the stream scan node.
+  // The backfill rate limit for the stream scan node.
   optional uint32 rate_limit = 8;
 
   // Snapshot read every N barriers
@@ -541,6 +672,18 @@ message StreamScanNode {
   // The state table used by ArrangementBackfill to replicate upstream mview's state table.
   // Used iff `ChainType::ArrangementBackfill`.
   catalog.Table arrangement_table = 10;
+
+  optional uint64 snapshot_backfill_epoch = 11;
+}
+
+// Config options for CDC backfill
+message StreamCdcScanOptions {
+  // Whether skip the backfill and only consume from upstream.
+  bool disable_backfill = 1;
+
+  uint32 snapshot_barrier_interval = 2;
+
+  uint32 snapshot_batch_size = 3;
 }
 
 message StreamCdcScanNode {
@@ -553,11 +696,20 @@ message StreamCdcScanNode {
   // Strips the primary key columns if they're unnecessary.
   repeated uint32 output_indices = 3;
 
-  /// The state table used by Backfill operator for persisting internal state
+  // The state table used by CdcBackfill operator for persisting internal state
   catalog.Table state_table = 4;
 
   // The external table that will be backfilled for CDC.
   plan_common.ExternalTableDesc cdc_table_desc = 5;
+
+  // The backfill rate limit for the stream cdc scan node.
+  optional uint32 rate_limit = 6;
+
+  // Whether skip the backfill and only consume from upstream.
+  // keep it for backward compatibility, new stream plan will use `options.disable_backfill`
+  bool disable_backfill = 7;
+
+  StreamCdcScanOptions options = 8;
 }
 
 // BatchPlanNode is used for mv on mv snapshot read.
@@ -665,15 +817,28 @@ message DmlNode {
   uint64 table_version_id = 3;
   // Column descriptions of the table.
   repeated plan_common.ColumnDesc column_descs = 2;
+  optional uint32 rate_limit = 4;
 }
 
 message RowIdGenNode {
   uint64 row_id_index = 1;
 }
 
+message NowModeUpdateCurrent {}
+
+message NowModeGenerateSeries {
+  data.Datum start_timestamp = 1;
+  data.Datum interval = 2;
+}
+
 message NowNode {
   // Persists emitted 'now'.
   catalog.Table state_table = 1;
+
+  oneof mode {
+    NowModeUpdateCurrent update_current = 101;
+    NowModeGenerateSeries generate_series = 102;
+  }
 }
 
 message ValuesNode {
@@ -712,6 +877,36 @@ message OverWindowNode {
   repeated common.ColumnOrder order_by = 3;
   catalog.Table state_table = 4;
   OverWindowCachePolicy cache_policy = 5;
+}
+
+message LocalApproxPercentileNode {
+  double base = 1;
+  uint32 percentile_index = 2;
+}
+
+message GlobalApproxPercentileNode {
+  double base = 1;
+  double quantile = 2;
+  catalog.Table bucket_state_table = 3;
+  catalog.Table count_state_table = 4;
+}
+
+message RowMergeNode {
+  catalog.ColIndexMapping lhs_mapping = 1;
+  catalog.ColIndexMapping rhs_mapping = 2;
+}
+
+message SyncLogStoreNode {
+  catalog.Table log_store_table = 1;
+  uint32 pause_duration_ms = 2;
+  uint32 buffer_size = 3;
+  bool aligned = 4;
+}
+
+message MaterializedExprsNode {
+  repeated expr.ExprNode exprs = 1;
+  catalog.Table state_table = 2;
+  optional uint32 state_clean_col_idx = 3;
 }
 
 message StreamNode {
@@ -757,6 +952,14 @@ message StreamNode {
     StreamFsFetchNode stream_fs_fetch = 138;
     StreamCdcScanNode stream_cdc_scan = 139;
     CdcFilterNode cdc_filter = 140;
+    SourceBackfillNode source_backfill = 142;
+    ChangeLogNode changelog = 143;
+    LocalApproxPercentileNode local_approx_percentile = 144;
+    GlobalApproxPercentileNode global_approx_percentile = 145;
+    RowMergeNode row_merge = 146;
+    AsOfJoinNode as_of_join = 147;
+    SyncLogStoreNode sync_log_store = 148;
+    MaterializedExprsNode materialized_exprs = 149;
   }
   // The id for the operator. This is local per mview.
   // TODO: should better be a uint32.
@@ -787,12 +990,39 @@ enum DispatcherType {
   DISPATCHER_TYPE_NO_SHUFFLE = 4;
 }
 
+// The method to map the upstream columns in the dispatcher before dispatching.
+//
+// - For intra-job exchange, typically the upstream and downstream columns are the same. `indices`
+//   will be `0..len` and `types` will be empty.
+//
+// - For inter-job exchange,
+//   * if the downstream only requires a subset of the upstream columns, `indices` will be the
+//     indices of the required columns in the upstream columns.
+//   * if some columns are added to the upstream, `indices` will help to maintain the same schema
+//     from the view of the downstream.
+//   * if some columns are altered to different (composite) types, `types` will be used to convert
+//     the upstream columns to the downstream columns to maintain the same schema.
+message DispatchOutputMapping {
+  message TypePair {
+    data.DataType upstream = 1;
+    data.DataType downstream = 2;
+  }
+
+  // Indices of the columns to output.
+  repeated uint32 indices = 1;
+  // Besides the indices, we may also need to convert the types of some columns.
+  // - If no type conversion is needed, this field will be empty.
+  // - If type conversion is needed, this will have the same length as `indices`. Only columns with
+  //   type conversion will have `upstream` and `downstream` field set.
+  repeated TypePair types = 2;
+}
+
 // The property of an edge in the fragment graph.
 // This is essientially a "logical" version of `Dispatcher`. See the doc of `Dispatcher` for more details.
 message DispatchStrategy {
   DispatcherType type = 1;
   repeated uint32 dist_key_indices = 2;
-  repeated uint32 output_indices = 3;
+  DispatchOutputMapping output_mapping = 3;
 }
 
 // A dispatcher redistribute messages.
@@ -802,10 +1032,8 @@ message Dispatcher {
   // Indices of the columns to be used for hashing.
   // For dispatcher types other than HASH, this is ignored.
   repeated uint32 dist_key_indices = 2;
-  // Indices of the columns to output.
-  // In most cases, this contains all columns in the input. But for some cases like MV on MV or
-  // schema change, we may only output a subset of the columns.
-  repeated uint32 output_indices = 6;
+  // The method to map the upstream columns in the dispatcher before dispatching.
+  DispatchOutputMapping output_mapping = 6;
   // The hash mapping for consistent hash.
   // For dispatcher types other than HASH, this is ignored.
   ActorMapping hash_mapping = 3;
@@ -818,18 +1046,12 @@ message Dispatcher {
 
 // A StreamActor is a running fragment of the overall stream graph,
 message StreamActor {
-  reserved 7;
-  reserved "colocated_upstream_actor_id";
+  reserved 3, 7, 6;
+  reserved "colocated_upstream_actor_id", "nodes", "upstream_actor_id";
 
   uint32 actor_id = 1;
   uint32 fragment_id = 2;
-  StreamNode nodes = 3;
   repeated Dispatcher dispatcher = 4;
-  // The actors that send messages to this actor.
-  // Note that upstream actor ids are also stored in the proto of merge nodes.
-  // It is painstaking to traverse through the node tree and get upstream actor id from the root StreamNode.
-  // We duplicate the information here to ease the parsing logic in stream manager.
-  repeated uint32 upstream_actor_id = 6;
   // Vnodes that the executors in this actor own.
   // If the fragment is a singleton, this field will not be set and leave a `None`.
   common.Buffer vnode_bitmap = 8;
@@ -839,32 +1061,27 @@ message StreamActor {
   plan_common.ExprContext expr_context = 10;
 }
 
-enum FragmentTypeFlag {
-  FRAGMENT_TYPE_FLAG_FRAGMENT_UNSPECIFIED = 0;
-  FRAGMENT_TYPE_FLAG_SOURCE = 1;
-  FRAGMENT_TYPE_FLAG_MVIEW = 2;
-  FRAGMENT_TYPE_FLAG_SINK = 4;
-  FRAGMENT_TYPE_FLAG_NOW = 8; // TODO: Remove this and insert a `BarrierRecv` instead.
-  FRAGMENT_TYPE_FLAG_STREAM_SCAN = 16;
-  FRAGMENT_TYPE_FLAG_BARRIER_RECV = 32;
-  FRAGMENT_TYPE_FLAG_VALUES = 64;
-  FRAGMENT_TYPE_FLAG_DML = 128;
-  FRAGMENT_TYPE_FLAG_CDC_FILTER = 256;
-}
-
 // The streaming context associated with a stream plan
 message StreamContext {
   // The timezone associated with the streaming plan. Only applies to MV for now.
   string timezone = 1;
 }
 
+message BackfillOrder {
+  map<uint32, common.Uint32Vector> order = 1;
+}
+
+// Representation of a graph of stream fragments.
+// Generated by the fragmenter in the frontend, only used in DDL requests and never persisted.
+//
+// For the persisted form, see `TableFragments`.
 message StreamFragmentGraph {
   message StreamFragment {
     // 0-based on frontend, and will be rewritten to global id on meta.
     uint32 fragment_id = 1;
     // root stream node in this fragment.
     StreamNode node = 2;
-    // Bitwise-OR of FragmentTypeFlags
+    // Bitwise-OR of `FragmentTypeFlag`s
     uint32 fragment_type_mask = 3;
     // Mark whether this fragment requires exactly one actor.
     // Note: if this is `false`, the fragment may still be a singleton according to the scheduler.
@@ -904,4 +1121,18 @@ message StreamFragmentGraph {
   StreamContext ctx = 5;
   // If none, default parallelism will be applied.
   Parallelism parallelism = 6;
+
+  // Specified max parallelism, i.e., expected vnode count for the graph.
+  //
+  // The scheduler on the meta service will use this as a hint to decide the vnode count
+  // for each fragment.
+  //
+  // Note that the actual vnode count may be different from this value.
+  // For example, a no-shuffle exchange between current fragment graph and an existing
+  // upstream fragment graph requires two fragments to be in the same distribution,
+  // thus the same vnode count.
+  uint32 max_parallelism = 7;
+
+  // The backfill order strategy for the fragments.
+  BackfillOrder backfill_order = 8;
 }

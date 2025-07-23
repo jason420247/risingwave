@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,5 +16,6 @@ mod generate_series;
 mod generate_subscripts;
 mod jsonb;
 mod pg_expandarray;
+mod pg_get_keywords;
 mod regexp_matches;
 mod unnest;

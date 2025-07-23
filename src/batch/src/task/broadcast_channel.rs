@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ pub fn new_broadcast_channel(
     output_channel_size: usize,
 ) -> (ChanSenderImpl, Vec<ChanReceiverImpl>) {
     let broadcast_info = match shuffle.distribution {
-        Some(exchange_info::Distribution::BroadcastInfo(ref v)) => v.clone(),
+        Some(exchange_info::Distribution::BroadcastInfo(ref v)) => *v,
         _ => BroadcastInfo::default(),
     };
 

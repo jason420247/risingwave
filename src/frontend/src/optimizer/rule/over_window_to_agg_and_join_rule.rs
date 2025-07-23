@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,17 +17,17 @@ use risingwave_expr::window_function::WindowFuncKind;
 use risingwave_pb::expr::expr_node::Type;
 use risingwave_pb::plan_common::JoinType;
 
-use super::Rule;
+use super::{BoxedRule, Rule};
+use crate::PlanRef;
 use crate::expr::{AggCall, ExprImpl, FunctionCall, InputRef, OrderBy};
 use crate::optimizer::plan_node::{
     LogicalAgg, LogicalJoin, LogicalProject, LogicalShare, PlanTreeNodeUnary,
 };
 use crate::utils::{Condition, GroupBy};
-use crate::PlanRef;
 pub struct OverWindowToAggAndJoinRule;
 
 impl OverWindowToAggAndJoinRule {
-    pub fn create() -> Box<dyn Rule> {
+    pub fn create() -> BoxedRule {
         Box::new(OverWindowToAggAndJoinRule)
     }
 }
@@ -37,9 +37,9 @@ impl Rule for OverWindowToAggAndJoinRule {
         let over_window = plan.as_logical_over_window()?;
         let window_functions = over_window.window_functions();
         if window_functions.iter().any(|window| {
-            !window.order_by.is_empty()
-                || !window.frame.bounds.start_is_unbounded()
-                || !window.frame.bounds.end_is_unbounded()
+            !(window.order_by.is_empty()
+                && window.frame.bounds.start_is_unbounded()
+                && window.frame.bounds.end_is_unbounded())
         }) {
             return None;
         }
@@ -51,9 +51,9 @@ impl Rule for OverWindowToAggAndJoinRule {
             .collect_vec();
         let mut select_exprs = group_exprs.clone();
         for func in window_functions {
-            if let WindowFuncKind::Aggregate(kind) = func.kind {
+            if let WindowFuncKind::Aggregate(kind) = &func.kind {
                 let agg_call = AggCall::new(
-                    kind,
+                    kind.clone(),
                     func.args.iter().map(|x| x.clone().into()).collect_vec(),
                     false,
                     OrderBy::any(),

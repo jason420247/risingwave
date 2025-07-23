@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,10 @@ impl DataChunkBuilder {
             array_builders: vec![],
             buffered_count: 0,
         }
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
     }
 
     /// Lazily create the array builders if absent
@@ -143,6 +147,11 @@ impl DataChunkBuilder {
         }
     }
 
+    /// Build a data chunk from the current buffer.
+    pub fn finish(mut self) -> DataChunk {
+        self.build_data_chunk()
+    }
+
     fn append_one_row_internal(&mut self, data_chunk: &DataChunk, row_idx: usize) {
         self.do_append_one_row_from_datums(data_chunk.row_at(row_idx).0.iter());
     }
@@ -221,6 +230,10 @@ impl DataChunkBuilder {
 
     pub fn buffered_count(&self) -> usize {
         self.buffered_count
+    }
+
+    pub fn can_append_update(&self) -> bool {
+        self.buffered_count + 2 <= self.batch_size
     }
 
     pub fn num_columns(&self) -> usize {
@@ -454,15 +467,15 @@ mod tests {
 
         let mut left_array_builder = DataType::Int32.create_array_builder(5);
         for v in [1, 2, 3, 4, 5] {
-            left_array_builder.append(&Some(ScalarImpl::Int32(v)));
+            left_array_builder.append(Some(ScalarImpl::Int32(v)));
         }
-        let left_arrays = vec![left_array_builder.finish()];
+        let left_arrays = [left_array_builder.finish()];
 
         let mut right_array_builder = DataType::Int64.create_array_builder(5);
         for v in [5, 4, 3, 2, 1] {
-            right_array_builder.append(&Some(ScalarImpl::Int64(v)));
+            right_array_builder.append(Some(ScalarImpl::Int64(v)));
         }
-        let right_arrays = vec![right_array_builder.finish()];
+        let right_arrays = [right_array_builder.finish()];
 
         let mut output_chunks = Vec::new();
 

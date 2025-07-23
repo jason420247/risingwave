@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,30 +15,29 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use anyhow::Context as _;
-use futures::{pin_mut, Stream};
-use futures_async_stream::try_stream;
+use anyhow::anyhow;
+use either::Either;
+use local_input::LocalInputStreamInner;
 use pin_project::pin_project;
-use risingwave_common::util::addr::{is_local_address, HostAddr};
-use risingwave_pb::task_service::{permits, GetStreamResponse};
-use risingwave_rpc_client::error::TonicStatusWrapper;
-use risingwave_rpc_client::ComputeClientPool;
-use thiserror_ext::AsReport;
+use risingwave_common::util::addr::{HostAddr, is_local_address};
+use tokio::sync::mpsc;
 
 use super::permit::Receiver;
-use crate::error::StreamResult;
-use crate::executor::error::StreamExecutorError;
-use crate::executor::monitor::StreamingMetrics;
-use crate::executor::*;
-use crate::task::{FragmentId, SharedContext, UpDownActorIds, UpDownFragmentIds};
+use crate::executor::prelude::*;
+use crate::executor::{
+    BarrierInner, DispatcherBarrier, DispatcherMessage, DispatcherMessageBatch,
+    DispatcherMessageStreamItem,
+};
+use crate::task::{FragmentId, LocalBarrierManager, UpDownActorIds, UpDownFragmentIds};
 
-/// `Input` provides an interface for [`MergeExecutor`] and [`ReceiverExecutor`] to receive data
-/// from upstream actors.
-pub trait Input: MessageStream {
-    /// The upstream actor id.
-    fn actor_id(&self) -> ActorId;
+/// `Input` is a more abstract upstream input type, used for `DynamicReceivers` type
+/// handling of multiple upstream inputs
+pub trait Input: Stream + Send {
+    type InputId;
+    /// The upstream input id.
+    fn id(&self) -> Self::InputId;
 
-    fn boxed_input(self) -> BoxedInput
+    fn boxed_input(self) -> BoxedInput<Self::InputId, Self::Item>
     where
         Self: Sized + 'static,
     {
@@ -46,12 +45,19 @@ pub trait Input: MessageStream {
     }
 }
 
-pub type BoxedInput = Pin<Box<dyn Input>>;
+pub type BoxedInput<InputId, Item> = Pin<Box<dyn Input<InputId = InputId, Item = Item>>>;
 
-impl std::fmt::Debug for dyn Input {
+/// `ActorInput` provides an interface for [`MergeExecutor`](crate::executor::MergeExecutor) and
+/// [`ReceiverExecutor`](crate::executor::ReceiverExecutor) to receive data from upstream actors.
+/// Only used for actor inputs.
+pub trait ActorInput = Input<Item = DispatcherMessageStreamItem, InputId = ActorId>;
+
+pub type BoxedActorInput = Pin<Box<dyn ActorInput>>;
+
+impl std::fmt::Debug for dyn ActorInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Input")
-            .field("actor_id", &self.actor_id())
+            .field("actor_id", &self.id())
             .finish_non_exhaustive()
     }
 }
@@ -64,27 +70,93 @@ pub struct LocalInput {
 
     actor_id: ActorId,
 }
-type LocalInputStreamInner = impl MessageStream;
+
+pub(crate) fn assert_equal_dispatcher_barrier<M1, M2>(
+    first: &BarrierInner<M1>,
+    second: &BarrierInner<M2>,
+) {
+    assert_eq!(first.epoch, second.epoch);
+    assert_eq!(first.kind, second.kind);
+}
+
+pub(crate) fn apply_dispatcher_barrier(
+    recv_barrier: &mut Barrier,
+    dispatcher_barrier: DispatcherBarrier,
+) {
+    assert_equal_dispatcher_barrier(recv_barrier, &dispatcher_barrier);
+    recv_barrier
+        .passed_actors
+        .extend(dispatcher_barrier.passed_actors);
+}
+
+pub(crate) async fn process_dispatcher_msg(
+    dispatcher_msg: DispatcherMessage,
+    barrier_rx: &mut mpsc::UnboundedReceiver<Barrier>,
+) -> StreamExecutorResult<Message> {
+    let msg = match dispatcher_msg {
+        DispatcherMessage::Chunk(chunk) => Message::Chunk(chunk),
+        DispatcherMessage::Barrier(barrier) => {
+            let mut recv_barrier = barrier_rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow!("end of barrier recv"))?;
+            apply_dispatcher_barrier(&mut recv_barrier, barrier);
+            Message::Barrier(recv_barrier)
+        }
+        DispatcherMessage::Watermark(watermark) => Message::Watermark(watermark),
+    };
+    Ok(msg)
+}
 
 impl LocalInput {
-    pub fn new(channel: Receiver, actor_id: ActorId) -> Self {
+    pub fn new(channel: Receiver, upstream_actor_id: ActorId) -> Self {
         Self {
-            inner: Self::run(channel, actor_id),
-            actor_id,
-        }
-    }
-
-    #[try_stream(ok = Message, error = StreamExecutorError)]
-    async fn run(mut channel: Receiver, actor_id: ActorId) {
-        let span: await_tree::Span = format!("LocalInput (actor {actor_id})").into();
-        while let Some(msg) = channel.recv().verbose_instrument_await(span.clone()).await {
-            yield msg;
+            inner: local_input::run(channel, upstream_actor_id),
+            actor_id: upstream_actor_id,
         }
     }
 }
 
+mod local_input {
+    use await_tree::InstrumentAwait;
+    use either::Either;
+
+    use crate::executor::exchange::error::ExchangeChannelClosed;
+    use crate::executor::exchange::permit::Receiver;
+    use crate::executor::prelude::try_stream;
+    use crate::executor::{DispatcherMessage, StreamExecutorError};
+    use crate::task::ActorId;
+
+    pub(super) type LocalInputStreamInner = impl crate::executor::DispatcherMessageStream;
+
+    #[define_opaque(LocalInputStreamInner)]
+    pub(super) fn run(channel: Receiver, upstream_actor_id: ActorId) -> LocalInputStreamInner {
+        run_inner(channel, upstream_actor_id)
+    }
+
+    #[try_stream(ok = DispatcherMessage, error = StreamExecutorError)]
+    async fn run_inner(mut channel: Receiver, upstream_actor_id: ActorId) {
+        let span = await_tree::span!("LocalInput (actor {upstream_actor_id})").verbose();
+        while let Some(msg) = channel.recv().instrument_await(span.clone()).await {
+            match msg.into_messages() {
+                Either::Left(barriers) => {
+                    for b in barriers {
+                        yield b;
+                    }
+                }
+                Either::Right(m) => {
+                    yield m;
+                }
+            }
+        }
+        // Always emit an error outside the loop. This is because we use barrier as the control
+        // message to stop the stream. Reaching here means the channel is closed unexpectedly.
+        Err(ExchangeChannelClosed::local_input(upstream_actor_id))?
+    }
+}
+
 impl Stream for LocalInput {
-    type Item = MessageStreamItem;
+    type Item = DispatcherMessageStreamItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // TODO: shall we pass the error with local exchange?
@@ -93,7 +165,9 @@ impl Stream for LocalInput {
 }
 
 impl Input for LocalInput {
-    fn actor_id(&self) -> ActorId {
+    type InputId = ActorId;
+
+    fn id(&self) -> Self::InputId {
         self.actor_id
     }
 }
@@ -106,69 +180,124 @@ pub struct RemoteInput {
 
     actor_id: ActorId,
 }
-type RemoteInputStreamInner = impl MessageStream;
+
+use remote_input::RemoteInputStreamInner;
+use risingwave_pb::common::ActorInfo;
 
 impl RemoteInput {
     /// Create a remote input from compute client and related info. Should provide the corresponding
     /// compute client of where the actor is placed.
-    pub fn new(
-        client_pool: ComputeClientPool,
+    pub async fn new(
+        local_barrier_manager: &LocalBarrierManager,
         upstream_addr: HostAddr,
         up_down_ids: UpDownActorIds,
         up_down_frag: UpDownFragmentIds,
         metrics: Arc<StreamingMetrics>,
-        batched_permits: usize,
-    ) -> Self {
+    ) -> StreamExecutorResult<Self> {
         let actor_id = up_down_ids.0;
 
-        Self {
+        let client = local_barrier_manager
+            .env
+            .client_pool()
+            .get_by_addr(upstream_addr)
+            .await?;
+        let (stream, permits_tx) = client
+            .get_stream(
+                up_down_ids.0,
+                up_down_ids.1,
+                up_down_frag.0,
+                up_down_frag.1,
+                local_barrier_manager.database_id,
+                local_barrier_manager.term_id.clone(),
+            )
+            .await?;
+
+        Ok(Self {
             actor_id,
-            inner: Self::run(
-                client_pool,
-                upstream_addr,
+            inner: remote_input::run(
+                stream,
+                permits_tx,
                 up_down_ids,
                 up_down_frag,
                 metrics,
-                batched_permits,
+                local_barrier_manager
+                    .env
+                    .config()
+                    .developer
+                    .exchange_batched_permits,
             ),
-        }
+        })
+    }
+}
+
+mod remote_input {
+    use std::sync::Arc;
+
+    use anyhow::Context;
+    use await_tree::InstrumentAwait;
+    use either::Either;
+    use risingwave_pb::task_service::{GetStreamResponse, permits};
+    use tokio::sync::mpsc;
+    use tonic::Streaming;
+
+    use crate::executor::exchange::error::ExchangeChannelClosed;
+    use crate::executor::monitor::StreamingMetrics;
+    use crate::executor::prelude::{StreamExt, pin_mut, try_stream};
+    use crate::executor::{DispatcherMessage, StreamExecutorError};
+    use crate::task::{UpDownActorIds, UpDownFragmentIds};
+
+    pub(super) type RemoteInputStreamInner = impl crate::executor::DispatcherMessageStream;
+
+    #[define_opaque(RemoteInputStreamInner)]
+    pub(super) fn run(
+        stream: Streaming<GetStreamResponse>,
+        permits_tx: mpsc::UnboundedSender<permits::Value>,
+        up_down_ids: UpDownActorIds,
+        up_down_frag: UpDownFragmentIds,
+        metrics: Arc<StreamingMetrics>,
+        batched_permits_limit: usize,
+    ) -> RemoteInputStreamInner {
+        run_inner(
+            stream,
+            permits_tx,
+            up_down_ids,
+            up_down_frag,
+            metrics,
+            batched_permits_limit,
+        )
     }
 
-    #[try_stream(ok = Message, error = StreamExecutorError)]
-    async fn run(
-        client_pool: ComputeClientPool,
-        upstream_addr: HostAddr,
+    #[try_stream(ok = DispatcherMessage, error = StreamExecutorError)]
+    async fn run_inner(
+        stream: Streaming<GetStreamResponse>,
+        permits_tx: mpsc::UnboundedSender<permits::Value>,
         up_down_ids: UpDownActorIds,
         up_down_frag: UpDownFragmentIds,
         metrics: Arc<StreamingMetrics>,
         batched_permits_limit: usize,
     ) {
-        let client = client_pool.get_by_addr(upstream_addr).await?;
-        let (stream, permits_tx) = client
-            .get_stream(up_down_ids.0, up_down_ids.1, up_down_frag.0, up_down_frag.1)
-            .await?;
-
         let up_actor_id = up_down_ids.0.to_string();
         let up_fragment_id = up_down_frag.0.to_string();
         let down_fragment_id = up_down_frag.1.to_string();
+        let exchange_frag_recv_size_metrics = metrics
+            .exchange_frag_recv_size
+            .with_guarded_label_values(&[&up_fragment_id, &down_fragment_id]);
 
-        let span: await_tree::Span = format!("RemoteInput (actor {up_actor_id})").into();
+        let span = await_tree::span!("RemoteInput (actor {up_actor_id})").verbose();
 
         let mut batched_permits_accumulated = 0;
 
         pin_mut!(stream);
-        while let Some(data_res) = stream.next().verbose_instrument_await(span.clone()).await {
+        while let Some(data_res) = stream.next().instrument_await(span.clone()).await {
             match data_res {
                 Ok(GetStreamResponse { message, permits }) => {
+                    use crate::executor::DispatcherMessageBatch;
                     let msg = message.unwrap();
-                    let bytes = Message::get_encoded_len(&msg);
+                    let bytes = DispatcherMessageBatch::get_encoded_len(&msg);
 
-                    metrics
-                        .exchange_frag_recv_size
-                        .with_label_values(&[&up_fragment_id, &down_fragment_id])
-                        .inc_by(bytes as u64);
+                    exchange_frag_recv_size_metrics.inc_by(bytes as u64);
 
-                    let msg_res = Message::from_protobuf(&msg);
+                    let msg_res = DispatcherMessageBatch::from_protobuf(&msg);
                     if let Some(add_back_permits) = match permits.unwrap().value {
                         // For records, batch the permits we received to reduce the backward
                         // `AddPermits` messages.
@@ -191,22 +320,30 @@ impl RemoteInput {
                     }
 
                     let msg = msg_res.context("RemoteInput decode message error")?;
-                    yield msg;
+                    match msg.into_messages() {
+                        Either::Left(barriers) => {
+                            for b in barriers {
+                                yield b;
+                            }
+                        }
+                        Either::Right(m) => {
+                            yield m;
+                        }
+                    }
                 }
-                Err(e) => {
-                    // TODO(error-handling): maintain the source chain
-                    return Err(StreamExecutorError::channel_closed(format!(
-                        "RemoteInput tonic error: {}",
-                        TonicStatusWrapper::from(e).as_report()
-                    )));
-                }
+
+                Err(e) => Err(ExchangeChannelClosed::remote_input(up_down_ids.0, Some(e)))?,
             }
         }
+
+        // Always emit an error outside the loop. This is because we use barrier as the control
+        // message to stop the stream. Reaching here means the channel is closed unexpectedly.
+        Err(ExchangeChannelClosed::remote_input(up_down_ids.0, None))?
     }
 }
 
 impl Stream for RemoteInput {
-    type Item = MessageStreamItem;
+    type Item = DispatcherMessageStreamItem;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
@@ -214,43 +351,55 @@ impl Stream for RemoteInput {
 }
 
 impl Input for RemoteInput {
-    fn actor_id(&self) -> ActorId {
+    type InputId = ActorId;
+
+    fn id(&self) -> Self::InputId {
         self.actor_id
     }
 }
 
 /// Create a [`LocalInput`] or [`RemoteInput`] instance with given info. Used by merge executors and
 /// receiver executors.
-pub(crate) fn new_input(
-    context: &SharedContext,
+pub(crate) async fn new_input(
+    local_barrier_manager: &LocalBarrierManager,
     metrics: Arc<StreamingMetrics>,
     actor_id: ActorId,
     fragment_id: FragmentId,
-    upstream_actor_id: ActorId,
+    upstream_actor_info: &ActorInfo,
     upstream_fragment_id: FragmentId,
-) -> StreamResult<BoxedInput> {
-    let upstream_addr = context
-        .get_actor_info(&upstream_actor_id)?
-        .get_host()?
-        .into();
+) -> StreamExecutorResult<BoxedActorInput> {
+    let upstream_actor_id = upstream_actor_info.actor_id;
+    let upstream_addr = upstream_actor_info.get_host()?.into();
 
-    let input = if is_local_address(&context.addr, &upstream_addr) {
+    let input = if is_local_address(local_barrier_manager.env.server_address(), &upstream_addr) {
         LocalInput::new(
-            context.take_receiver(&(upstream_actor_id, actor_id))?,
+            local_barrier_manager.register_local_upstream_output(actor_id, upstream_actor_id),
             upstream_actor_id,
         )
         .boxed_input()
     } else {
         RemoteInput::new(
-            context.compute_client_pool.clone(),
+            local_barrier_manager,
             upstream_addr,
             (upstream_actor_id, actor_id),
             (upstream_fragment_id, fragment_id),
             metrics,
-            context.config.developer.exchange_batched_permits,
         )
+        .await?
         .boxed_input()
     };
 
     Ok(input)
+}
+
+impl DispatcherMessageBatch {
+    fn into_messages(self) -> Either<impl Iterator<Item = DispatcherMessage>, DispatcherMessage> {
+        match self {
+            DispatcherMessageBatch::BarrierBatch(barriers) => {
+                Either::Left(barriers.into_iter().map(DispatcherMessage::Barrier))
+            }
+            DispatcherMessageBatch::Chunk(c) => Either::Right(DispatcherMessage::Chunk(c)),
+            DispatcherMessageBatch::Watermark(w) => Either::Right(DispatcherMessage::Watermark(w)),
+        }
+    }
 }

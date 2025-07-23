@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use bytes::{Buf, BufMut};
 use itertools::Itertools;
 use risingwave_common::must_match;
 use risingwave_hummock_sdk::key::{FullKey, UserKeyRangeRef};
-use xorf::{Filter, Xor16, Xor8};
+use xorf::{Filter, Xor8, Xor16};
 
 use super::{FilterBuilder, Sstable};
 use crate::hummock::{BlockMeta, MemoryLimiter};
@@ -442,26 +442,32 @@ impl Clone for XorFilterReader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use foyer::Hint;
     use rand::RngCore;
-    use risingwave_common::cache::CachePriority;
+    use risingwave_common::hash::VirtualNode;
+    use risingwave_common::util::epoch::test_epoch;
     use risingwave_hummock_sdk::EpochWithGap;
 
     use super::*;
-    use crate::filter_key_extractor::{FilterKeyExtractorImpl, FullKeyFilterKeyExtractor};
+    use crate::compaction_catalog_manager::{
+        CompactionCatalogAgent, FilterKeyExtractorImpl, FullKeyFilterKeyExtractor,
+    };
     use crate::hummock::iterator::test_utils::mock_sstable_store;
     use crate::hummock::sstable::{SstableBuilder, SstableBuilderOptions};
-    use crate::hummock::test_utils::{test_user_key_of, test_value_of, TEST_KEYS_COUNT};
+    use crate::hummock::test_utils::{TEST_KEYS_COUNT, test_user_key_of, test_value_of};
     use crate::hummock::value::HummockValue;
-    use crate::hummock::{BlockIterator, CachePolicy, Sstable, SstableWriterOptions};
+    use crate::hummock::{BlockIterator, CachePolicy, SstableWriterOptions};
     use crate::monitor::StoreLocalStatistic;
 
     #[tokio::test]
     async fn test_blocked_bloom_filter() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         let writer_opts = SstableWriterOptions {
             capacity_hint: None,
             tracker: None,
-            policy: CachePolicy::Fill(CachePriority::High),
+            policy: CachePolicy::Fill(Hint::Normal),
         };
         let opts = SstableBuilderOptions {
             capacity: 0,
@@ -474,19 +480,28 @@ mod tests {
         let writer = sstable_store
             .clone()
             .create_sst_writer(object_id, writer_opts);
+
+        let table_id_to_vnode = HashMap::from_iter(vec![(0, VirtualNode::COUNT_FOR_TEST)]);
+        let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+        let compaction_catalog_agent_ref = Arc::new(CompactionCatalogAgent::new(
+            FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor),
+            table_id_to_vnode,
+            table_id_to_watermark_serde,
+        ));
+
         let mut builder = SstableBuilder::new(
             object_id,
             writer,
             BlockedXor16FilterBuilder::create(0.01, 2048),
             opts,
-            Arc::new(FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor)),
+            compaction_catalog_agent_ref,
             None,
         );
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for i in 0..TEST_KEYS_COUNT {
             let epoch_count = rng.next_u64() % 20;
             for j in 0..epoch_count {
-                let epoch = 20 - j;
+                let epoch = test_epoch(20 - j);
                 let k = FullKey {
                     user_key: test_user_key_of(i),
                     epoch_with_gap: EpochWithGap::new_from_epoch(epoch),
@@ -503,15 +518,10 @@ mod tests {
             .await
             .unwrap();
         let mut stat = StoreLocalStatistic::default();
-        if let XorFilter::BlockXor16(reader) = &sstable.value().filter_reader.filter {
-            for idx in 0..sstable.value().meta.block_metas.len() {
+        if let XorFilter::BlockXor16(reader) = &sstable.filter_reader.filter {
+            for idx in 0..sstable.meta.block_metas.len() {
                 let resp = sstable_store
-                    .get_block_response(
-                        sstable.value(),
-                        idx,
-                        CachePolicy::Fill(CachePriority::High),
-                        &mut stat,
-                    )
+                    .get_block_response(&sstable, idx, CachePolicy::Fill(Hint::Normal), &mut stat)
                     .await
                     .unwrap();
                 let block = resp.wait().await.unwrap();

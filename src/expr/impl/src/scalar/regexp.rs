@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use fancy_regex::{Regex, RegexBuilder};
 use risingwave_common::array::{ArrayBuilder, ListValue, Utf8Array, Utf8ArrayBuilder};
-use risingwave_expr::{bail, function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, bail, function};
 use thiserror_ext::AsReport;
 
 #[derive(Debug)]
@@ -35,7 +35,7 @@ impl RegexpContext {
         let origin = if options.case_insensitive {
             format!("(?i:{})", pattern)
         } else {
-            pattern.to_string()
+            pattern.to_owned()
         };
 
         Ok(Self {
@@ -192,7 +192,7 @@ fn regexp_count(text: &str, start: i32, regex: &RegexpContext) -> Result<i32> {
             return Err(ExprError::InvalidParam {
                 name: "start",
                 reason: start.to_string().into(),
-            })
+            });
         }
         _ => start as usize - 1,
     };
@@ -276,7 +276,7 @@ fn regexp_replace(
             return Err(ExprError::InvalidParam {
                 name: "start",
                 reason: start.to_string().into(),
-            })
+            });
         }
         _ => start as usize - 1,
     };
@@ -348,7 +348,7 @@ fn regexp_replace(
         let mut ret = if start > 1 {
             text[..start].to_string()
         } else {
-            "".to_string()
+            "".to_owned()
         };
 
         // See if there is capture group or not
@@ -389,7 +389,7 @@ fn regexp_replace(
         } else {
             // There are capture groups in the regex
             // Reset return string at the beginning
-            ret = "".to_string();
+            ret = "".to_owned();
             if let Some(n) = n {
                 // Replace only the N-th match
                 let mut count = 1;

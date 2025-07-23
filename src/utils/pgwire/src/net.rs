@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -74,11 +74,18 @@ impl Listener {
     /// Accepts a new incoming connection from this listener.
     ///
     /// Returns a tuple of the stream and the string representation of the peer address.
-    pub async fn accept(&self) -> io::Result<(Stream, Address)> {
+    pub async fn accept(&self, tcp_keepalive: &TcpKeepalive) -> io::Result<(Stream, Address)> {
         match self {
             Self::Tcp(listener) => {
                 let (stream, addr) = listener.accept().await?;
                 stream.set_nodelay(true)?;
+                // Set TCP keepalive to 5 minutes, which is less than the connection idle timeout of 350 seconds in AWS ELB.
+                // https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html#connection-idle-timeout
+                #[cfg(not(madsim))]
+                {
+                    let r = socket2::SockRef::from(&stream);
+                    r.set_tcp_keepalive(tcp_keepalive)?;
+                }
                 Ok((Stream::Tcp(stream), Address::Tcp(addr)))
             }
             Self::Unix(listener) => {
@@ -88,3 +95,5 @@ impl Listener {
         }
     }
 }
+
+pub use socket2::TcpKeepalive;

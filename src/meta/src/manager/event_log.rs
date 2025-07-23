@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use parking_lot::RwLock;
-use risingwave_pb::meta::event_log::{Event as PbEvent, Event};
 use risingwave_pb::meta::EventLog as PbEventLog;
+use risingwave_pb::meta::event_log::{Event as PbEvent, Event};
 use tokio::task::JoinHandle;
 
-pub type EventLogMangerRef = Arc<EventLogManger>;
+pub type EventLogManagerRef = Arc<EventLogManger>;
 type EventLogSender = tokio::sync::mpsc::Sender<EventLog>;
 type ShutdownSender = tokio::sync::oneshot::Sender<()>;
 
@@ -171,6 +171,9 @@ impl From<&EventLog> for ChannelId {
             Event::InjectBarrierFail(_) => 5,
             Event::CollectBarrierFail(_) => 6,
             Event::WorkerNodePanic(_) => 7,
+            Event::AutoSchemaChangeFail(_) => 8,
+            Event::SinkFail(_) => 9,
+            Event::Recovery(_) => 10,
         }
     }
 }

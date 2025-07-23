@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use super::{ExecuteContext, Task};
+use crate::util::stylized_risedev_subcmd;
 use crate::{PrometheusConfig, PrometheusGen};
 
 pub struct PrometheusService {
@@ -57,7 +58,11 @@ impl Task for PrometheusService {
 
         let path = self.prometheus_path()?;
         if !path.exists() {
-            return Err(anyhow!("prometheus binary not found in {:?}\nDid you enable monitoring feature in `./risedev configure`?", path));
+            return Err(anyhow!(
+                "prometheus binary not found in {:?}\nDid you enable monitoring feature in `{}`?",
+                path,
+                stylized_risedev_subcmd("configure")
+            ));
         }
 
         let prefix_config = env::var("PREFIX_CONFIG")?;

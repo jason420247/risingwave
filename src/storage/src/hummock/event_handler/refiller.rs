@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,36 +13,35 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::{Deref, DerefMut, Range};
-use std::pin::Pin;
+use std::future::poll_fn;
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
-use std::task::{ready, Context, Poll};
+use std::task::{Poll, ready};
 use std::time::{Duration, Instant};
 
-use foyer::common::code::Key;
-use foyer::common::range::RangeBoundsExt;
+use foyer::{HybridCacheEntry, RangeBoundsExt};
 use futures::future::{join_all, try_join_all};
 use futures::{Future, FutureExt};
 use itertools::Itertools;
 use prometheus::core::{AtomicU64, GenericCounter, GenericCounterVec};
 use prometheus::{
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_gauge_with_registry, Histogram, HistogramVec, IntGauge, Registry,
+    Histogram, HistogramVec, IntGauge, Registry, register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry, register_int_gauge_with_registry,
 };
+use risingwave_common::license::Feature;
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
-use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::SstDeltaInfo;
 use risingwave_hummock_sdk::{HummockSstableObjectId, KeyComparator};
+use thiserror_ext::AsReport;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::hummock::file_cache::preclude::*;
 use crate::hummock::local_version::pinned_version::PinnedVersion;
 use crate::hummock::{
-    CachedBlock, FileCacheCompression, HummockError, HummockResult, Sstable, SstableBlockIndex,
-    SstableStoreRef, TableHolder,
+    Block, HummockError, HummockResult, Sstable, SstableBlockIndex, SstableStoreRef, TableHolder,
 };
 use crate::monitor::StoreLocalStatistic;
+use crate::opts::StorageOpts;
 
 pub static GLOBAL_CACHE_REFILL_METRICS: LazyLock<CacheRefillMetrics> =
     LazyLock::new(|| CacheRefillMetrics::new(&GLOBAL_METRICS_REGISTRY));
@@ -200,21 +199,59 @@ pub struct CacheRefillConfig {
     pub threshold: f64,
 }
 
+impl CacheRefillConfig {
+    pub fn from_storage_opts(options: &StorageOpts) -> Self {
+        let data_refill_levels = match Feature::ElasticDiskCache.check_available() {
+            Ok(_) => options
+                .cache_refill_data_refill_levels
+                .iter()
+                .copied()
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e.as_report(), "ElasticDiskCache is not available.");
+                HashSet::new()
+            }
+        };
+
+        Self {
+            timeout: Duration::from_millis(options.cache_refill_timeout_ms),
+            data_refill_levels,
+            concurrency: options.cache_refill_concurrency,
+            unit: options.cache_refill_unit,
+            threshold: options.cache_refill_threshold,
+        }
+    }
+}
+
 struct Item {
     handle: JoinHandle<()>,
     event: CacheRefillerEvent,
 }
 
+pub(crate) type SpawnRefillTask = Arc<
+    // first current version, second new version
+    dyn Fn(Vec<SstDeltaInfo>, CacheRefillContext, PinnedVersion, PinnedVersion) -> JoinHandle<()>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 /// A cache refiller for hummock data.
-pub struct CacheRefiller {
+pub(crate) struct CacheRefiller {
     /// order: old => new
     queue: VecDeque<Item>,
 
     context: CacheRefillContext,
+
+    spawn_refill_task: SpawnRefillTask,
 }
 
 impl CacheRefiller {
-    pub fn new(config: CacheRefillConfig, sstable_store: SstableStoreRef) -> Self {
+    pub(crate) fn new(
+        config: CacheRefillConfig,
+        sstable_store: SstableStoreRef,
+        spawn_refill_task: SpawnRefillTask,
+    ) -> Self {
         let config = Arc::new(config);
         let concurrency = Arc::new(Semaphore::new(config.concurrency));
         Self {
@@ -224,71 +261,70 @@ impl CacheRefiller {
                 concurrency,
                 sstable_store,
             },
+            spawn_refill_task,
         }
     }
 
-    pub fn start_cache_refill(
+    pub(crate) fn default_spawn_refill_task() -> SpawnRefillTask {
+        Arc::new(|deltas, context, _, _| {
+            let task = CacheRefillTask { deltas, context };
+            tokio::spawn(task.run())
+        })
+    }
+
+    pub(crate) fn start_cache_refill(
         &mut self,
         deltas: Vec<SstDeltaInfo>,
-        pinned_version: Arc<PinnedVersion>,
+        pinned_version: PinnedVersion,
         new_pinned_version: PinnedVersion,
     ) {
-        let task = CacheRefillTask {
+        let handle = (self.spawn_refill_task)(
             deltas,
-            context: self.context.clone(),
-        };
+            self.context.clone(),
+            pinned_version.clone(),
+            new_pinned_version.clone(),
+        );
         let event = CacheRefillerEvent {
             pinned_version,
             new_pinned_version,
         };
-        let handle = tokio::spawn(task.run());
         let item = Item { handle, event };
         self.queue.push_back(item);
         GLOBAL_CACHE_REFILL_METRICS.refill_queue_total.add(1);
     }
 
-    pub fn last_new_pinned_version(&self) -> Option<&PinnedVersion> {
+    pub(crate) fn last_new_pinned_version(&self) -> Option<&PinnedVersion> {
         self.queue.back().map(|item| &item.event.new_pinned_version)
     }
-
-    pub fn next_event(&mut self) -> NextCacheRefillerEvent<'_> {
-        NextCacheRefillerEvent { refiller: self }
-    }
 }
 
-pub struct NextCacheRefillerEvent<'a> {
-    refiller: &'a mut CacheRefiller,
-}
-
-impl<'a> Future for NextCacheRefillerEvent<'a> {
-    type Output = CacheRefillerEvent;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let refiller = &mut self.deref_mut().refiller;
-
-        if let Some(item) = refiller.queue.front_mut() {
-            ready!(item.handle.poll_unpin(cx)).unwrap();
-            let item = refiller.queue.pop_front().unwrap();
-            GLOBAL_CACHE_REFILL_METRICS.refill_queue_total.sub(1);
-            return Poll::Ready(item.event);
-        }
-        Poll::Pending
+impl CacheRefiller {
+    pub(crate) fn next_event(&mut self) -> impl Future<Output = CacheRefillerEvent> + '_ {
+        poll_fn(|cx| {
+            if let Some(item) = self.queue.front_mut() {
+                ready!(item.handle.poll_unpin(cx)).unwrap();
+                let item = self.queue.pop_front().unwrap();
+                GLOBAL_CACHE_REFILL_METRICS.refill_queue_total.sub(1);
+                return Poll::Ready(item.event);
+            }
+            Poll::Pending
+        })
     }
 }
 
 pub struct CacheRefillerEvent {
-    pub pinned_version: Arc<PinnedVersion>,
+    pub pinned_version: PinnedVersion,
     pub new_pinned_version: PinnedVersion,
 }
 
 #[derive(Clone)]
-struct CacheRefillContext {
+pub(crate) struct CacheRefillContext {
     config: Arc<CacheRefillConfig>,
     concurrency: Arc<Semaphore>,
     sstable_store: SstableStoreRef,
 }
 
-pub struct CacheRefillTask {
+struct CacheRefillTask {
     deltas: Vec<SstDeltaInfo>,
     context: CacheRefillContext,
 }
@@ -304,7 +340,7 @@ impl CacheRefillTask {
                     let holders = match Self::meta_cache_refill(&context, delta).await {
                         Ok(holders) => holders,
                         Err(e) => {
-                            tracing::warn!("meta cache refill error: {:?}", e);
+                            tracing::warn!(error = %e.as_report(), "meta cache refill error");
                             return;
                         }
                     };
@@ -330,6 +366,7 @@ impl CacheRefillTask {
 
                 let now = Instant::now();
                 let res = context.sstable_store.sstable(info, &mut stats).await;
+                stats.discard();
                 GLOBAL_CACHE_REFILL_METRICS
                     .meta_refill_success_duration
                     .observe(now.elapsed().as_secs_f64());
@@ -344,7 +381,7 @@ impl CacheRefillTask {
     fn get_units_to_refill_by_inheritance(
         context: &CacheRefillContext,
         ssts: &[TableHolder],
-        parent_ssts: &[impl Deref<Target = Sstable>],
+        parent_ssts: impl IntoIterator<Item = HybridCacheEntry<HummockSstableObjectId, Box<Sstable>>>,
     ) -> HashSet<SstableUnit> {
         let mut res = HashSet::default();
 
@@ -421,20 +458,26 @@ impl CacheRefillTask {
         res
     }
 
+    /// Data cache refill entry point.
     async fn data_cache_refill(
         context: &CacheRefillContext,
         delta: &SstDeltaInfo,
         holders: Vec<TableHolder>,
     ) {
-        // return if data file cache is disabled
-        let Some(filter) = context.sstable_store.data_recent_filter() else {
+        // Skip data cache refill if data disk cache is not enabled.
+        if !context.sstable_store.block_cache().is_hybrid() {
             return;
-        };
+        }
 
         // return if no data to refill
         if delta.insert_sst_infos.is_empty() || delta.delete_sst_object_ids.is_empty() {
             return;
         }
+
+        // return if data file cache is disabled
+        let Some(filter) = context.sstable_store.data_recent_filter() else {
+            return;
+        };
 
         // return if recent filter miss
         if !context
@@ -513,10 +556,12 @@ impl CacheRefillTask {
             }
         });
         let parent_ssts = match try_join_all(futures).await {
-            Ok(parent_ssts) => parent_ssts.into_iter().flatten().collect_vec(),
-            Err(e) => return tracing::error!("get old meta from cache error: {}", e),
+            Ok(parent_ssts) => parent_ssts.into_iter().flatten(),
+            Err(e) => {
+                return tracing::error!(error = %e.as_report(), "get old meta from cache error");
+            }
         };
-        let units = Self::get_units_to_refill_by_inheritance(context, &holders, &parent_ssts);
+        let units = Self::get_units_to_refill_by_inheritance(context, &holders, parent_ssts);
 
         let ssts: HashMap<HummockSstableObjectId, TableHolder> =
             holders.into_iter().map(|meta| (meta.id, meta)).collect();
@@ -525,7 +570,7 @@ impl CacheRefillTask {
             async move {
                 let sst = ssts.get(&unit.sst_obj_id).unwrap();
                 if let Err(e) = Self::data_file_cache_refill_unit(context, sst, unit).await {
-                    tracing::error!("data file cache unit refill error: {}", e);
+                    tracing::error!(error = %e.as_report(), "data file cache unit refill error");
                 }
             }
         });
@@ -548,8 +593,7 @@ impl CacheRefillTask {
         let blocks = unit.blks.size().unwrap();
 
         let mut tasks = vec![];
-        let mut writers = Vec::with_capacity(blocks);
-        let mut ranges = Vec::with_capacity(blocks);
+        let mut contexts = Vec::with_capacity(blocks);
         let mut admits = 0;
 
         let (range_first, _) = sst.calculate_block_info(unit.blks.start);
@@ -561,25 +605,22 @@ impl CacheRefillTask {
             .inc_by(range.size().unwrap() as u64);
 
         for blk in unit.blks {
-            let (range, _uncompressed_capacity) = sst.calculate_block_info(blk);
+            let (range, uncompressed_capacity) = sst.calculate_block_info(blk);
             let key = SstableBlockIndex {
                 sst_id: sst.id,
                 block_idx: blk as u64,
             };
-            // see `CachedBlock::serialized_len()`
-            let mut writer = sstable_store
-                .data_file_cache()
-                .writer(key, key.serialized_len() + 1 + 8 + range.size().unwrap());
 
-            if writer.judge() {
+            let mut writer = sstable_store.block_cache().storage_writer(key);
+
+            if writer.pick().admitted() {
                 admits += 1;
             }
 
-            writers.push(writer);
-            ranges.push(range);
+            contexts.push((writer, range, uncompressed_capacity))
         }
 
-        if admits as f64 / writers.len() as f64 >= threshold {
+        if admits as f64 / contexts.len() as f64 >= threshold {
             let task = async move {
                 GLOBAL_CACHE_REFILL_METRICS.data_refill_attempts_total.inc();
 
@@ -596,23 +637,14 @@ impl CacheRefillTask {
                     .read(&sstable_store.get_sst_data_path(sst.id), range.clone())
                     .await?;
                 let mut futures = vec![];
-                for (mut writer, r) in writers.into_iter().zip_eq_fast(ranges) {
+                for (w, r, uc) in contexts {
                     let offset = r.start - range.start;
                     let len = r.end - r.start;
                     let bytes = data.slice(offset..offset + len);
-
                     let future = async move {
-                        let value = CachedBlock::Fetched {
-                            bytes,
-                            uncompressed_capacity: writer.weight() - writer.key().serialized_len(),
-                        };
-
-                        writer.force();
-                        // TODO(MrCroxx): compress if raw is not compressed?
-                        // skip compression for it may already be compressed.
-                        writer.set_compression(FileCacheCompression::None);
-                        let res = writer.finish(value).await.map_err(HummockError::file_cache);
-                        if matches!(res, Ok(true)) {
+                        let value = Box::new(Block::decode(bytes, uc)?);
+                        // The entry should always be `Some(..)`, use if here for compatible.
+                        if let Some(_entry) = w.force().insert(value) {
                             GLOBAL_CACHE_REFILL_METRICS
                                 .data_refill_success_bytes
                                 .inc_by(len as u64);
@@ -620,7 +652,7 @@ impl CacheRefillTask {
                                 .data_refill_block_success_total
                                 .inc();
                         }
-                        res
+                        Ok::<_, HummockError>(())
                     };
                     futures.push(future);
                 }

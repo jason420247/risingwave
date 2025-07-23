@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use risingwave_common::array::Op;
-use risingwave_common::estimate_size::EstimateSize;
 use risingwave_common::row::{OwnedRow, Row, RowExt};
 use risingwave_common::types::{DefaultOrdered, ScalarRefImpl};
+use risingwave_common_estimate_size::EstimateSize;
 
-use crate::common::cache::{StateCache, TopNStateCache};
+use crate::common::state_cache::{StateCache, TopNStateCache};
 
 /// The watermark cache key is just an `OwnedRow` wrapped in `DefaultOrdered`.
 /// This is because we want to use the `DefaultOrdered` implementation of `Ord`.
@@ -125,7 +125,7 @@ impl StateTableWatermarkCache {
     }
 
     pub fn capacity(&self) -> usize {
-        self.inner.capacity_inner()
+        self.inner.capacity()
     }
 
     pub fn len(&self) -> usize {
@@ -186,7 +186,7 @@ mod tests {
     use risingwave_common::types::{Scalar, Timestamptz};
 
     use super::*;
-    use crate::common::cache::StateCacheFiller;
+    use crate::common::state_cache::StateCacheFiller;
 
     /// With capacity 3, test the following sequence of inserts:
     /// Insert
@@ -453,23 +453,23 @@ mod tests {
 
     #[test]
     fn test_watermark_cache_syncing() {
-        let v1 = vec![
+        let v1 = [
             Some(Timestamptz::from_secs(1000).unwrap().to_scalar_value()),
             Some(1000i64.into()),
         ];
-        let v2 = vec![
+        let v2 = [
             Some(Timestamptz::from_secs(3000).unwrap().to_scalar_value()),
             Some(1000i64.into()),
         ];
-        let v3 = vec![
+        let v3 = [
             Some(Timestamptz::from_secs(2000).unwrap().to_scalar_value()),
             Some(1000i64.into()),
         ];
         let mut cache = StateTableWatermarkCache::new(3);
         let mut filler = cache.begin_syncing();
-        filler.insert_unchecked(DefaultOrdered(v1.into_owned_row()), ());
-        filler.insert_unchecked(DefaultOrdered(v2.into_owned_row()), ());
-        filler.insert_unchecked(DefaultOrdered(v3.into_owned_row()), ());
+        filler.insert_unchecked(DefaultOrdered(v1.to_owned_row()), ());
+        filler.insert_unchecked(DefaultOrdered(v2.to_owned_row()), ());
+        filler.insert_unchecked(DefaultOrdered(v3.to_owned_row()), ());
         filler.finish();
         assert_eq!(cache.len(), 3);
         assert_eq!(

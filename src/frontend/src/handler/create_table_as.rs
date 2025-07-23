@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
+
 use either::Either;
 use pgwire::pg_response::StatementType;
 use risingwave_common::catalog::{ColumnCatalog, ColumnDesc};
-use risingwave_common::error::{ErrorCode, Result};
 use risingwave_pb::ddl_service::TableJobType;
-use risingwave_pb::stream_plan::stream_fragment_graph::Parallelism;
-use risingwave_sqlparser::ast::{ColumnDef, ObjectName, Query, Statement};
+use risingwave_sqlparser::ast::{ColumnDef, ObjectName, OnConflict, Query, Statement};
 
 use super::{HandlerArgs, RwPgResponse};
 use crate::binder::BoundStatement;
-use crate::handler::create_table::{gen_create_table_plan_without_bind, ColumnIdGenerator};
+use crate::error::{ErrorCode, Result};
+use crate::handler::create_table::{
+    ColumnIdGenerator, CreateTableProps, gen_create_table_plan_without_source,
+};
 use crate::handler::query::handle_query;
-use crate::{build_graph, Binder, OptimizerContext};
+use crate::stream_fragmenter::GraphJobType;
+use crate::{Binder, OptimizerContext, build_graph};
 
 pub async fn handle_create_as(
     handler_args: HandlerArgs,
@@ -33,6 +37,9 @@ pub async fn handle_create_as(
     query: Box<Query>,
     column_defs: Vec<ColumnDef>,
     append_only: bool,
+    on_conflict: Option<OnConflict>,
+    with_version_column: Option<String>,
+    ast_engine: risingwave_sqlparser::ast::Engine,
 ) -> Result<RwPgResponse> {
     if column_defs.iter().any(|column| column.data_type.is_some()) {
         return Err(ErrorCode::InvalidInputSyntax(
@@ -40,6 +47,11 @@ pub async fn handle_create_as(
         )
         .into());
     }
+    let engine = match ast_engine {
+        risingwave_sqlparser::ast::Engine::Hummock => risingwave_common::catalog::Engine::Hummock,
+        risingwave_sqlparser::ast::Engine::Iceberg => risingwave_common::catalog::Engine::Iceberg,
+    };
+
     let session = handler_args.session.clone();
 
     if let Either::Right(resp) = session.check_relation_name_duplicated(
@@ -62,12 +74,9 @@ pub async fn handle_create_as(
                 .schema()
                 .fields()
                 .iter()
-                .map(|field| {
-                    let id = col_id_gen.generate(&field.name);
-                    ColumnCatalog {
-                        column_desc: ColumnDesc::from_field_with_column_id(field, id.get_id()),
-                        is_hidden: false,
-                    }
+                .map(|field| ColumnCatalog {
+                    column_desc: ColumnDesc::from_field_without_column_id(field),
+                    is_hidden: false,
                 })
                 .collect()
         } else {
@@ -75,9 +84,14 @@ pub async fn handle_create_as(
         }
     };
 
+    // Generate column id.
+    for c in &mut columns {
+        col_id_gen.generate(c)?;
+    }
+
     if column_defs.len() > columns.len() {
         return Err(ErrorCode::InvalidInputSyntax(
-            "too many column names were specified".to_string(),
+            "too many column names were specified".to_owned(),
         )
         .into());
     }
@@ -89,33 +103,35 @@ pub async fn handle_create_as(
 
     let (graph, source, table) = {
         let context = OptimizerContext::from_handler_args(handler_args.clone());
-        let properties = handler_args
-            .with_options
-            .inner()
-            .clone()
-            .into_iter()
-            .collect();
-        let (plan, source, table) = gen_create_table_plan_without_bind(
+        let (_, secret_refs, connection_refs) = context.with_options().clone().into_parts();
+        if !secret_refs.is_empty() || !connection_refs.is_empty() {
+            return Err(crate::error::ErrorCode::InvalidParameterValue(
+                "Secret reference and Connection reference are not allowed in options for CREATE TABLE AS".to_owned(),
+            )
+            .into());
+        }
+        let (plan, table) = gen_create_table_plan_without_source(
             context,
             table_name.clone(),
             columns,
             vec![],
             vec![],
-            properties,
-            "".to_owned(), // TODO: support `SHOW CREATE TABLE` for `CREATE TABLE AS`
-            vec![],        // No watermark should be defined in for `CREATE TABLE AS`
-            append_only,
-            Some(col_id_gen.into_version()),
+            vec![], // No watermark should be defined in for `CREATE TABLE AS`
+            col_id_gen.into_version(),
+            CreateTableProps {
+                // Note: by providing and persisting an empty definition, querying the definition of the table
+                // will hit the purification logic, which will construct it based on the catalog.
+                definition: "".to_owned(),
+                append_only,
+                on_conflict: on_conflict.into(),
+                with_version_column,
+                webhook_info: None,
+                engine,
+            },
         )?;
-        let mut graph = build_graph(plan);
-        graph.parallelism =
-            session
-                .config()
-                .streaming_parallelism()
-                .map(|parallelism| Parallelism {
-                    parallelism: parallelism.get(),
-                });
-        (graph, source, table)
+        let graph = build_graph(plan, Some(GraphJobType::Table))?;
+
+        (graph, None, table)
     };
 
     tracing::trace!(
@@ -126,7 +142,14 @@ pub async fn handle_create_as(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .create_table(source, table, graph, TableJobType::Unspecified)
+        .create_table(
+            source,
+            table.to_prost(),
+            graph,
+            TableJobType::Unspecified,
+            if_not_exists,
+            HashSet::default(),
+        )
         .await?;
 
     // Generate insert

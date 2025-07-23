@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ impl FunctionCallWithLambda {
         lambda_arg: ExprImpl,
         return_type: DataType,
     ) -> Self {
-        assert!([ExprType::ArrayTransform].contains(&func_type));
+        assert!([ExprType::ArrayTransform, ExprType::MapFilter].contains(&func_type));
         Self {
             base: FunctionCall::new_unchecked(func_type, inputs, return_type),
             lambda_arg,

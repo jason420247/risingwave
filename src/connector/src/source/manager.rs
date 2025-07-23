@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,29 +15,34 @@
 use std::fmt::Debug;
 
 use risingwave_common::catalog::{
-    ColumnDesc, ColumnId, KAFKA_TIMESTAMP_COLUMN_NAME, OFFSET_COLUMN_NAME, ROWID_PREFIX,
-    TABLE_NAME_COLUMN_NAME,
+    CDC_OFFSET_COLUMN_NAME, CDC_TABLE_NAME_COLUMN_NAME, ColumnDesc, ColumnId,
+    KAFKA_TIMESTAMP_COLUMN_NAME, ROW_ID_COLUMN_ID, ROW_ID_COLUMN_NAME,
 };
 use risingwave_common::types::DataType;
-use risingwave_pb::plan_common::{AdditionalColumnType, ColumnDescVersion};
+use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
+use risingwave_pb::plan_common::{AdditionalColumn, ColumnDescVersion};
 
-/// `SourceColumnDesc` is used to describe a column in the Source and is used as the column
-/// counterpart in `StreamScan`
+/// `SourceColumnDesc` is used to describe a column in the Source.
+///
+/// See the implementation of `From<&ColumnDesc>` for the difference between `SourceColumnDesc` and [`ColumnDesc`].
 #[derive(Clone, Debug)]
 pub struct SourceColumnDesc {
     pub name: String,
     pub data_type: DataType,
     pub column_id: ColumnId,
-    pub fields: Vec<ColumnDesc>,
+    /// `additional_column` and `column_type` are orthogonal
+    /// `additional_column` is used to indicate the column is from which part of the message
+    /// `column_type` is used to indicate the type of the column, only used in cdc scenario
+    pub additional_column: AdditionalColumn,
+    // ------
+    // Fields above are the same in `ColumnDesc`.
+    // Fields below are specific to `SourceColumnDesc`.
+    // ------
     pub column_type: SourceColumnType,
-
-    // `is_pk` is used to indicate whether the column is part of the primary key columns.
+    /// `is_pk` is used to indicate whether the column is part of the primary key columns.
     pub is_pk: bool,
-
-    // `additional_column_type` and `column_type` are orthogonal
-    // `additional_column_type` is used to indicate the column is from which part of the message
-    // `column_type` is used to indicate the type of the column, only used in cdc scenario
-    pub additional_column_type: AdditionalColumnType,
+    /// `is_hidden_addition_col` is used to indicate whether the column is a hidden addition column.
+    pub is_hidden_addition_col: bool,
 }
 
 /// `SourceColumnType` is used to indicate the type of a column emitted by the Source.
@@ -58,12 +63,13 @@ pub enum SourceColumnType {
 
 impl SourceColumnType {
     pub fn from_name(name: &str) -> Self {
-        if name.starts_with(KAFKA_TIMESTAMP_COLUMN_NAME) || name.starts_with(TABLE_NAME_COLUMN_NAME)
+        if name.starts_with(KAFKA_TIMESTAMP_COLUMN_NAME)
+            || name.starts_with(CDC_TABLE_NAME_COLUMN_NAME)
         {
             Self::Meta
-        } else if name == (ROWID_PREFIX) {
+        } else if name == ROW_ID_COLUMN_NAME {
             Self::RowId
-        } else if name == OFFSET_COLUMN_NAME {
+        } else if name == CDC_OFFSET_COLUMN_NAME {
             Self::Offset
         } else {
             Self::Normal
@@ -72,22 +78,25 @@ impl SourceColumnType {
 }
 
 impl SourceColumnDesc {
-    /// Create a [`SourceColumnDesc`] without composite types.
-    #[track_caller]
+    /// Create a [`SourceColumnDesc`].
+    // TODO(struct): rename to `new`?
     pub fn simple(name: impl Into<String>, data_type: DataType, column_id: ColumnId) -> Self {
-        assert!(
-            !matches!(data_type, DataType::List { .. } | DataType::Struct(..)),
-            "called `SourceColumnDesc::simple` with a composite type."
-        );
         let name = name.into();
         Self {
             name,
             data_type,
             column_id,
-            fields: vec![],
             column_type: SourceColumnType::Normal,
             is_pk: false,
-            additional_column_type: AdditionalColumnType::Normal,
+            is_hidden_addition_col: false,
+            additional_column: AdditionalColumn { column_type: None },
+        }
+    }
+
+    pub fn hidden_addition_col_from_column_desc(c: &ColumnDesc) -> Self {
+        Self {
+            is_hidden_addition_col: true,
+            ..c.into()
         }
     }
 
@@ -105,37 +114,76 @@ impl SourceColumnDesc {
 
     #[inline]
     pub fn is_visible(&self) -> bool {
-        self.column_type == SourceColumnType::Normal
+        !self.is_hidden_addition_col && self.column_type == SourceColumnType::Normal
     }
 }
 
 impl From<&ColumnDesc> for SourceColumnDesc {
-    fn from(c: &ColumnDesc) -> Self {
-        let column_type = SourceColumnType::from_name(c.name.as_str());
+    fn from(
+        ColumnDesc {
+            data_type,
+            column_id,
+            name,
+            additional_column,
+            // ignored fields below
+            generated_or_default_column,
+            description: _,
+            version: _,
+            system_column: _,
+            nullable: _,
+        }: &ColumnDesc,
+    ) -> Self {
+        if let Some(option) = generated_or_default_column {
+            debug_assert!(
+                matches!(option, GeneratedOrDefaultColumn::DefaultColumn(_)),
+                "source column should not be generated: {:?}",
+                generated_or_default_column.as_ref().unwrap()
+            )
+        }
+
+        let column_type = SourceColumnType::from_name(name);
+        if column_type == SourceColumnType::RowId {
+            debug_assert_eq!(name, ROW_ID_COLUMN_NAME);
+            debug_assert_eq!(*column_id, ROW_ID_COLUMN_ID);
+        }
+
         Self {
-            name: c.name.clone(),
-            data_type: c.data_type.clone(),
-            column_id: c.column_id,
-            fields: c.field_descs.clone(),
+            name: name.clone(),
+            data_type: data_type.clone(),
+            column_id: *column_id,
+            additional_column: additional_column.clone(),
+            // additional fields below
             column_type,
             is_pk: false,
-            additional_column_type: c.additional_column_type,
+            is_hidden_addition_col: false,
         }
     }
 }
 
 impl From<&SourceColumnDesc> for ColumnDesc {
-    fn from(s: &SourceColumnDesc) -> Self {
+    fn from(
+        SourceColumnDesc {
+            name,
+            data_type,
+            column_id,
+            additional_column,
+            // ignored fields below
+            column_type: _,
+            is_pk: _,
+            is_hidden_addition_col: _,
+        }: &SourceColumnDesc,
+    ) -> Self {
         ColumnDesc {
-            data_type: s.data_type.clone(),
-            column_id: s.column_id,
-            name: s.name.clone(),
-            field_descs: s.fields.clone(),
-            type_name: "".to_string(),
+            data_type: data_type.clone(),
+            column_id: *column_id,
+            name: name.clone(),
+            additional_column: additional_column.clone(),
+            // additional fields below
             generated_or_default_column: None,
             description: None,
-            additional_column_type: s.additional_column_type,
-            version: ColumnDescVersion::Pr13707,
+            version: ColumnDescVersion::LATEST,
+            system_column: None,
+            nullable: true,
         }
     }
 }

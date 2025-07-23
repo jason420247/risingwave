@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,42 +15,47 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
-use risingwave_common::config::MAX_CONNECTION_WINDOW_SIZE;
-use risingwave_common::monitor::connection::{EndpointExt, TcpConfig};
+use futures::TryStreamExt;
+use risingwave_common::config::{MAX_CONNECTION_WINDOW_SIZE, RpcClientConfig};
+use risingwave_common::monitor::{EndpointExt, TcpConfig};
 use risingwave_common::util::addr::HostAddr;
 use risingwave_pb::stream_service::stream_service_client::StreamServiceClient;
+use risingwave_pb::stream_service::streaming_control_stream_request::PbInitRequest;
+use risingwave_pb::stream_service::streaming_control_stream_response::InitResponse;
 use risingwave_pb::stream_service::*;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Endpoint;
 
-use crate::error::Result;
-use crate::tracing::{Channel, TracingInjectedChannelExt};
-use crate::{rpc_client_method_impl, RpcClient, RpcClientPool};
+use crate::channel::{Channel, WrappedChannelExt};
+use crate::error::{Result, RpcError};
+use crate::{RpcClient, RpcClientPool, UnboundedBidiStreamHandle, stream_rpc_client_method_impl};
 
 #[derive(Clone)]
 pub struct StreamClient(StreamServiceClient<Channel>);
 
 #[async_trait]
 impl RpcClient for StreamClient {
-    async fn new_client(host_addr: HostAddr) -> Result<Self> {
-        Self::new(host_addr).await
+    async fn new_client(host_addr: HostAddr, opts: &RpcClientConfig) -> Result<Self> {
+        Self::new(host_addr, opts).await
     }
 }
 
 impl StreamClient {
-    async fn new(host_addr: HostAddr) -> Result<Self> {
+    async fn new(host_addr: HostAddr, opts: &RpcClientConfig) -> Result<Self> {
         let channel = Endpoint::from_shared(format!("http://{}", &host_addr))?
             .initial_connection_window_size(MAX_CONNECTION_WINDOW_SIZE)
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(opts.connect_timeout_secs))
             .monitored_connect(
                 "grpc-stream-client",
                 TcpConfig {
                     tcp_nodelay: true,
-                    keepalive_duration: None,
+                    ..Default::default()
                 },
             )
             .await?
-            .tracing_injected();
+            .wrapped();
 
         Ok(Self(
             StreamServiceClient::new(channel).max_decoding_message_size(usize::MAX),
@@ -64,18 +69,46 @@ pub type StreamClientPoolRef = Arc<StreamClientPool>;
 macro_rules! for_all_stream_rpc {
     ($macro:ident) => {
         $macro! {
-             { 0, update_actors, UpdateActorsRequest, UpdateActorsResponse }
-            ,{ 0, build_actors, BuildActorsRequest, BuildActorsResponse }
-            ,{ 0, broadcast_actor_info_table, BroadcastActorInfoTableRequest, BroadcastActorInfoTableResponse }
-            ,{ 0, drop_actors, DropActorsRequest, DropActorsResponse }
-            ,{ 0, force_stop_actors, ForceStopActorsRequest, ForceStopActorsResponse}
-            ,{ 0, inject_barrier, InjectBarrierRequest, InjectBarrierResponse }
-            ,{ 0, barrier_complete, BarrierCompleteRequest, BarrierCompleteResponse }
-            ,{ 0, wait_epoch_commit, WaitEpochCommitRequest, WaitEpochCommitResponse }
+            { 0, get_min_uncommitted_object_id, GetMinUncommittedObjectIdRequest, GetMinUncommittedObjectIdResponse }
         }
     };
 }
 
 impl StreamClient {
-    for_all_stream_rpc! { rpc_client_method_impl }
+    for_all_stream_rpc! { stream_rpc_client_method_impl }
+}
+
+pub type StreamingControlHandle =
+    UnboundedBidiStreamHandle<StreamingControlStreamRequest, StreamingControlStreamResponse>;
+
+impl StreamClient {
+    pub async fn start_streaming_control(
+        &self,
+        init_request: PbInitRequest,
+    ) -> Result<StreamingControlHandle> {
+        let first_request = StreamingControlStreamRequest {
+            request: Some(streaming_control_stream_request::Request::Init(
+                init_request,
+            )),
+        };
+        let mut client = self.0.to_owned();
+        let (handle, first_rsp) =
+            UnboundedBidiStreamHandle::initialize(first_request, |rx| async move {
+                client
+                    .streaming_control_stream(UnboundedReceiverStream::new(rx))
+                    .await
+                    .map(|response| response.into_inner().map_err(RpcError::from_stream_status))
+                    .map_err(RpcError::from_stream_status)
+            })
+            .await?;
+        match first_rsp {
+            StreamingControlStreamResponse {
+                response: Some(streaming_control_stream_response::Response::Init(InitResponse {})),
+            } => {}
+            other => {
+                return Err(anyhow!("expect InitResponse but get {:?}", other).into());
+            }
+        };
+        Ok(handle)
+    }
 }

@@ -31,11 +31,11 @@ use crate::tokenizer::Tokenizer;
 
 pub fn run_parser_method<F, T: Debug + PartialEq>(sql: &str, f: F) -> T
 where
-    F: Fn(&mut Parser) -> T,
+    F: Fn(&mut Parser<'_>) -> T,
 {
     let mut tokenizer = Tokenizer::new(sql);
     let tokens = tokenizer.tokenize_with_location().unwrap();
-    f(&mut Parser::new(tokens))
+    f(&mut Parser(&tokens))
 }
 
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, ParserError> {
@@ -45,6 +45,7 @@ pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, ParserError> {
 }
 
 /// Ensures that `sql` parses as a single statement and returns it.
+///
 /// If non-empty `canonical` SQL representation is provided,
 /// additionally asserts that parsing `sql` results in the same parse
 /// tree as parsing `canonical`, and that serializing it back to string
@@ -110,10 +111,11 @@ pub fn verified_expr(sql: &str) -> Expr {
 
 pub fn only<T>(v: impl IntoIterator<Item = T>) -> T {
     let mut iter = v.into_iter();
-    if let (Some(item), None) = (iter.next(), iter.next()) {
-        item
-    } else {
-        panic!("only called on collection without exactly one item")
+    match (iter.next(), iter.next()) {
+        (Some(item), None) => item,
+        _ => {
+            panic!("only called on collection without exactly one item")
+        }
     }
 }
 
@@ -138,7 +140,7 @@ pub fn table_alias(name: impl Into<String>) -> Option<TableAlias> {
 pub fn table(name: impl Into<String>) -> TableFactor {
     TableFactor::Table {
         name: ObjectName(vec![Ident::new_unchecked(name.into())]),
-        for_system_time_as_of_proctime: false,
+        as_of: None,
         alias: None,
     }
 }

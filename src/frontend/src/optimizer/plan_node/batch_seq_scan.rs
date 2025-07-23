@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,37 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::Bound;
-
-use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
-use risingwave_common::error::Result;
-use risingwave_common::types::ScalarImpl;
-use risingwave_common::util::scan_range::{is_full_range, ScanRange};
-use risingwave_pb::batch_plan::plan_node::NodeBody;
+use risingwave_common::util::scan_range::{ScanRange, is_full_range};
 use risingwave_pb::batch_plan::RowSeqScanNode;
+use risingwave_pb::batch_plan::plan_node::NodeBody;
+use risingwave_sqlparser::ast::AsOf;
 
 use super::batch::prelude::*;
-use super::utils::{childless_record, Distill};
-use super::{generic, ExprRewritable, PlanBase, PlanRef, ToBatchPb, ToDistributedBatch};
+use super::utils::{Distill, childless_record, scan_ranges_as_strs, to_pb_time_travel_as_of};
+use super::{ExprRewritable, PlanBase, PlanRef, ToDistributedBatch, generic};
 use crate::catalog::ColumnId;
+use crate::error::Result;
 use crate::expr::{ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::plan_node::ToLocalBatch;
+use crate::optimizer::plan_node::{ToLocalBatch, TryToBatchPb};
 use crate::optimizer::property::{Distribution, DistributionDisplay, Order};
+use crate::scheduler::SchedulerResult;
 
 /// `BatchSeqScan` implements [`super::LogicalScan`] to scan from a row-oriented table
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BatchSeqScan {
     pub base: PlanBase<Batch>,
-    core: generic::Scan,
+    core: generic::TableScan,
     scan_ranges: Vec<ScanRange>,
     limit: Option<u64>,
+    as_of: Option<AsOf>,
 }
 
 impl BatchSeqScan {
     fn new_inner(
-        core: generic::Scan,
+        core: generic::TableScan,
         dist: Distribution,
         scan_ranges: Vec<ScanRange>,
         limit: Option<u64>,
@@ -67,22 +66,24 @@ impl BatchSeqScan {
                 );
             })
         }
+        let as_of = core.as_of.clone();
 
         Self {
             base,
             core,
             scan_ranges,
             limit,
+            as_of,
         }
     }
 
-    pub fn new(core: generic::Scan, scan_ranges: Vec<ScanRange>, limit: Option<u64>) -> Self {
+    pub fn new(core: generic::TableScan, scan_ranges: Vec<ScanRange>, limit: Option<u64>) -> Self {
         // Use `Single` by default, will be updated later with `clone_with_dist`.
         Self::new_inner(core, Distribution::Single, scan_ranges, limit)
     }
 
     pub fn new_with_dist(
-        core: generic::Scan,
+        core: generic::TableScan,
         dist: Distribution,
         scan_ranges: Vec<ScanRange>,
         limit: Option<u64>,
@@ -122,43 +123,12 @@ impl BatchSeqScan {
 
     /// Get a reference to the batch seq scan's logical.
     #[must_use]
-    pub fn core(&self) -> &generic::Scan {
+    pub fn core(&self) -> &generic::TableScan {
         &self.core
     }
 
     pub fn scan_ranges(&self) -> &[ScanRange] {
         &self.scan_ranges
-    }
-
-    fn scan_ranges_as_strs(&self, verbose: bool) -> Vec<String> {
-        let order_names = match verbose {
-            true => self.core.order_names_with_table_prefix(),
-            false => self.core.order_names(),
-        };
-        let mut range_strs = vec![];
-
-        let explain_max_range = 20;
-        for scan_range in self.scan_ranges.iter().take(explain_max_range) {
-            #[expect(clippy::disallowed_methods)]
-            let mut range_str = scan_range
-                .eq_conds
-                .iter()
-                .zip(order_names.iter())
-                .map(|(v, name)| match v {
-                    Some(v) => format!("{} = {:?}", name, v),
-                    None => format!("{} IS NULL", name),
-                })
-                .collect_vec();
-            if !is_full_range(&scan_range.range) {
-                let i = scan_range.eq_conds.len();
-                range_str.push(range_to_string(&order_names[i], &scan_range.range))
-            }
-            range_strs.push(range_str.join(" AND "));
-        }
-        if self.scan_ranges.len() > explain_max_range {
-            range_strs.push("...".to_string());
-        }
-        range_strs
     }
 
     pub fn limit(&self) -> &Option<u64> {
@@ -168,33 +138,6 @@ impl BatchSeqScan {
 
 impl_plan_tree_node_for_leaf! { BatchSeqScan }
 
-fn lb_to_string(name: &str, lb: &Bound<ScalarImpl>) -> String {
-    let (op, v) = match lb {
-        Bound::Included(v) => (">=", v),
-        Bound::Excluded(v) => (">", v),
-        Bound::Unbounded => unreachable!(),
-    };
-    format!("{} {} {:?}", name, op, v)
-}
-fn ub_to_string(name: &str, ub: &Bound<ScalarImpl>) -> String {
-    let (op, v) = match ub {
-        Bound::Included(v) => ("<=", v),
-        Bound::Excluded(v) => ("<", v),
-        Bound::Unbounded => unreachable!(),
-    };
-    format!("{} {} {:?}", name, op, v)
-}
-fn range_to_string(name: &str, range: &(Bound<ScalarImpl>, Bound<ScalarImpl>)) -> String {
-    match (&range.0, &range.1) {
-        (Bound::Unbounded, Bound::Unbounded) => unreachable!(),
-        (Bound::Unbounded, ub) => ub_to_string(name, ub),
-        (lb, Bound::Unbounded) => lb_to_string(name, lb),
-        (lb, ub) => {
-            format!("{} AND {}", lb_to_string(name, lb), ub_to_string(name, ub))
-        }
-    }
-}
-
 impl Distill for BatchSeqScan {
     fn distill<'a>(&self) -> XmlNode<'a> {
         let verbose = self.base.ctx().is_explain_verbose();
@@ -203,7 +146,11 @@ impl Distill for BatchSeqScan {
         vec.push(("columns", self.core.columns_pretty(verbose)));
 
         if !self.scan_ranges.is_empty() {
-            let range_strs = self.scan_ranges_as_strs(verbose);
+            let order_names = match verbose {
+                true => self.core.order_names_with_table_prefix(),
+                false => self.core.order_names(),
+            };
+            let range_strs = scan_ranges_as_strs(order_names, &self.scan_ranges);
             vec.push((
                 "scan_ranges",
                 Pretty::Array(range_strs.into_iter().map(Pretty::from).collect()),
@@ -232,10 +179,10 @@ impl ToDistributedBatch for BatchSeqScan {
     }
 }
 
-impl ToBatchPb for BatchSeqScan {
-    fn to_batch_prost_body(&self) -> NodeBody {
-        NodeBody::RowSeqScan(RowSeqScanNode {
-            table_desc: Some(self.core.table_desc.to_protobuf()),
+impl TryToBatchPb for BatchSeqScan {
+    fn try_to_batch_prost_body(&self) -> SchedulerResult<NodeBody> {
+        Ok(NodeBody::RowSeqScan(RowSeqScanNode {
+            table_desc: Some(self.core.table_desc.try_to_protobuf()?),
             column_ids: self
                 .core
                 .output_column_ids()
@@ -247,7 +194,8 @@ impl ToBatchPb for BatchSeqScan {
             vnode_bitmap: None,
             ordered: !self.order().is_any(),
             limit: *self.limit(),
-        })
+            as_of: to_pb_time_travel_as_of(&self.as_of)?,
+        }))
     }
 }
 

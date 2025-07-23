@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use risingwave_common::array::{ArrayImpl, ArrayRef, DataChunk};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::{DataType, Datum, ScalarImpl};
 use risingwave_expr::expr::{BoxedExpression, Expression};
-use risingwave_expr::{build_function, Result};
+use risingwave_expr::{Result, build_function};
 
 /// `FieldExpression` access a field from a struct.
 #[derive(Debug)]
@@ -54,7 +54,7 @@ impl Expression for FieldExpression {
     }
 }
 
-#[build_function("field(struct, int4) -> any", type_infer = "panic")]
+#[build_function("field(struct, int4) -> any", type_infer = "unreachable")]
 fn build(return_type: DataType, children: Vec<BoxedExpression>) -> Result<BoxedExpression> {
     // Field `func_call_node` have 2 child nodes, the first is Field `FuncCall` or
     // `InputRef`, the second is i32 `Literal`.

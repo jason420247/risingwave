@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ use std::mem::size_of;
 
 use bytes::{Buf, BufMut};
 use itertools::Itertools;
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::{ListArrayData, PbArray, PbArrayType};
 use serde::{Deserialize, Serializer};
 use thiserror_ext::AsReport;
@@ -28,12 +29,11 @@ use super::{
     Array, ArrayBuilder, ArrayBuilderImpl, ArrayImpl, ArrayResult, BoolArray, PrimitiveArray,
     PrimitiveArrayItemType, RowRef, Utf8Array,
 };
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::EstimateSize;
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::row::Row;
 use crate::types::{
-    hash_datum, DataType, Datum, DatumRef, DefaultOrd, Scalar, ScalarImpl, ScalarRefImpl,
-    ToDatumRef, ToText,
+    DataType, Datum, DatumRef, DefaultOrd, Scalar, ScalarImpl, ScalarRefImpl, ToDatumRef, ToText,
+    hash_datum,
 };
 use crate::util::memcmp_encoding;
 use crate::util::value_encoding::estimate_serialize_datum_size;
@@ -43,7 +43,6 @@ pub struct ListArrayBuilder {
     bitmap: BitmapBuilder,
     offsets: Vec<u32>,
     value: Box<ArrayBuilderImpl>,
-    len: usize,
 }
 
 impl ArrayBuilder for ListArrayBuilder {
@@ -56,6 +55,7 @@ impl ArrayBuilder for ListArrayBuilder {
 
     #[cfg(test)]
     fn new(capacity: usize) -> Self {
+        // TODO: deprecate this
         Self::with_type(
             capacity,
             // Default datatype
@@ -73,7 +73,6 @@ impl ArrayBuilder for ListArrayBuilder {
             bitmap: BitmapBuilder::with_capacity(capacity),
             offsets,
             value: Box::new(value_type.create_array_builder(capacity)),
-            len: 0,
         }
     }
 
@@ -101,7 +100,6 @@ impl ArrayBuilder for ListArrayBuilder {
                 }
             }
         }
-        self.len += n;
     }
 
     fn append_array(&mut self, other: &ListArray) {
@@ -110,14 +108,12 @@ impl ArrayBuilder for ListArrayBuilder {
         self.offsets
             .append(&mut other.offsets[1..].iter().map(|o| *o + last).collect());
         self.value.append_array(&other.value);
-        self.len += other.len();
     }
 
     fn pop(&mut self) -> Option<()> {
         self.bitmap.pop()?;
         let start = self.offsets.pop().unwrap();
         let end = *self.offsets.last().unwrap();
-        self.len -= 1;
         for _ in end..start {
             self.value.pop().unwrap();
         }
@@ -143,7 +139,6 @@ impl ListArrayBuilder {
         let last = *self.offsets.last().unwrap();
         self.offsets
             .push(last.checked_add(row.len() as u32).expect("offset overflow"));
-        self.len += 1;
         for v in row.iter() {
             self.value.append(v);
         }
@@ -180,10 +175,12 @@ impl Array for ListArray {
     type RefItem<'a> = ListRef<'a>;
 
     unsafe fn raw_value_at_unchecked(&self, idx: usize) -> Self::RefItem<'_> {
-        ListRef {
-            array: &self.value,
-            start: *self.offsets.get_unchecked(idx),
-            end: *self.offsets.get_unchecked(idx + 1),
+        unsafe {
+            ListRef {
+                array: &self.value,
+                start: *self.offsets.get_unchecked(idx),
+                end: *self.offsets.get_unchecked(idx + 1),
+            }
         }
     }
 
@@ -200,6 +197,7 @@ impl Array for ListArray {
                 offsets: self.offsets.to_vec(),
                 value: Some(Box::new(value)),
                 value_type: Some(self.value.data_type().to_protobuf()),
+                elem_size: None,
             })),
             null_bitmap: Some(self.bitmap.to_protobuf()),
             values: vec![],
@@ -239,10 +237,22 @@ impl ListArray {
         }
     }
 
+    /// Return the inner array of the list array.
+    pub fn values(&self) -> &ArrayImpl {
+        &self.value
+    }
+
     pub fn from_protobuf(array: &PbArray) -> ArrayResult<ArrayImpl> {
         ensure!(
             array.values.is_empty(),
             "Must have no buffer in a list array"
+        );
+        debug_assert!(
+            (array.array_type == PbArrayType::List as i32)
+                || (array.array_type == PbArrayType::Map as i32)
+                || (array.array_type == PbArrayType::Vector as i32),
+            "invalid array type for list: {}",
+            array.array_type
         );
         let bitmap: Bitmap = array.get_null_bitmap()?.into();
         let array_data = array.get_list_array_data()?.to_owned();
@@ -360,11 +370,11 @@ impl ListValue {
 
     /// Creates a new `ListValue` from an iterator of `Datum`.
     pub fn from_datum_iter<T: ToDatumRef>(
-        datatype: &DataType,
+        elem_datatype: &DataType,
         iter: impl IntoIterator<Item = T>,
     ) -> Self {
         let iter = iter.into_iter();
-        let mut builder = datatype.create_array_builder(iter.size_hint().0);
+        let mut builder = elem_datatype.create_array_builder(iter.size_hint().0);
         for datum in iter {
             builder.append(datum);
         }
@@ -401,15 +411,15 @@ impl ListValue {
     }
 
     pub fn memcmp_deserialize(
-        datatype: &DataType,
+        item_datatype: &DataType,
         deserializer: &mut memcomparable::Deserializer<impl Buf>,
     ) -> memcomparable::Result<Self> {
         let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
         let mut inner_deserializer = memcomparable::Deserializer::new(bytes.as_slice());
-        let mut builder = datatype.create_array_builder(0);
+        let mut builder = item_datatype.create_array_builder(0);
         while inner_deserializer.has_remaining() {
             builder.append(memcmp_encoding::deserialize_datum_in_composite(
-                datatype,
+                item_datatype,
                 &mut inner_deserializer,
             )?)
         }
@@ -495,6 +505,7 @@ impl From<ListValue> for ArrayImpl {
     }
 }
 
+/// A slice of an array
 #[derive(Copy, Clone)]
 pub struct ListRef<'a> {
     array: &'a ArrayImpl,
@@ -575,14 +586,32 @@ impl<'a> ListRef<'a> {
         ListValue::new(builder.finish())
     }
 
+    pub fn as_primitive_slice<T: PrimitiveArrayItemType>(self) -> Option<&'a [T]> {
+        T::try_into_array_ref(self.array)
+            .map(|prim_arr| &prim_arr.as_slice()[self.start as usize..self.end as usize])
+    }
+
     /// Returns a slice if the list is of type `int64[]`.
     pub fn as_i64_slice(&self) -> Option<&[i64]> {
-        match &self.array {
-            ArrayImpl::Int64(array) => {
-                Some(&array.as_slice()[self.start as usize..self.end as usize])
-            }
-            _ => None,
-        }
+        self.as_primitive_slice()
+    }
+
+    /// # Panics
+    /// Panics if the list is not a map's internal representation (See [`super::MapArray`]).
+    pub(super) fn as_map_kv(self) -> (ListRef<'a>, ListRef<'a>) {
+        let (k, v) = self.array.as_struct().fields().collect_tuple().unwrap();
+        (
+            ListRef {
+                array: k,
+                start: self.start,
+                end: self.end,
+            },
+            ListRef {
+                array: v,
+                start: self.start,
+                end: self.end,
+            },
+        )
     }
 }
 
@@ -612,6 +641,24 @@ impl Debug for ListRef<'_> {
     }
 }
 
+impl Row for ListRef<'_> {
+    fn datum_at(&self, index: usize) -> DatumRef<'_> {
+        self.array.value_at(self.start as usize + index)
+    }
+
+    unsafe fn datum_at_unchecked(&self, index: usize) -> DatumRef<'_> {
+        unsafe { self.array.value_at_unchecked(self.start as usize + index) }
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = DatumRef<'_>> {
+        (*self).iter()
+    }
+}
+
 impl ToText for ListRef<'_> {
     // This function will be invoked when pgwire prints a list value in string.
     // Refer to PostgreSQL `array_out` or `appendPGArray`.
@@ -625,12 +672,14 @@ impl ToText for ListRef<'_> {
                 // chars and whitespaces.
                 let need_quote = !matches!(datum_ref, None | Some(ScalarRefImpl::List(_)))
                     && (s.is_empty()
-                        || s.to_ascii_lowercase() == "null"
+                        || s.eq_ignore_ascii_case("null")
                         || s.contains([
-                            '"', '\\', '{', '}', ',',
+                            '"', '\\', ',',
+                            // whilespace:
                             // PostgreSQL `array_isspace` includes '\x0B' but rust
                             // [`char::is_ascii_whitespace`] does not.
-                            ' ', '\t', '\n', '\r', '\x0B', '\x0C',
+                            ' ', '\t', '\n', '\r', '\x0B', '\x0C', // list-specific:
+                            '{', '}',
                         ]));
                 if need_quote {
                     f(&"\"")?;
@@ -698,17 +747,18 @@ impl ListValue {
             fn parse_array(&mut self) -> Result<ListValue, String> {
                 self.skip_whitespace();
                 if !self.try_consume('{') {
-                    return Err("Array value must start with \"{\"".to_string());
+                    return Err("Array value must start with \"{\"".to_owned());
                 }
                 self.skip_whitespace();
                 if self.try_consume('}') {
-                    return Ok(ListValue::empty(self.data_type.as_list()));
+                    return Ok(ListValue::empty(self.data_type.as_list_element_type()));
                 }
-                let mut builder = ArrayBuilderImpl::with_type(0, self.data_type.as_list().clone());
+                let mut builder =
+                    ArrayBuilderImpl::with_type(0, self.data_type.as_list_element_type().clone());
                 loop {
                     let mut parser = Self {
                         input: self.input,
-                        data_type: self.data_type.as_list(),
+                        data_type: self.data_type.as_list_element_type(),
                     };
                     builder.append(parser.parse()?);
                     self.input = parser.input;
@@ -724,7 +774,7 @@ impl ListValue {
                             break;
                         }
                         None => return Err(Self::eoi()),
-                        _ => return Err("Unexpected array element.".to_string()),
+                        _ => return Err("Unexpected array element.".to_owned()),
                     }
                 }
                 Ok(ListValue::new(builder.finish()))
@@ -762,14 +812,13 @@ impl ListValue {
                                 Cow::Borrowed(trimmed)
                             };
                         }
-                        (_, '{') => return Err("Unexpected \"{\" character.".to_string()),
-                        (_, '"') => return Err("Unexpected array element.".to_string()),
+                        (_, '{') => return Err("Unexpected \"{\" character.".to_owned()),
+                        (_, '"') => return Err("Unexpected array element.".to_owned()),
                         _ => {}
                     }
                 };
                 Ok(Some(
-                    ScalarImpl::from_literal(&s, self.data_type)
-                        .map_err(|e| e.to_report_string())?,
+                    ScalarImpl::from_text(&s, self.data_type).map_err(|e| e.to_report_string())?,
                 ))
             }
 
@@ -797,7 +846,7 @@ impl ListValue {
                         _ => {}
                     }
                 };
-                ScalarImpl::from_literal(&s, self.data_type).map_err(|e| e.to_report_string())
+                ScalarImpl::from_text(&s, self.data_type).map_err(|e| e.to_report_string())
             }
 
             /// Unescape a string.
@@ -871,7 +920,7 @@ impl ListValue {
             fn expect_end(&mut self) -> Result<(), String> {
                 self.skip_whitespace();
                 match self.peek() {
-                    Some(_) => Err("Junk after closing right brace.".to_string()),
+                    Some(_) => Err("Junk after closing right brace.".to_owned()),
                     None => Ok(()),
                 }
             }

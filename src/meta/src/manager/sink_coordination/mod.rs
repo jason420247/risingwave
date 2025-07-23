@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,22 +13,14 @@
 // limitations under the License.
 
 mod coordinator_worker;
+mod handle;
 mod manager;
 
 use futures::stream::BoxStream;
 pub use manager::SinkCoordinatorManager;
-use risingwave_common::buffer::Bitmap;
-use risingwave_connector::sink::SinkParam;
 use risingwave_pb::connector_service::{CoordinateRequest, CoordinateResponse};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 use tonic::Status;
 
 pub type SinkWriterRequestStream = BoxStream<'static, Result<CoordinateRequest, Status>>;
-pub type SinkCoordinatorResponseSender = Sender<Result<CoordinateResponse, Status>>;
-
-pub struct NewSinkWriterRequest {
-    pub request_stream: SinkWriterRequestStream,
-    pub response_tx: SinkCoordinatorResponseSender,
-    pub param: SinkParam,
-    pub vnode_bitmap: Bitmap,
-}
+pub type SinkCoordinatorResponseSender = UnboundedSender<Result<CoordinateResponse, Status>>;

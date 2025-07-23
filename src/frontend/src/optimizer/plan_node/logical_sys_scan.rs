@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,14 @@ use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::bail_not_implemented;
 use risingwave_common::catalog::{ColumnDesc, TableDesc};
-use risingwave_common::error::Result;
 
 use super::generic::{GenericPlanNode, GenericPlanRef};
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    generic, BatchFilter, BatchProject, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef,
-    PredicatePushdown, ToBatch, ToStream,
+    BatchFilter, BatchProject, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef,
+    PredicatePushdown, ToBatch, ToStream, generic,
 };
+use crate::error::Result;
 use crate::expr::{CorrelatedInputRef, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
@@ -101,15 +101,13 @@ impl LogicalSysScan {
 
     /// a vec of `InputRef` corresponding to `output_col_idx`, which can represent a pulled project.
     fn output_idx_to_input_ref(&self) -> Vec<ExprImpl> {
-        let output_idx = self
-            .output_col_idx()
+        self.output_col_idx()
             .iter()
             .enumerate()
             .map(|(i, &col_idx)| {
                 InputRef::new(i, self.table_desc().columns[col_idx].data_type.clone()).into()
             })
-            .collect_vec();
-        output_idx
+            .collect_vec()
     }
 
     /// Undo predicate push down when predicate in scan is not supported.
@@ -135,7 +133,7 @@ impl LogicalSysScan {
         predicate = predicate.rewrite_expr(&mut inverse_mapping);
 
         let scan_without_predicate = generic::SysScan::new(
-            self.table_name().to_string(),
+            self.table_name().to_owned(),
             self.required_col_idx().to_vec(),
             self.core.table_desc.clone(),
             self.ctx(),
@@ -152,7 +150,7 @@ impl LogicalSysScan {
 
     fn clone_with_predicate(&self, predicate: Condition) -> Self {
         generic::SysScan::new_inner(
-            self.table_name().to_string(),
+            self.table_name().to_owned(),
             self.output_col_idx().to_vec(),
             self.core.table_desc.clone(),
             self.base.ctx().clone(),
@@ -164,7 +162,7 @@ impl LogicalSysScan {
 
     pub fn clone_with_output_indices(&self, output_col_idx: Vec<usize>) -> Self {
         generic::SysScan::new_inner(
-            self.table_name().to_string(),
+            self.table_name().to_owned(),
             output_col_idx,
             self.core.table_desc.clone(),
             self.base.ctx().clone(),
@@ -209,7 +207,7 @@ impl Distill for LogicalSysScan {
                             Pretty::from(if verbose {
                                 format!("{}.{}", self.table_name(), col_name)
                             } else {
-                                col_name.to_string()
+                                col_name.clone()
                             })
                         })
                         .collect(),
@@ -242,9 +240,11 @@ impl ColPrunable for LogicalSysScan {
             .iter()
             .map(|i| self.required_col_idx()[*i])
             .collect();
-        assert!(output_col_idx
-            .iter()
-            .all(|i| self.output_col_idx().contains(i)));
+        assert!(
+            output_col_idx
+                .iter()
+                .all(|i| self.output_col_idx().contains(i))
+        );
 
         self.clone_with_output_indices(output_col_idx).into()
     }
@@ -291,7 +291,7 @@ impl PredicatePushdown for LogicalSysScan {
         }
         let non_pushable_predicate: Vec<_> = predicate
             .conjunctions
-            .extract_if(|expr| {
+            .extract_if(.., |expr| {
                 if expr.count_nows() > 0 {
                     true
                 } else {
@@ -309,13 +309,13 @@ impl PredicatePushdown for LogicalSysScan {
             self.clone_with_predicate(predicate.and(self.predicate().clone()))
                 .into()
         } else {
-            return LogicalFilter::create(
+            LogicalFilter::create(
                 self.clone_with_predicate(predicate.and(self.predicate().clone()))
                     .into(),
                 Condition {
                     conjunctions: non_pushable_predicate,
                 },
-            );
+            )
         }
     }
 }

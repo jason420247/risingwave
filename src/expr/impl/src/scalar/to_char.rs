@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use chrono::format::{Item, StrftimeItems};
 use chrono::{Datelike, NaiveDate};
 use risingwave_common::types::{Interval, Timestamp, Timestamptz};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 use super::timestamptz::time_zone_err;
 use crate::scalar::arithmetic_op::timestamp_interval_add;
@@ -87,6 +87,8 @@ impl ChronoPattern {
             ("Mon", "%b"),
             ("DD", "%d"),
             ("dd", "%d"),
+            ("NS", "%9f"),
+            ("ns", "%9f"),
             ("US", "%6f"),
             ("us", "%6f"),
             ("MS", "%3f"),
@@ -351,6 +353,7 @@ fn format_inner(w: &mut impl Write, interval: Interval, item: &Item<'_>) -> Resu
                 | WeekFromMon | IsoYearDiv100 | Timestamp | YearDiv100 | Internal(_) => {
                     unreachable!()
                 }
+                _ => unreachable!(),
             }
             Ok(())
         }
@@ -395,6 +398,7 @@ fn format_inner(w: &mut impl Write, interval: Interval, item: &Item<'_>) -> Resu
                 | Nanosecond9
                 | RFC2822
                 | RFC3339 => unreachable!(),
+                _ => unreachable!(),
             }
         }
         Item::Error => Err(invalid_pattern_err()),

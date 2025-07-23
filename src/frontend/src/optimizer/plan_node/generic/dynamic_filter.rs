@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fixedbitset::FixedBitSet;
 use pretty_xmlish::Pretty;
 use risingwave_common::catalog::Schema;
 use risingwave_common::util::sort_util::OrderType;
@@ -31,9 +30,9 @@ pub struct DynamicFilter<PlanRef> {
     /// The predicate (formed with exactly one of < , <=, >, >=)
     comparator: ExprType,
     left_index: usize,
-    pub left: PlanRef,
+    left: PlanRef,
     /// The right input can only have one column.
-    pub right: PlanRef,
+    right: PlanRef,
 }
 impl<PlanRef> DynamicFilter<PlanRef> {
     pub fn comparator(&self) -> ExprType {
@@ -108,19 +107,6 @@ impl<PlanRef: GenericPlanRef> DynamicFilter<PlanRef> {
         }
     }
 
-    pub fn watermark_columns(&self, right_watermark: bool) -> FixedBitSet {
-        let mut watermark_columns = FixedBitSet::with_capacity(self.left.schema().len());
-        if right_watermark {
-            match self.comparator {
-                ExprType::Equal | ExprType::GreaterThan | ExprType::GreaterThanOrEqual => {
-                    watermark_columns.set(self.left_index, true)
-                }
-                _ => {}
-            }
-        }
-        watermark_columns
-    }
-
     fn condition_display(&self) -> (Condition, Schema) {
         let mut concat_schema = self.left.schema().fields.clone();
         concat_schema.extend(self.right.schema().fields.clone());
@@ -157,8 +143,7 @@ pub fn infer_left_internal_table_catalog(
         }
     }
 
-    let mut internal_table_catalog_builder =
-        TableCatalogBuilder::new(me.ctx().with_options().internal_table_subset());
+    let mut internal_table_catalog_builder = TableCatalogBuilder::default();
 
     schema.fields().iter().for_each(|field| {
         internal_table_catalog_builder.add_column(field);
@@ -180,8 +165,7 @@ pub fn infer_right_internal_table_catalog(input: impl stream::StreamPlanRef) -> 
         Vec::<usize>::new()
     );
 
-    let mut internal_table_catalog_builder =
-        TableCatalogBuilder::new(input.ctx().with_options().internal_table_subset());
+    let mut internal_table_catalog_builder = TableCatalogBuilder::default();
 
     schema.fields().iter().for_each(|field| {
         internal_table_catalog_builder.add_column(field);

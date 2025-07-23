@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
-use risingwave_common::catalog::TableOption;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
 use risingwave_pb::hummock::compact_task;
-use risingwave_pb::hummock::hummock_version::Levels;
 
-use super::{CompactionSelector, DynamicLevelSelectorCore, LocalSelectorStatistic};
+use super::{CompactionSelector, DynamicLevelSelectorCore};
 use crate::hummock::compaction::picker::{EmergencyCompactionPicker, LocalPickerStatistic};
-use crate::hummock::compaction::{create_compaction_task, CompactionTask};
-use crate::hummock::level_handler::LevelHandler;
-use crate::hummock::model::CompactionGroup;
+use crate::hummock::compaction::selector::CompactionSelectorContext;
+use crate::hummock::compaction::{CompactionTask, create_compaction_task};
 
 #[derive(Default)]
 pub struct EmergencySelector {}
@@ -32,16 +27,26 @@ impl CompactionSelector for EmergencySelector {
     fn pick_compaction(
         &mut self,
         task_id: HummockCompactionTaskId,
-        group: &CompactionGroup,
-        levels: &Levels,
-        level_handlers: &mut [LevelHandler],
-        selector_stats: &mut LocalSelectorStatistic,
-        _table_id_to_options: HashMap<u32, TableOption>,
+        context: CompactionSelectorContext<'_>,
     ) -> Option<CompactionTask> {
-        let dynamic_level_core = DynamicLevelSelectorCore::new(group.compaction_config.clone());
+        let CompactionSelectorContext {
+            group,
+            levels,
+            level_handlers,
+            selector_stats,
+            developer_config,
+            ..
+        } = context;
+        let dynamic_level_core = DynamicLevelSelectorCore::new(
+            group.compaction_config.clone(),
+            developer_config.clone(),
+        );
         let ctx = dynamic_level_core.calculate_level_base_size(levels);
-        let picker =
-            EmergencyCompactionPicker::new(ctx.base_level, group.compaction_config.clone());
+        let picker = EmergencyCompactionPicker::new(
+            ctx.base_level,
+            group.compaction_config.clone(),
+            developer_config,
+        );
 
         let mut stats = LocalPickerStatistic::default();
         if let Some(compaction_input) = picker.pick_compaction(levels, level_handlers, &mut stats) {

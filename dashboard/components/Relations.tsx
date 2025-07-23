@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,6 @@
 import {
   Box,
   Button,
-  Modal,
-  ModalBody,
-  ModalCloseButton,
-  ModalContent,
-  ModalFooter,
-  ModalHeader,
-  ModalOverlay,
   Table,
   TableContainer,
   Tbody,
@@ -32,24 +25,29 @@ import {
   Th,
   Thead,
   Tr,
-  useDisclosure,
 } from "@chakra-ui/react"
 import loadable from "@loadable/component"
 import Head from "next/head"
 
 import Link from "next/link"
-import { Fragment, useEffect, useState } from "react"
+import { Fragment } from "react"
 import Title from "../components/Title"
-import useErrorToast from "../hook/useErrorToast"
+import useFetch from "../lib/api/fetch"
+import {
+  Relation,
+  getDatabases,
+  getSchemas,
+  getUsers,
+} from "../lib/api/streaming"
 import extractColumnInfo from "../lib/extractInfo"
-import { Relation, StreamingJob } from "../pages/api/streaming"
 import {
   Sink as RwSink,
   Source as RwSource,
   Table as RwTable,
 } from "../proto/gen/catalog"
+import { CatalogModal, useCatalogModal } from "./CatalogModal"
 
-const ReactJson = loadable(() => import("react-json-view"))
+export const ReactJson = loadable(() => import("react-json-view"))
 
 export type Column<R> = {
   name: string
@@ -61,7 +59,7 @@ export const dependentsColumn: Column<Relation> = {
   name: "Depends",
   width: 1,
   content: (r) => (
-    <Link href={`/streaming_graph/?id=${r.id}`}>
+    <Link href={`/relation_graph/?id=${r.id}`}>
       <Button
         size="sm"
         aria-label="view dependents"
@@ -74,11 +72,11 @@ export const dependentsColumn: Column<Relation> = {
   ),
 }
 
-export const fragmentsColumn: Column<StreamingJob> = {
+export const fragmentsColumn: Column<Relation> = {
   name: "Fragments",
   width: 1,
   content: (r) => (
-    <Link href={`/streaming_plan/?id=${r.id}`}>
+    <Link href={`/fragment_graph/?id=${r.id}`}>
       <Button
         size="sm"
         aria-label="view fragments"
@@ -102,6 +100,33 @@ export const primaryKeyColumn: Column<RwTable> = {
       .join(", "),
 }
 
+export const vnodeCountColumn: Column<RwTable> = {
+  name: "Vnode Count",
+  width: 1,
+  // The table catalogs retrieved here are constructed from SQL models,
+  // where the `vnode_count` column has already been populated during migration.
+  // Therefore, it should always be present and no need to specify a fallback.
+  content: (r) => r.maybeVnodeCount ?? "?",
+}
+
+// Helper function to format bytes into human readable format
+function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined) return "unknown"
+  if (bytes === 0) return "0 B"
+  const k = 1024
+  const sizes = ["B", "KB", "MB", "GB", "TB"]
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i]
+}
+
+export const dataSizeColumn: Column<Relation> = {
+  name: "Data Size",
+  width: 2,
+  content: (r) => formatBytes(r.totalSizeBytes),
+}
+
+export const tableColumns = [primaryKeyColumn, vnodeCountColumn, dataSizeColumn]
+
 export const connectorColumnSource: Column<RwSource> = {
   name: "Connector",
   width: 3,
@@ -121,66 +146,44 @@ export function Relations<R extends Relation>(
   getRelations: () => Promise<R[]>,
   extraColumns: Column<R>[]
 ) {
-  const toast = useErrorToast()
-  const [relationList, setRelationList] = useState<R[]>([])
+  const { response: relationList } = useFetch(async () => {
+    const relations = await getRelations()
+    const users = await getUsers()
+    const databases = await getDatabases()
+    const schemas = await getSchemas()
+    return relations.map((r) => {
+      // Add owner, schema, and database names. It's linear search but the list is small.
+      const owner = users.find((u) => u.id === r.owner)
+      const ownerName = owner?.name
+      const schema = schemas.find((s) => s.id === r.schemaId)
+      const schemaName = schema?.name
+      const database = databases.find((d) => d.id === r.databaseId)
+      const databaseName = database?.name
+      return { ...r, ownerName, schemaName, databaseName }
+    })
+  })
+  const [modalData, setModalId] = useCatalogModal(relationList)
 
-  useEffect(() => {
-    async function doFetch() {
-      try {
-        setRelationList(await getRelations())
-      } catch (e: any) {
-        toast(e)
-      }
-    }
-    doFetch()
-    return () => {}
-  }, [toast, getRelations])
-
-  const { isOpen, onOpen, onClose } = useDisclosure()
-  const [currentRelation, setCurrentRelation] = useState<R>()
-  const openRelationCatalog = (relation: R) => {
-    if (relation) {
-      setCurrentRelation(relation)
-      onOpen()
-    }
-  }
-
-  const catalogModal = (
-    <Modal isOpen={isOpen} onClose={onClose} size="3xl">
-      <ModalOverlay />
-      <ModalContent>
-        <ModalHeader>
-          Catalog of {currentRelation?.id} - {currentRelation?.name}
-        </ModalHeader>
-        <ModalCloseButton />
-        <ModalBody>
-          {isOpen && currentRelation && (
-            <ReactJson
-              src={currentRelation}
-              collapsed={1}
-              name={null}
-              displayDataTypes={false}
-            />
-          )}
-        </ModalBody>
-
-        <ModalFooter>
-          <Button colorScheme="blue" mr={3} onClick={onClose}>
-            Close
-          </Button>
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
+  const modal = (
+    <CatalogModal modalData={modalData} onClose={() => setModalId(null)} />
   )
 
   const table = (
     <Box p={3}>
       <Title>{title}</Title>
+      {relationList && (
+        <Box mb={3} fontSize="sm" color="gray.600">
+          Total: {relationList.length}{" "}
+          {relationList.length === 1 ? "item" : "items"}
+        </Box>
+      )}
       <TableContainer>
         <Table variant="simple" size="sm" maxWidth="full">
           <Thead>
             <Tr>
               <Th width={3}>Id</Th>
+              <Th width={5}>Database</Th>
+              <Th width={5}>Schema</Th>
               <Th width={5}>Name</Th>
               <Th width={3}>Owner</Th>
               {extraColumns.map((c) => (
@@ -192,7 +195,7 @@ export function Relations<R extends Relation>(
             </Tr>
           </Thead>
           <Tbody>
-            {relationList.map((r) => (
+            {relationList?.map((r) => (
               <Tr key={r.id}>
                 <Td>
                   <Button
@@ -200,22 +203,28 @@ export function Relations<R extends Relation>(
                     aria-label="view catalog"
                     colorScheme="blue"
                     variant="link"
-                    onClick={() => openRelationCatalog(r)}
+                    onClick={() => setModalId(r.id)}
                   >
                     {r.id}
                   </Button>
                 </Td>
+                <Td>{r.databaseName}</Td>
+                <Td>{r.schemaName}</Td>
                 <Td>{r.name}</Td>
-                <Td>{r.owner}</Td>
+                <Td>{r.ownerName}</Td>
                 {extraColumns.map((c) => (
                   <Td key={c.name}>{c.content(r)}</Td>
                 ))}
-                <Td overflowWrap="normal">
-                  {r.columns
-                    .filter((col) => ("isHidden" in col ? !col.isHidden : true))
-                    .map((col) => extractColumnInfo(col))
-                    .join(", ")}
-                </Td>
+                {r.columns && r.columns.length > 0 && (
+                  <Td overflowWrap="normal">
+                    {r.columns
+                      .filter((col) =>
+                        "isHidden" in col ? !col.isHidden : true
+                      )
+                      .map((col) => extractColumnInfo(col))
+                      .join(", ")}
+                  </Td>
+                )}
               </Tr>
             ))}
           </Tbody>
@@ -229,7 +238,7 @@ export function Relations<R extends Relation>(
       <Head>
         <title>{title}</title>
       </Head>
-      {catalogModal}
+      {modal}
       {table}
     </Fragment>
   )

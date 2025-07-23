@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::array::{Op, StreamChunk};
+use risingwave_common::array::Op;
 use risingwave_common::row::{RowDeserializer, RowExt};
 use risingwave_common::util::epoch::EpochPair;
 use risingwave_common::util::sort_util::ColumnOrder;
-use risingwave_storage::StateStore;
 
-use super::top_n_cache::AppendOnlyTopNCacheTrait;
+use super::top_n_cache::{AppendOnlyTopNCacheTrait, TopNStaging};
 use super::utils::*;
-use super::{ManagedTopNState, TopNCache, NO_GROUP_KEY};
-use crate::common::table::state_table::StateTable;
-use crate::error::StreamResult;
-use crate::executor::error::StreamExecutorResult;
-use crate::executor::{ActorContextRef, Executor, ExecutorInfo, PkIndices, Watermark};
+use super::{ManagedTopNState, TopNCache};
+use crate::common::table::state_table::StateTablePostCommit;
+use crate::executor::prelude::*;
 
 /// If the input is append-only, `AppendOnlyGroupTopNExecutor` does not need
 /// to keep all the rows seen. As long as a record
@@ -38,9 +35,9 @@ pub type AppendOnlyTopNExecutor<S, const WITH_TIES: bool> =
 impl<S: StateStore, const WITH_TIES: bool> AppendOnlyTopNExecutor<S, WITH_TIES> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        input: Box<dyn Executor>,
+        input: Executor,
         ctx: ActorContextRef,
-        info: ExecutorInfo,
+        schema: Schema,
         storage_key: Vec<ColumnOrder>,
         offset_and_limit: (usize, usize),
         order_by: Vec<ColumnOrder>,
@@ -50,7 +47,7 @@ impl<S: StateStore, const WITH_TIES: bool> AppendOnlyTopNExecutor<S, WITH_TIES> 
             input,
             ctx,
             inner: InnerAppendOnlyTopNExecutor::new(
-                info,
+                schema,
                 storage_key,
                 offset_and_limit,
                 order_by,
@@ -61,7 +58,7 @@ impl<S: StateStore, const WITH_TIES: bool> AppendOnlyTopNExecutor<S, WITH_TIES> 
 }
 
 pub struct InnerAppendOnlyTopNExecutor<S: StateStore, const WITH_TIES: bool> {
-    info: ExecutorInfo,
+    schema: Schema,
 
     /// The storage key indices of the `TopNExecutor`
     storage_key_indices: PkIndices,
@@ -73,14 +70,14 @@ pub struct InnerAppendOnlyTopNExecutor<S: StateStore, const WITH_TIES: bool> {
     /// TODO: support WITH TIES
     cache: TopNCache<WITH_TIES>,
 
-    /// Used for serializing pk into CacheKey.
+    /// Used for serializing pk into `CacheKey`.
     cache_key_serde: CacheKeySerde,
 }
 
 impl<S: StateStore, const WITH_TIES: bool> InnerAppendOnlyTopNExecutor<S, WITH_TIES> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        info: ExecutorInfo,
+        schema: Schema,
         storage_key: Vec<ColumnOrder>,
         offset_and_limit: (usize, usize),
         order_by: Vec<ColumnOrder>,
@@ -89,12 +86,12 @@ impl<S: StateStore, const WITH_TIES: bool> InnerAppendOnlyTopNExecutor<S, WITH_T
         let num_offset = offset_and_limit.0;
         let num_limit = offset_and_limit.1;
 
-        let cache_key_serde = create_cache_key_serde(&storage_key, &info.schema, &order_by, &[]);
+        let cache_key_serde = create_cache_key_serde(&storage_key, &schema, &order_by, &[]);
         let managed_state = ManagedTopNState::<S>::new(state_table, cache_key_serde.clone());
-        let data_types = info.schema.data_types();
+        let data_types = schema.data_types();
 
         Ok(Self {
-            info,
+            schema,
             managed_state,
             storage_key_indices: storage_key.into_iter().map(|op| op.column_index).collect(),
             cache: TopNCache::new(num_offset, num_limit, data_types),
@@ -108,11 +105,15 @@ impl<S: StateStore, const WITH_TIES: bool> TopNExecutorBase
 where
     TopNCache<WITH_TIES>: AppendOnlyTopNCacheTrait,
 {
-    async fn apply_chunk(&mut self, chunk: StreamChunk) -> StreamExecutorResult<StreamChunk> {
-        let mut res_ops = Vec::with_capacity(self.cache.limit);
-        let mut res_rows = Vec::with_capacity(self.cache.limit);
-        let data_types = self.info().schema.data_types();
-        let row_deserializer = RowDeserializer::new(data_types);
+    type State = S;
+
+    async fn apply_chunk(
+        &mut self,
+        chunk: StreamChunk,
+    ) -> StreamExecutorResult<Option<StreamChunk>> {
+        let mut staging = TopNStaging::new();
+        let data_types = self.schema.data_types();
+        let deserializer = RowDeserializer::new(data_types.clone());
         // apply the chunk to state table
         for (op, row_ref) in chunk.rows() {
             debug_assert_eq!(op, Op::Insert);
@@ -121,17 +122,27 @@ where
             self.cache.insert(
                 cache_key,
                 row_ref,
-                &mut res_ops,
-                &mut res_rows,
+                &mut staging,
                 &mut self.managed_state,
-                &row_deserializer,
+                &deserializer,
             )?;
         }
 
-        generate_output(res_rows, res_ops, &self.info().schema)
+        if staging.is_empty() {
+            return Ok(None);
+        }
+        let mut chunk_builder = StreamChunkBuilder::unlimited(data_types, Some(staging.len()));
+        for res in staging.into_deserialized_changes(&deserializer) {
+            let (op, row) = res?;
+            let _none = chunk_builder.append_row(op, row);
+        }
+        Ok(chunk_builder.take())
     }
 
-    async fn flush_data(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+    async fn flush_data(
+        &mut self,
+        epoch: EpochPair,
+    ) -> StreamExecutorResult<StateTablePostCommit<'_, S>> {
         self.managed_state.flush(epoch).await
     }
 
@@ -139,12 +150,8 @@ where
         self.managed_state.try_flush().await
     }
 
-    fn info(&self) -> &ExecutorInfo {
-        &self.info
-    }
-
     async fn init(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
-        self.managed_state.init_epoch(epoch);
+        self.managed_state.init_epoch(epoch).await?;
         self.managed_state
             .init_topn_cache(NO_GROUP_KEY, &mut self.cache)
             .await
@@ -159,18 +166,17 @@ where
 #[cfg(test)]
 mod tests {
 
-    use assert_matches::assert_matches;
-    use futures::StreamExt;
-    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::array::StreamChunk;
+    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::catalog::{Field, Schema};
     use risingwave_common::types::DataType;
+    use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
 
     use super::AppendOnlyTopNExecutor;
     use crate::executor::test_utils::top_n_executor::create_in_memory_state_table;
-    use crate::executor::test_utils::MockSource;
-    use crate::executor::{ActorContext, Barrier, Executor, ExecutorInfo, Message, PkIndices};
+    use crate::executor::test_utils::{MockSource, StreamExecutorTestExt};
+    use crate::executor::{ActorContext, Barrier, Execute, Executor, Message, PkIndices};
 
     fn create_stream_chunks() -> Vec<StreamChunk> {
         let chunk1 = StreamChunk::from_pretty(
@@ -223,21 +229,17 @@ mod tests {
         vec![0, 1]
     }
 
-    fn create_source() -> Box<MockSource> {
+    fn create_source() -> Executor {
         let mut chunks = create_stream_chunks();
-        let schema = create_schema();
-        Box::new(MockSource::with_messages(
-            schema,
-            pk_indices(),
-            vec![
-                Message::Barrier(Barrier::new_test_barrier(1)),
-                Message::Chunk(std::mem::take(&mut chunks[0])),
-                Message::Barrier(Barrier::new_test_barrier(2)),
-                Message::Chunk(std::mem::take(&mut chunks[1])),
-                Message::Barrier(Barrier::new_test_barrier(3)),
-                Message::Chunk(std::mem::take(&mut chunks[2])),
-            ],
-        ))
+        MockSource::with_messages(vec![
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(1))),
+            Message::Chunk(std::mem::take(&mut chunks[0])),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(2))),
+            Message::Chunk(std::mem::take(&mut chunks[1])),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(3))),
+            Message::Chunk(std::mem::take(&mut chunks[2])),
+        ])
+        .into_executor(create_schema(), pk_indices())
     }
 
     #[tokio::test]
@@ -251,71 +253,54 @@ mod tests {
         )
         .await;
 
-        let info = ExecutorInfo {
-            schema: source.schema().clone(),
-            pk_indices: source.pk_indices().to_vec(),
-            identity: "AppendOnlyTopNExecutor 1".to_string(),
-        };
-        let top_n_executor = Box::new(
-            AppendOnlyTopNExecutor::<_, false>::new(
-                source as Box<dyn Executor>,
-                ActorContext::create(0),
-                info,
-                storage_key,
-                (0, 5),
-                order_by(),
-                state_table,
-            )
-            .unwrap(),
-        );
-        let mut top_n_executor = top_n_executor.execute();
+        let schema = source.schema().clone();
+        let top_n = AppendOnlyTopNExecutor::<_, false>::new(
+            source,
+            ActorContext::for_test(0),
+            schema,
+            storage_key,
+            (0, 5),
+            order_by(),
+            state_table,
+        )
+        .unwrap();
+        let mut top_n = top_n.boxed().execute();
 
         // consume the init epoch
-        top_n_executor.next().await.unwrap().unwrap();
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            *res.as_chunk().unwrap(),
+            top_n.expect_chunk().await.sort_rows(),
             StreamChunk::from_pretty(
                 "  I I
                 +  1 0
                 +  2 1
                 +  3 2
-                + 10 3
                 +  9 4
-                - 10 3
                 +  8 5"
             )
+            .sort_rows(),
         );
         // We added (1, 2, 3, 10, 9, 8).
         // Now (1, 2, 3, 8, 9)
         // Barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            *res.as_chunk().unwrap(),
+            top_n.expect_chunk().await.sort_rows(),
             StreamChunk::from_pretty(
                 " I I
                 - 9 4
-                + 7 6
                 - 8 5
                 + 3 7
-                - 7 6
                 + 1 8"
             )
+            .sort_rows(),
         );
         // We added (7, 3, 1, 9).
         // Now (1, 1, 2, 3, 3)
         // Barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            *res.as_chunk().unwrap(),
+            top_n.expect_chunk().await.sort_rows(),
             StreamChunk::from_pretty(
                 " I  I
                 - 3  7
@@ -323,6 +308,7 @@ mod tests {
                 - 3  2
                 + 1 13"
             )
+            .sort_rows(),
         );
         // We added (1, 1, 2, 3).
         // Now (1, 1, 1, 1, 2)
@@ -338,47 +324,37 @@ mod tests {
         )
         .await;
 
-        let info = ExecutorInfo {
-            schema: source.schema().clone(),
-            pk_indices: source.pk_indices().to_vec(),
-            identity: "AppendOnlyTopNExecutor 1".to_string(),
-        };
-        let top_n_executor = Box::new(
-            AppendOnlyTopNExecutor::<_, false>::new(
-                source as Box<dyn Executor>,
-                ActorContext::create(0),
-                info,
-                storage_key(),
-                (3, 4),
-                order_by(),
-                state_table,
-            )
-            .unwrap(),
-        );
-        let mut top_n_executor = top_n_executor.execute();
+        let schema = source.schema().clone();
+        let top_n = AppendOnlyTopNExecutor::<_, false>::new(
+            source,
+            ActorContext::for_test(0),
+            schema,
+            storage_key(),
+            (3, 4),
+            order_by(),
+            state_table,
+        )
+        .unwrap();
+        let mut top_n = top_n.boxed().execute();
 
         // consume the init epoch
-        top_n_executor.next().await.unwrap().unwrap();
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            *res.as_chunk().unwrap(),
+            top_n.expect_chunk().await.sort_rows(),
             StreamChunk::from_pretty(
                 "  I I
                 + 10 3
                 +  9 4
                 +  8 5"
             )
+            .sort_rows(),
         );
         // We added (1, 2, 3, 10, 9, 8).
         // Now (1, 2, 3) -> (8, 9, 10)
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            *res.as_chunk().unwrap(),
+            top_n.expect_chunk().await.sort_rows(),
             StreamChunk::from_pretty(
                 "  I I
                 +  7 6
@@ -387,17 +363,14 @@ mod tests {
                 -  9 4
                 +  3 2"
             )
+            .sort_rows(),
         );
         // We added (7, 3, 1, 9).
         // Now (1, 1, 2) -> (3, 3, 7, 8)
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            *res.as_chunk().unwrap(),
+            top_n.expect_chunk().await.sort_rows(),
             StreamChunk::from_pretty(
                 " I  I
                 - 8  5
@@ -407,6 +380,7 @@ mod tests {
                 - 3  7
                 + 2 14"
             )
+            .sort_rows(),
         );
         // We added (1, 1, 2, 3).
         // Now (1, 1, 1) -> (1, 2, 2, 3)

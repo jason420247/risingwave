@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,50 +12,64 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::LazyLock;
+use std::any::type_name;
+use std::fmt::Debug;
 
+use anyhow::anyhow;
 use itertools::Itertools;
-use regex::Regex;
 
 pub const RW_INTERNAL_TABLE_FUNCTION_NAME: &str = "rw_table";
 
 pub fn generate_internal_table_name_with_type(
-    mview_name: &str,
+    job_name: &str,
     fragment_id: u32,
     table_id: u32,
     table_type: &str,
 ) -> String {
     format!(
         "__internal_{}_{}_{}_{}",
-        mview_name,
+        job_name,
         fragment_id,
         table_type.to_lowercase(),
         table_id
     )
 }
 
-pub fn valid_table_name(table_name: &str) -> bool {
-    static INTERNAL_TABLE_NAME: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"__internal_.*_\d+").unwrap());
-    !INTERNAL_TABLE_NAME.is_match(table_name)
+pub fn is_backfill_table(table_name: &str) -> bool {
+    let parts: Vec<&str> = table_name.split('_').collect();
+    let parts_len = parts.len();
+    parts_len >= 2 && parts[parts_len - 2] == "streamscan"
 }
 
-pub fn get_dist_key_in_pk_indices(dist_key_indices: &[usize], pk_indices: &[usize]) -> Vec<usize> {
-    let dist_key_in_pk_indices = dist_key_indices
+pub fn is_source_backfill_table(table_name: &str) -> bool {
+    let parts: Vec<&str> = table_name.split('_').collect();
+    let parts_len = parts.len();
+    parts_len >= 2 && parts[parts_len - 2] == "sourcebackfill"
+}
+
+pub fn get_dist_key_in_pk_indices<I: Eq + Copy + Debug, O: TryFrom<usize>>(
+    dist_key_indices: &[I],
+    pk_indices: &[I],
+) -> anyhow::Result<Vec<O>> {
+    dist_key_indices
         .iter()
         .map(|&di| {
             pk_indices
                 .iter()
                 .position(|&pi| di == pi)
-                .unwrap_or_else(|| {
-                    panic!(
+                .ok_or_else(|| {
+                    anyhow!(
                         "distribution key {:?} must be a subset of primary key {:?}",
-                        dist_key_indices, pk_indices
+                        dist_key_indices,
+                        pk_indices
                     )
                 })
+                .map(|idx| match O::try_from(idx) {
+                    Ok(idx) => idx,
+                    Err(_) => unreachable!("failed to cast {} to {}", idx, type_name::<O>()),
+                })
         })
-        .collect_vec();
-    dist_key_in_pk_indices
+        .try_collect()
 }
 
 /// Get distribution key start index in pk, and return None if `dist_key_in_pk_indices` is not empty

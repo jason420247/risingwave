@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,20 @@
 use bytes::Bytes;
 use pgwire::types::{Format, FormatIterator};
 use risingwave_common::bail;
-use risingwave_common::error::{ErrorCode, Result};
-use risingwave_common::types::{Datum, FromSqlError, ScalarImpl};
+use risingwave_common::error::BoxedError;
+use risingwave_common::types::{Datum, ScalarImpl};
 
-use super::statement::RewriteExprsRecursive;
 use super::BoundStatement;
-use crate::expr::{Expr, ExprImpl, ExprRewriter, Literal};
+use super::statement::RewriteExprsRecursive;
+use crate::error::{ErrorCode, Result};
+use crate::expr::{Expr, ExprImpl, ExprRewriter, Literal, default_rewrite_expr};
 
 /// Rewrites parameter expressions to literals.
 pub(crate) struct ParamRewriter {
     pub(crate) params: Vec<Option<Bytes>>,
     pub(crate) parsed_params: Vec<Datum>,
     pub(crate) param_formats: Vec<Format>,
-    pub(crate) error: Option<FromSqlError>,
+    pub(crate) error: Option<BoxedError>,
 }
 
 impl ParamRewriter {
@@ -46,22 +47,12 @@ impl ExprRewriter for ParamRewriter {
         if self.error.is_some() {
             return expr;
         }
-        match expr {
-            ExprImpl::InputRef(inner) => self.rewrite_input_ref(*inner),
-            ExprImpl::Literal(inner) => self.rewrite_literal(*inner),
-            ExprImpl::FunctionCall(inner) => self.rewrite_function_call(*inner),
-            ExprImpl::FunctionCallWithLambda(inner) => {
-                self.rewrite_function_call_with_lambda(*inner)
-            }
-            ExprImpl::AggCall(inner) => self.rewrite_agg_call(*inner),
-            ExprImpl::Subquery(inner) => self.rewrite_subquery(*inner),
-            ExprImpl::CorrelatedInputRef(inner) => self.rewrite_correlated_input_ref(*inner),
-            ExprImpl::TableFunction(inner) => self.rewrite_table_function(*inner),
-            ExprImpl::WindowFunction(inner) => self.rewrite_window_function(*inner),
-            ExprImpl::UserDefinedFunction(inner) => self.rewrite_user_defined_function(*inner),
-            ExprImpl::Parameter(inner) => self.rewrite_parameter(*inner),
-            ExprImpl::Now(inner) => self.rewrite_now(*inner),
-        }
+        default_rewrite_expr(self, expr)
+    }
+
+    fn rewrite_subquery(&mut self, mut subquery: crate::expr::Subquery) -> ExprImpl {
+        subquery.query.rewrite_exprs_recursive(self);
+        subquery.into()
     }
 
     fn rewrite_parameter(&mut self, parameter: crate::expr::Parameter) -> ExprImpl {
@@ -71,9 +62,20 @@ impl ExprRewriter for ParamRewriter {
         // But we store it in 0-based vector. So we need to minus 1.
         let parameter_index = (parameter.index - 1) as usize;
 
+        fn cstr_to_str(b: &[u8]) -> std::result::Result<&str, BoxedError> {
+            let without_null = if b.last() == Some(&0) {
+                &b[..b.len() - 1]
+            } else {
+                b
+            };
+            Ok(std::str::from_utf8(without_null)?)
+        }
+
         let datum: Datum = if let Some(val_bytes) = self.params[parameter_index].clone() {
             let res = match self.param_formats[parameter_index] {
-                Format::Text => ScalarImpl::from_text(&val_bytes, &data_type),
+                Format::Text => {
+                    cstr_to_str(&val_bytes).and_then(|str| ScalarImpl::from_text(str, &data_type))
+                }
                 Format::Binary => ScalarImpl::from_binary(&val_bytes, &data_type),
             };
             match res {
@@ -87,7 +89,7 @@ impl ExprRewriter for ParamRewriter {
             None
         };
 
-        self.parsed_params[parameter_index] = datum.clone();
+        self.parsed_params[parameter_index].clone_from(&datum);
         Literal::new(datum, data_type).into()
     }
 }
@@ -122,8 +124,8 @@ mod test {
     use risingwave_common::types::DataType;
     use risingwave_sqlparser::test_utils::parse_sql_statements;
 
-    use crate::binder::test_utils::{mock_binder, mock_binder_with_param_types};
     use crate::binder::BoundStatement;
+    use crate::binder::test_utils::{mock_binder, mock_binder_with_param_types};
 
     fn create_expect_bound(sql: &str) -> BoundStatement {
         let mut binder = mock_binder();
@@ -206,6 +208,19 @@ mod test {
             create_expect_bound("select 1,1::INT4"),
             create_actual_bound(
                 "select $1,$1::INT4",
+                vec![],
+                vec![Some("1".into())],
+                vec![Format::Text],
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn subquery() {
+        expect_actual_eq(
+            create_expect_bound("select (select '1')"),
+            create_actual_bound(
+                "select (select $1)",
                 vec![],
                 vec![Some("1".into())],
                 vec![Format::Text],

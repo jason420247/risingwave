@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,155 +14,40 @@
 
 use itertools::Itertools;
 use risingwave_meta::manager::MetadataManager;
-use risingwave_meta_model_v2::UserId;
-use risingwave_pb::user::grant_privilege::Object;
+use risingwave_meta_model::{SchemaId, UserId};
+use risingwave_pb::user::alter_default_privilege_request::Operation;
 use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::user_service_server::UserService;
 use risingwave_pb::user::{
-    CreateUserRequest, CreateUserResponse, DropUserRequest, DropUserResponse, GrantPrivilege,
-    GrantPrivilegeRequest, GrantPrivilegeResponse, RevokePrivilegeRequest, RevokePrivilegeResponse,
-    UpdateUserRequest, UpdateUserResponse,
+    AlterDefaultPrivilegeRequest, AlterDefaultPrivilegeResponse, CreateUserRequest,
+    CreateUserResponse, DropUserRequest, DropUserResponse, GrantPrivilegeRequest,
+    GrantPrivilegeResponse, RevokePrivilegeRequest, RevokePrivilegeResponse, UpdateUserRequest,
+    UpdateUserResponse,
 };
 use tonic::{Request, Response, Status};
 
-use crate::manager::{IdCategory, MetaSrvEnv};
-use crate::MetaResult;
-
 pub struct UserServiceImpl {
-    env: MetaSrvEnv,
     metadata_manager: MetadataManager,
 }
 
 impl UserServiceImpl {
-    pub fn new(env: MetaSrvEnv, metadata_manager: MetadataManager) -> Self {
-        Self {
-            env,
-            metadata_manager,
-        }
-    }
-
-    /// Expands `GrantPrivilege` with object `GrantAllTables` or `GrantAllSources` to specific
-    /// tables and sources, and set `with_grant_option` inside when grant privilege to a user.
-    async fn expand_privilege(
-        &self,
-        privileges: &[GrantPrivilege],
-        with_grant_option: Option<bool>,
-    ) -> MetaResult<Vec<GrantPrivilege>> {
-        let mut expanded_privileges = Vec::new();
-        for privilege in privileges {
-            if let Some(Object::AllTablesSchemaId(schema_id)) = &privilege.object {
-                let tables = match &self.metadata_manager {
-                    MetadataManager::V1(mgr) => {
-                        mgr.catalog_manager
-                            .list_readonly_table_ids(*schema_id)
-                            .await
-                    }
-                    MetadataManager::V2(mgr) => mgr
-                        .catalog_controller
-                        .list_readonly_table_ids(*schema_id as _)
-                        .await?
-                        .into_iter()
-                        .map(|id| id as _)
-                        .collect(),
-                };
-                for table_id in tables {
-                    let mut privilege = privilege.clone();
-                    privilege.object = Some(Object::TableId(table_id));
-                    if let Some(true) = with_grant_option {
-                        privilege
-                            .action_with_opts
-                            .iter_mut()
-                            .for_each(|p| p.with_grant_option = true);
-                    }
-                    expanded_privileges.push(privilege);
-                }
-            } else if let Some(Object::AllDmlTablesSchemaId(schema_id)) = &privilege.object {
-                let tables = match &self.metadata_manager {
-                    MetadataManager::V1(mgr) => {
-                        mgr.catalog_manager.list_dml_table_ids(*schema_id).await
-                    }
-                    MetadataManager::V2(mgr) => mgr
-                        .catalog_controller
-                        .list_dml_table_ids(*schema_id as _)
-                        .await?
-                        .into_iter()
-                        .map(|id| id as _)
-                        .collect(),
-                };
-                for table_id in tables {
-                    let mut privilege = privilege.clone();
-                    privilege.object = Some(Object::TableId(table_id));
-                    if let Some(true) = with_grant_option {
-                        privilege
-                            .action_with_opts
-                            .iter_mut()
-                            .for_each(|p| p.with_grant_option = true);
-                    }
-                    expanded_privileges.push(privilege);
-                }
-            } else if let Some(Object::AllSourcesSchemaId(schema_id)) = &privilege.object {
-                let sources = match &self.metadata_manager {
-                    MetadataManager::V1(mgr) => {
-                        mgr.catalog_manager.list_source_ids(*schema_id).await
-                    }
-                    MetadataManager::V2(mgr) => mgr
-                        .catalog_controller
-                        .list_source_ids(*schema_id as _)
-                        .await?
-                        .into_iter()
-                        .map(|id| id as _)
-                        .collect(),
-                };
-                for source_id in sources {
-                    let mut privilege = privilege.clone();
-                    privilege.object = Some(Object::SourceId(source_id));
-                    if let Some(with_grant_option) = with_grant_option {
-                        privilege.action_with_opts.iter_mut().for_each(|p| {
-                            p.with_grant_option = with_grant_option;
-                        });
-                    }
-                    expanded_privileges.push(privilege);
-                }
-            } else {
-                let mut privilege = privilege.clone();
-                if let Some(with_grant_option) = with_grant_option {
-                    privilege.action_with_opts.iter_mut().for_each(|p| {
-                        p.with_grant_option = with_grant_option;
-                    });
-                }
-                expanded_privileges.push(privilege);
-            }
-        }
-
-        Ok(expanded_privileges)
+    pub fn new(metadata_manager: MetadataManager) -> Self {
+        Self { metadata_manager }
     }
 }
 
 #[async_trait::async_trait]
 impl UserService for UserServiceImpl {
-    #[cfg_attr(coverage, coverage(off))]
     async fn create_user(
         &self,
         request: Request<CreateUserRequest>,
     ) -> Result<Response<CreateUserResponse>, Status> {
         let req = request.into_inner();
-        let version = match &self.metadata_manager {
-            MetadataManager::V1(mgr) => {
-                let id = self
-                    .env
-                    .id_gen_manager()
-                    .generate::<{ IdCategory::User }>()
-                    .await? as u32;
-                let mut user = req.get_user()?.clone();
-                user.id = id;
-                mgr.catalog_manager.create_user(&user).await?
-            }
-            MetadataManager::V2(mgr) => {
-                mgr.catalog_controller
-                    .create_user(req.get_user()?.clone())
-                    .await?
-            }
-        };
+        let version = self
+            .metadata_manager
+            .catalog_controller
+            .create_user(req.get_user()?.clone())
+            .await?;
 
         Ok(Response::new(CreateUserResponse {
             status: None,
@@ -170,16 +55,16 @@ impl UserService for UserServiceImpl {
         }))
     }
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn drop_user(
         &self,
         request: Request<DropUserRequest>,
     ) -> Result<Response<DropUserResponse>, Status> {
         let req = request.into_inner();
-        let version = match &self.metadata_manager {
-            MetadataManager::V1(mgr) => mgr.catalog_manager.drop_user(req.user_id).await?,
-            MetadataManager::V2(mgr) => mgr.catalog_controller.drop_user(req.user_id as _).await?,
-        };
+        let version = self
+            .metadata_manager
+            .catalog_controller
+            .drop_user(req.user_id as _)
+            .await?;
 
         Ok(Response::new(DropUserResponse {
             status: None,
@@ -187,7 +72,6 @@ impl UserService for UserServiceImpl {
         }))
     }
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn update_user(
         &self,
         request: Request<UpdateUserRequest>,
@@ -200,18 +84,11 @@ impl UserService for UserServiceImpl {
             .collect_vec();
         let user = req.get_user()?.clone();
 
-        let version = match &self.metadata_manager {
-            MetadataManager::V1(mgr) => {
-                mgr.catalog_manager
-                    .update_user(&user, &update_fields)
-                    .await?
-            }
-            MetadataManager::V2(mgr) => {
-                mgr.catalog_controller
-                    .update_user(user, &update_fields)
-                    .await?
-            }
-        };
+        let version = self
+            .metadata_manager
+            .catalog_controller
+            .update_user(user, &update_fields)
+            .await?;
 
         Ok(Response::new(UpdateUserResponse {
             status: None,
@@ -219,28 +96,22 @@ impl UserService for UserServiceImpl {
         }))
     }
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn grant_privilege(
         &self,
         request: Request<GrantPrivilegeRequest>,
     ) -> Result<Response<GrantPrivilegeResponse>, Status> {
         let req = request.into_inner();
-        let new_privileges = self
-            .expand_privilege(req.get_privileges(), Some(req.with_grant_option))
+        let user_ids: Vec<_> = req.get_user_ids().iter().map(|id| *id as UserId).collect();
+        let version = self
+            .metadata_manager
+            .catalog_controller
+            .grant_privilege(
+                user_ids,
+                req.get_privileges(),
+                req.granted_by as _,
+                req.with_grant_option,
+            )
             .await?;
-        let version = match &self.metadata_manager {
-            MetadataManager::V1(mgr) => {
-                mgr.catalog_manager
-                    .grant_privilege(&req.user_ids, &new_privileges, req.granted_by)
-                    .await?
-            }
-            MetadataManager::V2(mgr) => {
-                let user_ids: Vec<_> = req.get_user_ids().iter().map(|id| *id as UserId).collect();
-                mgr.catalog_controller
-                    .grant_privilege(user_ids, &new_privileges, req.granted_by as _)
-                    .await?
-            }
-        };
 
         Ok(Response::new(GrantPrivilegeResponse {
             status: None,
@@ -248,44 +119,81 @@ impl UserService for UserServiceImpl {
         }))
     }
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn revoke_privilege(
         &self,
         request: Request<RevokePrivilegeRequest>,
     ) -> Result<Response<RevokePrivilegeResponse>, Status> {
         let req = request.into_inner();
-        let privileges = self.expand_privilege(req.get_privileges(), None).await?;
-        let version = match &self.metadata_manager {
-            MetadataManager::V1(mgr) => {
-                mgr.catalog_manager
-                    .revoke_privilege(
-                        &req.user_ids,
-                        &privileges,
-                        req.granted_by,
-                        req.revoke_by,
-                        req.revoke_grant_option,
-                        req.cascade,
-                    )
-                    .await?
-            }
-            MetadataManager::V2(mgr) => {
-                let user_ids: Vec<_> = req.get_user_ids().iter().map(|id| *id as UserId).collect();
-                mgr.catalog_controller
-                    .revoke_privilege(
-                        user_ids,
-                        &privileges,
-                        Some(req.granted_by as _),
-                        req.revoke_by as _,
-                        req.revoke_grant_option,
-                        req.cascade,
-                    )
-                    .await?
-            }
-        };
+        let user_ids: Vec<_> = req.get_user_ids().iter().map(|id| *id as UserId).collect();
+        let version = self
+            .metadata_manager
+            .catalog_controller
+            .revoke_privilege(
+                user_ids,
+                req.get_privileges(),
+                req.granted_by as _,
+                req.revoke_by as _,
+                req.revoke_grant_option,
+                req.cascade,
+            )
+            .await?;
 
         Ok(Response::new(RevokePrivilegeResponse {
             status: None,
             version,
+        }))
+    }
+
+    async fn alter_default_privilege(
+        &self,
+        request: Request<AlterDefaultPrivilegeRequest>,
+    ) -> Result<Response<AlterDefaultPrivilegeResponse>, Status> {
+        let req = request.into_inner();
+        let operation = req.get_operation()?;
+        let user_ids: Vec<_> = req.get_user_ids().iter().map(|id| *id as UserId).collect();
+        let schema_ids: Vec<_> = req.schema_ids.iter().map(|id| *id as SchemaId).collect();
+        match operation {
+            Operation::GrantPrivilege(grant_privilege) => {
+                self.metadata_manager
+                    .catalog_controller
+                    .grant_default_privileges(
+                        user_ids,
+                        req.database_id as _,
+                        schema_ids,
+                        req.granted_by as _,
+                        grant_privilege.actions().collect(),
+                        grant_privilege.get_object_type()?,
+                        grant_privilege
+                            .grantees
+                            .iter()
+                            .map(|id| *id as UserId)
+                            .collect(),
+                        grant_privilege.with_grant_option,
+                    )
+                    .await?
+            }
+            Operation::RevokePrivilege(revoke_privilege) => {
+                self.metadata_manager
+                    .catalog_controller
+                    .revoke_default_privileges(
+                        user_ids,
+                        req.database_id as _,
+                        schema_ids,
+                        revoke_privilege.actions().collect(),
+                        revoke_privilege.get_object_type()?,
+                        revoke_privilege
+                            .grantees
+                            .iter()
+                            .map(|id| *id as UserId)
+                            .collect(),
+                        revoke_privilege.revoke_grant_option,
+                    )
+                    .await?
+            }
+        }
+
+        Ok(Response::new(AlterDefaultPrivilegeResponse {
+            status: None,
         }))
     }
 }

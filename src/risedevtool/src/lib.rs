@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 #![allow(clippy::derive_partial_eq_without_eq)]
 #![feature(exit_status_error)]
 #![feature(let_chains)]
-#![feature(lint_reasons)]
 
 mod config;
 pub use config::*;
@@ -25,10 +24,6 @@ mod preflight_check;
 pub use preflight_check::*;
 pub mod service_config;
 pub use service_config::*;
-mod compose;
-pub use compose::*;
-mod compose_deploy;
-pub use compose_deploy::*;
 mod risedev_env;
 pub use risedev_env::*;
 

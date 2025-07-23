@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,6 +37,14 @@ mod side_effect_visitor;
 pub use side_effect_visitor::*;
 mod cardinality_visitor;
 pub use cardinality_visitor::*;
+mod jsonb_stream_key_checker;
+pub use jsonb_stream_key_checker::*;
+mod distributed_dml_visitor;
+mod read_storage_table_visitor;
+mod rw_timestamp_validator;
+pub use distributed_dml_visitor::*;
+pub use read_storage_table_visitor::*;
+pub use rw_timestamp_validator::*;
 
 use crate::for_all_plan_nodes;
 use crate::optimizer::plan_node::*;
@@ -89,11 +97,20 @@ macro_rules! def_visitor {
 
             paste! {
                 fn visit(&mut self, plan: PlanRef) -> Self::Result {
-                    match plan.node_type() {
-                        $(
-                            PlanNodeType::[<$convention $name>] => self.[<visit_ $convention:snake _ $name:snake>](plan.downcast_ref::<[<$convention $name>]>().unwrap()),
-                        )*
-                    }
+                    use risingwave_common::util::recursive::{tracker, Recurse};
+                    use crate::session::current::notice_to_user;
+
+                    tracker!().recurse(|t| {
+                        if t.depth_reaches(PLAN_DEPTH_THRESHOLD) {
+                            notice_to_user(PLAN_TOO_DEEP_NOTICE);
+                        }
+
+                        match plan.node_type() {
+                            $(
+                                PlanNodeType::[<$convention $name>] => self.[<visit_ $convention:snake _ $name:snake>](plan.downcast_ref::<[<$convention $name>]>().unwrap()),
+                            )*
+                        }
+                    })
                 }
 
                 $(

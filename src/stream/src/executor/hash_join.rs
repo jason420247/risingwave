@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,133 +11,37 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
+use std::assert_matches::assert_matches;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::marker::PhantomData;
 use std::time::Duration;
 
-use await_tree::InstrumentAwait;
-use futures::{pin_mut, Stream, StreamExt};
-use futures_async_stream::try_stream;
+use anyhow::Context;
 use itertools::Itertools;
 use multimap::MultiMap;
-use risingwave_common::array::{Op, RowRef, StreamChunk};
-use risingwave_common::catalog::Schema;
+use risingwave_common::array::Op;
 use risingwave_common::hash::{HashKey, NullBitmap};
-use risingwave_common::row::{OwnedRow, Row};
-use risingwave_common::types::{DataType, DefaultOrd, ToOwnedDatum};
+use risingwave_common::row::RowExt;
+use risingwave_common::types::{DefaultOrd, ToOwnedDatum};
 use risingwave_common::util::epoch::EpochPair;
 use risingwave_common::util::iter_util::ZipEqDebug;
-use risingwave_expr::expr::NonStrictExpression;
 use risingwave_expr::ExprError;
-use risingwave_storage::StateStore;
+use risingwave_expr::expr::NonStrictExpression;
 use tokio::time::Instant;
 
-use self::JoinType::{FullOuter, LeftOuter, LeftSemi, RightAnti, RightOuter, RightSemi};
+use self::builder::JoinChunkBuilder;
 use super::barrier_align::*;
-use super::error::{StreamExecutorError, StreamExecutorResult};
-use super::managed_state::join::*;
-use super::monitor::StreamingMetrics;
+use super::join::hash_join::*;
+use super::join::row::{JoinEncoding, JoinRow};
+use super::join::*;
 use super::watermark::*;
-use super::{
-    ActorContextRef, BoxedExecutor, BoxedMessageStream, Executor, ExecutorInfo, Message,
-    PkIndicesRef, Watermark,
-};
-use crate::common::table::state_table::StateTable;
-use crate::common::JoinStreamChunkBuilder;
-use crate::executor::expect_first_barrier_from_aligned_stream;
-use crate::executor::JoinType::LeftAnti;
-use crate::task::AtomicU64Ref;
-
-/// The `JoinType` and `SideType` are to mimic a enum, because currently
-/// enum is not supported in const generic.
-// TODO: Use enum to replace this once [feature(adt_const_params)](https://github.com/rust-lang/rust/issues/95174) get completed.
-pub type JoinTypePrimitive = u8;
+use crate::executor::CachedJoinRow;
+use crate::executor::join::builder::JoinStreamChunkBuilder;
+use crate::executor::join::hash_join::CacheResult;
+use crate::executor::prelude::*;
 
 /// Evict the cache every n rows.
 const EVICT_EVERY_N_ROWS: u32 = 16;
-
-#[allow(non_snake_case, non_upper_case_globals)]
-pub mod JoinType {
-    use super::JoinTypePrimitive;
-    pub const Inner: JoinTypePrimitive = 0;
-    pub const LeftOuter: JoinTypePrimitive = 1;
-    pub const RightOuter: JoinTypePrimitive = 2;
-    pub const FullOuter: JoinTypePrimitive = 3;
-    pub const LeftSemi: JoinTypePrimitive = 4;
-    pub const LeftAnti: JoinTypePrimitive = 5;
-    pub const RightSemi: JoinTypePrimitive = 6;
-    pub const RightAnti: JoinTypePrimitive = 7;
-}
-
-pub type SideTypePrimitive = u8;
-#[allow(non_snake_case, non_upper_case_globals)]
-pub mod SideType {
-    use super::SideTypePrimitive;
-    pub const Left: SideTypePrimitive = 0;
-    pub const Right: SideTypePrimitive = 1;
-}
-
-const fn is_outer_side(join_type: JoinTypePrimitive, side_type: SideTypePrimitive) -> bool {
-    join_type == JoinType::FullOuter
-        || (join_type == JoinType::LeftOuter && side_type == SideType::Left)
-        || (join_type == JoinType::RightOuter && side_type == SideType::Right)
-}
-
-const fn outer_side_null(join_type: JoinTypePrimitive, side_type: SideTypePrimitive) -> bool {
-    join_type == JoinType::FullOuter
-        || (join_type == JoinType::LeftOuter && side_type == SideType::Right)
-        || (join_type == JoinType::RightOuter && side_type == SideType::Left)
-}
-
-/// Send the update only once if the join type is semi/anti and the update is the same side as the
-/// join
-const fn forward_exactly_once(join_type: JoinTypePrimitive, side_type: SideTypePrimitive) -> bool {
-    ((join_type == JoinType::LeftSemi || join_type == JoinType::LeftAnti)
-        && side_type == SideType::Left)
-        || ((join_type == JoinType::RightSemi || join_type == JoinType::RightAnti)
-            && side_type == SideType::Right)
-}
-
-const fn only_forward_matched_side(
-    join_type: JoinTypePrimitive,
-    side_type: SideTypePrimitive,
-) -> bool {
-    ((join_type == JoinType::LeftSemi || join_type == JoinType::LeftAnti)
-        && side_type == SideType::Right)
-        || ((join_type == JoinType::RightSemi || join_type == JoinType::RightAnti)
-            && side_type == SideType::Left)
-}
-
-const fn is_semi(join_type: JoinTypePrimitive) -> bool {
-    join_type == JoinType::LeftSemi || join_type == JoinType::RightSemi
-}
-
-const fn is_anti(join_type: JoinTypePrimitive) -> bool {
-    join_type == JoinType::LeftAnti || join_type == JoinType::RightAnti
-}
-
-const fn is_left_semi_or_anti(join_type: JoinTypePrimitive) -> bool {
-    join_type == JoinType::LeftSemi || join_type == JoinType::LeftAnti
-}
-
-const fn is_right_semi_or_anti(join_type: JoinTypePrimitive) -> bool {
-    join_type == JoinType::RightSemi || join_type == JoinType::RightAnti
-}
-
-const fn need_left_degree(join_type: JoinTypePrimitive) -> bool {
-    join_type == FullOuter
-        || join_type == LeftOuter
-        || join_type == LeftAnti
-        || join_type == LeftSemi
-}
-
-const fn need_right_degree(join_type: JoinTypePrimitive) -> bool {
-    join_type == FullOuter
-        || join_type == RightOuter
-        || join_type == RightAnti
-        || join_type == RightSemi
-}
 
 fn is_subset(vec1: Vec<usize>, vec2: Vec<usize>) -> bool {
     HashSet::<usize>::from_iter(vec1).is_subset(&vec2.into_iter().collect())
@@ -159,9 +63,9 @@ impl JoinParams {
     }
 }
 
-struct JoinSide<K: HashKey, S: StateStore> {
+struct JoinSide<K: HashKey, S: StateStore, E: JoinEncoding> {
     /// Store all data from a one side stream
-    ht: JoinHashMap<K, S>,
+    ht: JoinHashMap<K, S, E>,
     /// Indices of the join key columns
     join_key_indices: Vec<usize>,
     /// The data type of all columns without degree.
@@ -186,9 +90,10 @@ struct JoinSide<K: HashKey, S: StateStore> {
     state_clean_columns: Vec<(usize, usize)>,
     /// Whether degree table is needed for this side.
     need_degree_table: bool,
+    _marker: std::marker::PhantomData<E>,
 }
 
-impl<K: HashKey, S: StateStore> std::fmt::Debug for JoinSide<K, S> {
+impl<K: HashKey, S: StateStore, E: JoinEncoding> std::fmt::Debug for JoinSide<K, S, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JoinSide")
             .field("join_key_indices", &self.join_key_indices)
@@ -200,7 +105,7 @@ impl<K: HashKey, S: StateStore> std::fmt::Debug for JoinSide<K, S> {
     }
 }
 
-impl<K: HashKey, S: StateStore> JoinSide<K, S> {
+impl<K: HashKey, S: StateStore, E: JoinEncoding> JoinSide<K, S, E> {
     // WARNING: Please do not call this until we implement it.
     fn is_dirty(&self) -> bool {
         unimplemented!()
@@ -217,27 +122,28 @@ impl<K: HashKey, S: StateStore> JoinSide<K, S> {
         // self.ht.clear();
     }
 
-    pub fn init(&mut self, epoch: EpochPair) {
-        self.ht.init(epoch);
+    pub async fn init(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+        self.ht.init(epoch).await
     }
 }
 
 /// `HashJoinExecutor` takes two input streams and runs equal hash join on them.
 /// The output columns are the concatenation of left and right columns.
-pub struct HashJoinExecutor<K: HashKey, S: StateStore, const T: JoinTypePrimitive> {
+pub struct HashJoinExecutor<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
+{
     ctx: ActorContextRef,
     info: ExecutorInfo,
 
     /// Left input executor
-    input_l: Option<BoxedExecutor>,
+    input_l: Option<Executor>,
     /// Right input executor
-    input_r: Option<BoxedExecutor>,
+    input_r: Option<Executor>,
     /// The data types of the formed new columns
     actual_output_data_types: Vec<DataType>,
     /// The parameters of the left join executor
-    side_l: JoinSide<K, S>,
+    side_l: JoinSide<K, S, E>,
     /// The parameters of the right join executor
-    side_r: JoinSide<K, S>,
+    side_r: JoinSide<K, S, E>,
     /// Optional non-equi join conditions
     cond: Option<NonStrictExpression>,
     /// Column indices of watermark output and offset expression of each inequality, respectively.
@@ -258,10 +164,16 @@ pub struct HashJoinExecutor<K: HashKey, S: StateStore, const T: JoinTypePrimitiv
 
     /// watermark column index -> `BufferedWatermarks`
     watermark_buffers: BTreeMap<usize, BufferedWatermarks<SideTypePrimitive>>,
+
+    /// When to alert high join amplification
+    high_join_amplification_threshold: usize,
+
+    /// Max number of rows that will be cached in the entry state.
+    entry_state_max_rows: usize,
 }
 
-impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> std::fmt::Debug
-    for HashJoinExecutor<K, S, T>
+impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding> std::fmt::Debug
+    for HashJoinExecutor<K, S, T, E>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HashJoinExecutor")
@@ -277,32 +189,18 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> std::fmt::Debug
     }
 }
 
-impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> Executor for HashJoinExecutor<K, S, T> {
+impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding> Execute
+    for HashJoinExecutor<K, S, T, E>
+{
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.into_stream().boxed()
     }
-
-    fn schema(&self) -> &Schema {
-        &self.info.schema
-    }
-
-    fn pk_indices(&self) -> PkIndicesRef<'_> {
-        &self.info.pk_indices
-    }
-
-    fn identity(&self) -> &str {
-        &self.info.identity
-    }
 }
 
-struct HashJoinChunkBuilder<const T: JoinTypePrimitive, const SIDE: SideTypePrimitive> {
-    stream_chunk_builder: JoinStreamChunkBuilder,
-}
-
-struct EqJoinArgs<'a, K: HashKey, S: StateStore> {
+struct EqJoinArgs<'a, K: HashKey, S: StateStore, E: JoinEncoding> {
     ctx: &'a ActorContextRef,
-    side_l: &'a mut JoinSide<K, S>,
-    side_r: &'a mut JoinSide<K, S>,
+    side_l: &'a mut JoinSide<K, S, E>,
+    side_r: &'a mut JoinSide<K, S, E>,
     actual_output_data_types: &'a [DataType],
     cond: &'a mut Option<NonStrictExpression>,
     inequality_watermarks: &'a [Option<Watermark>],
@@ -310,130 +208,19 @@ struct EqJoinArgs<'a, K: HashKey, S: StateStore> {
     append_only_optimize: bool,
     chunk_size: usize,
     cnt_rows_received: &'a mut u32,
+    high_join_amplification_threshold: usize,
+    entry_state_max_rows: usize,
 }
 
-impl<const T: JoinTypePrimitive, const SIDE: SideTypePrimitive> HashJoinChunkBuilder<T, SIDE> {
-    fn with_match_on_insert(
-        &mut self,
-        row: &RowRef<'_>,
-        matched_row: &JoinRow<OwnedRow>,
-    ) -> Option<StreamChunk> {
-        // Left/Right Anti sides
-        if is_anti(T) {
-            if matched_row.is_zero_degree() && only_forward_matched_side(T, SIDE) {
-                self.stream_chunk_builder
-                    .append_row_matched(Op::Delete, &matched_row.row)
-            } else {
-                None
-            }
-        // Left/Right Semi sides
-        } else if is_semi(T) {
-            if matched_row.is_zero_degree() && only_forward_matched_side(T, SIDE) {
-                self.stream_chunk_builder
-                    .append_row_matched(Op::Insert, &matched_row.row)
-            } else {
-                None
-            }
-        // Outer sides
-        } else if matched_row.is_zero_degree() && outer_side_null(T, SIDE) {
-            // if the matched_row does not have any current matches
-            // `StreamChunkBuilder` guarantees that `UpdateDelete` will never
-            // issue an output chunk.
-            if self
-                .stream_chunk_builder
-                .append_row_matched(Op::UpdateDelete, &matched_row.row)
-                .is_some()
-            {
-                unreachable!("`Op::UpdateDelete` should not yield chunk");
-            }
-            self.stream_chunk_builder
-                .append_row(Op::UpdateInsert, row, &matched_row.row)
-        // Inner sides
-        } else {
-            self.stream_chunk_builder
-                .append_row(Op::Insert, row, &matched_row.row)
-        }
-    }
-
-    fn with_match_on_delete(
-        &mut self,
-        row: &RowRef<'_>,
-        matched_row: &JoinRow<OwnedRow>,
-    ) -> Option<StreamChunk> {
-        // Left/Right Anti sides
-        if is_anti(T) {
-            if matched_row.is_zero_degree() && only_forward_matched_side(T, SIDE) {
-                self.stream_chunk_builder
-                    .append_row_matched(Op::Insert, &matched_row.row)
-            } else {
-                None
-            }
-        // Left/Right Semi sides
-        } else if is_semi(T) {
-            if matched_row.is_zero_degree() && only_forward_matched_side(T, SIDE) {
-                self.stream_chunk_builder
-                    .append_row_matched(Op::Delete, &matched_row.row)
-            } else {
-                None
-            }
-        // Outer sides
-        } else if matched_row.is_zero_degree() && outer_side_null(T, SIDE) {
-            // if the matched_row does not have any current
-            // matches
-            if self
-                .stream_chunk_builder
-                .append_row(Op::UpdateDelete, row, &matched_row.row)
-                .is_some()
-            {
-                unreachable!("`Op::UpdateDelete` should not yield chunk");
-            }
-            self.stream_chunk_builder
-                .append_row_matched(Op::UpdateInsert, &matched_row.row)
-        // Inner sides
-        } else {
-            // concat with the matched_row and append the new
-            // row
-            // FIXME: we always use `Op::Delete` here to avoid
-            // violating
-            // the assumption for U+ after U-.
-            self.stream_chunk_builder
-                .append_row(Op::Delete, row, &matched_row.row)
-        }
-    }
-
-    #[inline]
-    fn forward_exactly_once_if_matched(&mut self, op: Op, row: RowRef<'_>) -> Option<StreamChunk> {
-        // if it's a semi join and the side needs to be maintained.
-        if is_semi(T) && forward_exactly_once(T, SIDE) {
-            self.stream_chunk_builder.append_row_update(op, row)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn forward_if_not_matched(&mut self, op: Op, row: RowRef<'_>) -> Option<StreamChunk> {
-        // if it's outer join or anti join and the side needs to be maintained.
-        if (is_anti(T) && forward_exactly_once(T, SIDE)) || is_outer_side(T, SIDE) {
-            self.stream_chunk_builder.append_row_update(op, row)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn take(&mut self) -> Option<StreamChunk> {
-        self.stream_chunk_builder.take()
-    }
-}
-
-impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, S, T> {
+impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
+    HashJoinExecutor<K, S, T, E>
+{
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: ActorContextRef,
         info: ExecutorInfo,
-        input_l: BoxedExecutor,
-        input_r: BoxedExecutor,
+        input_l: Executor,
+        input_r: Executor,
         params_l: JoinParams,
         params_r: JoinParams,
         null_safe: Vec<bool>,
@@ -448,7 +235,63 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
         is_append_only: bool,
         metrics: Arc<StreamingMetrics>,
         chunk_size: usize,
+        high_join_amplification_threshold: usize,
     ) -> Self {
+        Self::new_with_cache_size(
+            ctx,
+            info,
+            input_l,
+            input_r,
+            params_l,
+            params_r,
+            null_safe,
+            output_indices,
+            cond,
+            inequality_pairs,
+            state_table_l,
+            degree_state_table_l,
+            state_table_r,
+            degree_state_table_r,
+            watermark_epoch,
+            is_append_only,
+            metrics,
+            chunk_size,
+            high_join_amplification_threshold,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cache_size(
+        ctx: ActorContextRef,
+        info: ExecutorInfo,
+        input_l: Executor,
+        input_r: Executor,
+        params_l: JoinParams,
+        params_r: JoinParams,
+        null_safe: Vec<bool>,
+        output_indices: Vec<usize>,
+        cond: Option<NonStrictExpression>,
+        inequality_pairs: Vec<(usize, usize, bool, Option<NonStrictExpression>)>,
+        state_table_l: StateTable<S>,
+        degree_state_table_l: StateTable<S>,
+        state_table_r: StateTable<S>,
+        degree_state_table_r: StateTable<S>,
+        watermark_epoch: AtomicU64Ref,
+        is_append_only: bool,
+        metrics: Arc<StreamingMetrics>,
+        chunk_size: usize,
+        high_join_amplification_threshold: usize,
+        entry_state_max_rows: Option<usize>,
+    ) -> Self {
+        let entry_state_max_rows = match entry_state_max_rows {
+            None => {
+                ctx.streaming_config
+                    .developer
+                    .hash_join_entry_state_max_rows
+            }
+            Some(entry_state_max_rows) => entry_state_max_rows,
+        };
         let side_l_column_n = input_l.schema().len();
 
         let schema_fields = match T {
@@ -477,51 +320,59 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
         let state_pk_indices_l = input_l.pk_indices().to_vec();
         let state_pk_indices_r = input_r.pk_indices().to_vec();
 
-        let state_order_key_indices_l = state_table_l.pk_indices();
-        let state_order_key_indices_r = state_table_r.pk_indices();
+        let state_join_key_indices_l = params_l.join_key_indices;
+        let state_join_key_indices_r = params_r.join_key_indices;
 
-        let join_key_indices_l = params_l.join_key_indices;
-        let join_key_indices_r = params_r.join_key_indices;
+        let degree_join_key_indices_l = (0..state_join_key_indices_l.len()).collect_vec();
+        let degree_join_key_indices_r = (0..state_join_key_indices_r.len()).collect_vec();
 
-        let degree_pk_indices_l = (join_key_indices_l.len()
-            ..join_key_indices_l.len() + params_l.deduped_pk_indices.len())
+        let degree_pk_indices_l = (state_join_key_indices_l.len()
+            ..state_join_key_indices_l.len() + params_l.deduped_pk_indices.len())
             .collect_vec();
-        let degree_pk_indices_r = (join_key_indices_r.len()
-            ..join_key_indices_r.len() + params_r.deduped_pk_indices.len())
+        let degree_pk_indices_r = (state_join_key_indices_r.len()
+            ..state_join_key_indices_r.len() + params_r.deduped_pk_indices.len())
             .collect_vec();
 
         // If pk is contained in join key.
-        let pk_contained_in_jk_l = is_subset(state_pk_indices_l, join_key_indices_l.clone());
-        let pk_contained_in_jk_r = is_subset(state_pk_indices_r, join_key_indices_r.clone());
+        let pk_contained_in_jk_l =
+            is_subset(state_pk_indices_l.clone(), state_join_key_indices_l.clone());
+        let pk_contained_in_jk_r =
+            is_subset(state_pk_indices_r.clone(), state_join_key_indices_r.clone());
 
         // check whether join key contains pk in both side
         let append_only_optimize = is_append_only && pk_contained_in_jk_l && pk_contained_in_jk_r;
 
-        let join_key_data_types_l = join_key_indices_l
+        let join_key_data_types_l = state_join_key_indices_l
             .iter()
             .map(|idx| state_all_data_types_l[*idx].clone())
             .collect_vec();
 
-        let join_key_data_types_r = join_key_indices_r
+        let join_key_data_types_r = state_join_key_indices_r
             .iter()
             .map(|idx| state_all_data_types_r[*idx].clone())
             .collect_vec();
 
         assert_eq!(join_key_data_types_l, join_key_data_types_r);
 
-        let degree_all_data_types_l = state_order_key_indices_l
-            .iter()
-            .map(|idx| state_all_data_types_l[*idx].clone())
-            .collect_vec();
-        let degree_all_data_types_r = state_order_key_indices_r
-            .iter()
-            .map(|idx| state_all_data_types_r[*idx].clone())
-            .collect_vec();
-
         let null_matched = K::Bitmap::from_bool_vec(null_safe);
 
         let need_degree_table_l = need_left_degree(T) && !pk_contained_in_jk_r;
         let need_degree_table_r = need_right_degree(T) && !pk_contained_in_jk_l;
+
+        let degree_state_l = need_degree_table_l.then(|| {
+            TableInner::new(
+                degree_pk_indices_l,
+                degree_join_key_indices_l,
+                degree_state_table_l,
+            )
+        });
+        let degree_state_r = need_degree_table_r.then(|| {
+            TableInner::new(
+                degree_pk_indices_r,
+                degree_join_key_indices_r,
+                degree_state_table_r,
+            )
+        });
 
         let (left_to_output, right_to_output) = {
             let (left_len, right_len) = if is_left_semi_or_anti(T) {
@@ -609,21 +460,20 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                 ht: JoinHashMap::new(
                     watermark_epoch.clone(),
                     join_key_data_types_l,
+                    state_join_key_indices_l.clone(),
                     state_all_data_types_l.clone(),
                     state_table_l,
                     params_l.deduped_pk_indices,
-                    degree_all_data_types_l,
-                    degree_state_table_l,
-                    degree_pk_indices_l,
+                    degree_state_l,
                     null_matched.clone(),
-                    need_degree_table_l,
                     pk_contained_in_jk_l,
+                    None,
                     metrics.clone(),
                     ctx.id,
                     ctx.fragment_id,
                     "left",
                 ),
-                join_key_indices: join_key_indices_l,
+                join_key_indices: state_join_key_indices_l,
                 all_data_types: state_all_data_types_l,
                 i2o_mapping: left_to_output,
                 i2o_mapping_indexed: l2o_indexed,
@@ -632,26 +482,26 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                 state_clean_columns: l_state_clean_columns,
                 start_pos: 0,
                 need_degree_table: need_degree_table_l,
+                _marker: PhantomData,
             },
             side_r: JoinSide {
                 ht: JoinHashMap::new(
                     watermark_epoch,
                     join_key_data_types_r,
+                    state_join_key_indices_r.clone(),
                     state_all_data_types_r.clone(),
                     state_table_r,
                     params_r.deduped_pk_indices,
-                    degree_all_data_types_r,
-                    degree_state_table_r,
-                    degree_pk_indices_r,
+                    degree_state_r,
                     null_matched,
-                    need_degree_table_r,
                     pk_contained_in_jk_r,
+                    None,
                     metrics.clone(),
                     ctx.id,
                     ctx.fragment_id,
                     "right",
                 ),
-                join_key_indices: join_key_indices_r,
+                join_key_indices: state_join_key_indices_r,
                 all_data_types: state_all_data_types_r,
                 start_pos: side_l_column_n,
                 i2o_mapping: right_to_output,
@@ -660,6 +510,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                 non_null_fields: r_non_null_fields,
                 state_clean_columns: r_state_clean_columns,
                 need_degree_table: need_degree_table_r,
+                _marker: PhantomData,
             },
             cond,
             inequality_pairs,
@@ -669,6 +520,8 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
             chunk_size,
             cnt_rows_received: 0,
             watermark_buffers,
+            high_join_amplification_threshold,
+            entry_state_max_rows,
         }
     }
 
@@ -682,15 +535,19 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
             self.ctx.id,
             self.ctx.fragment_id,
             self.metrics.clone(),
+            "Join",
         );
         pin_mut!(aligned_stream);
 
-        let barrier = expect_first_barrier_from_aligned_stream(&mut aligned_stream).await?;
-        self.side_l.init(barrier.epoch);
-        self.side_r.init(barrier.epoch);
+        let actor_id = self.ctx.id;
 
+        let barrier = expect_first_barrier_from_aligned_stream(&mut aligned_stream).await?;
+        let first_epoch = barrier.epoch;
         // The first barrier message should be propagated.
         yield Message::Barrier(barrier);
+        self.side_l.init(first_epoch).await?;
+        self.side_r.init(first_epoch).await?;
+
         let actor_id_str = self.ctx.id.to_string();
         let fragment_id_str = self.ctx.fragment_id.to_string();
 
@@ -702,26 +559,30 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
         let left_join_match_duration_ns = self
             .metrics
             .join_match_duration_ns
-            .with_guarded_label_values(&[&actor_id_str, &fragment_id_str, "left"]);
+            .with_guarded_label_values(&[actor_id_str.as_str(), fragment_id_str.as_str(), "left"]);
         let right_join_match_duration_ns = self
             .metrics
             .join_match_duration_ns
-            .with_guarded_label_values(&[&actor_id_str, &fragment_id_str, "right"]);
+            .with_guarded_label_values(&[actor_id_str.as_str(), fragment_id_str.as_str(), "right"]);
 
         let barrier_join_match_duration_ns = self
             .metrics
             .join_match_duration_ns
-            .with_guarded_label_values(&[&actor_id_str, &fragment_id_str, "barrier"]);
+            .with_guarded_label_values(&[
+                actor_id_str.as_str(),
+                fragment_id_str.as_str(),
+                "barrier",
+            ]);
 
         let left_join_cached_entry_count = self
             .metrics
             .join_cached_entry_count
-            .with_guarded_label_values(&[&actor_id_str, &fragment_id_str, "left"]);
+            .with_guarded_label_values(&[actor_id_str.as_str(), fragment_id_str.as_str(), "left"]);
 
         let right_join_cached_entry_count = self
             .metrics
             .join_cached_entry_count
-            .with_guarded_label_values(&[&actor_id_str, &fragment_id_str, "right"]);
+            .with_guarded_label_values(&[actor_id_str.as_str(), fragment_id_str.as_str(), "right"]);
 
         let mut start_time = Instant::now();
 
@@ -761,6 +622,8 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         append_only_optimize: self.append_only_optimize,
                         chunk_size: self.chunk_size,
                         cnt_rows_received: &mut self.cnt_rows_received,
+                        high_join_amplification_threshold: self.high_join_amplification_threshold,
+                        entry_state_max_rows: self.entry_state_max_rows,
                     }) {
                         left_time += left_start_time.elapsed();
                         yield Message::Chunk(chunk?);
@@ -785,6 +648,8 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         append_only_optimize: self.append_only_optimize,
                         chunk_size: self.chunk_size,
                         cnt_rows_received: &mut self.cnt_rows_received,
+                        high_join_amplification_threshold: self.high_join_amplification_threshold,
+                        entry_state_max_rows: self.entry_state_max_rows,
                     }) {
                         right_time += right_start_time.elapsed();
                         yield Message::Chunk(chunk?);
@@ -796,22 +661,26 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                 }
                 AlignedMessage::Barrier(barrier) => {
                     let barrier_start_time = Instant::now();
-                    self.flush_data(barrier.epoch).await?;
+                    let (left_post_commit, right_post_commit) =
+                        self.flush_data(barrier.epoch).await?;
+
+                    let update_vnode_bitmap = barrier.as_update_vnode_bitmap(actor_id);
+                    yield Message::Barrier(barrier);
 
                     // Update the vnode bitmap for state tables of both sides if asked.
-                    if let Some(vnode_bitmap) = barrier.as_update_vnode_bitmap(self.ctx.id) {
-                        if self.side_l.ht.update_vnode_bitmap(vnode_bitmap.clone()) {
-                            self.watermark_buffers
-                                .values_mut()
-                                .for_each(|buffers| buffers.clear());
-                            self.inequality_watermarks.fill(None);
-                        }
-                        self.side_r.ht.update_vnode_bitmap(vnode_bitmap);
+                    right_post_commit
+                        .post_yield_barrier(update_vnode_bitmap.clone())
+                        .await?;
+                    if left_post_commit
+                        .post_yield_barrier(update_vnode_bitmap)
+                        .await?
+                        .unwrap_or(false)
+                    {
+                        self.watermark_buffers
+                            .values_mut()
+                            .for_each(|buffers| buffers.clear());
+                        self.inequality_watermarks.fill(None);
                     }
-
-                    // Update epoch for managed cache.
-                    self.side_l.ht.update_epoch(barrier.epoch.curr);
-                    self.side_r.ht.update_epoch(barrier.epoch.curr);
 
                     // Report metrics of cached join rows/entries
                     for (join_cached_entry_count, ht) in [
@@ -823,19 +692,24 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
 
                     barrier_join_match_duration_ns
                         .inc_by(barrier_start_time.elapsed().as_nanos() as u64);
-                    yield Message::Barrier(barrier);
                 }
             }
             start_time = Instant::now();
         }
     }
 
-    async fn flush_data(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+    async fn flush_data(
+        &mut self,
+        epoch: EpochPair,
+    ) -> StreamExecutorResult<(
+        JoinHashMapPostCommit<'_, K, S, E>,
+        JoinHashMapPostCommit<'_, K, S, E>,
+    )> {
         // All changes to the state has been buffered in the mem-table of the state table. Just
         // `commit` them here.
-        self.side_l.ht.flush(epoch).await?;
-        self.side_r.ht.flush(epoch).await?;
-        Ok(())
+        let left = self.side_l.ht.flush(epoch).await?;
+        let right = self.side_r.ht.flush(epoch).await?;
+        Ok((left, right))
     }
 
     async fn try_flush_data(&mut self) -> StreamExecutorResult<()> {
@@ -848,8 +722,8 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
 
     // We need to manually evict the cache.
     fn evict_cache(
-        side_update: &mut JoinSide<K, S>,
-        side_match: &mut JoinSide<K, S>,
+        side_update: &mut JoinSide<K, S, E>,
+        side_match: &mut JoinSide<K, S, E>,
         cnt_rows_received: &mut u32,
     ) {
         *cnt_rows_received += 1;
@@ -942,23 +816,10 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
         Ok(watermarks_to_emit)
     }
 
-    /// the data the hash table and match the coming
-    /// data chunk with the executor state
-    async fn hash_eq_match(
-        key: &K,
-        ht: &mut JoinHashMap<K, S>,
-    ) -> StreamExecutorResult<Option<HashValueType>> {
-        if !key.null_bitmap().is_subset(ht.null_matched()) {
-            Ok(None)
-        } else {
-            ht.take_state(key).await.map(Some)
-        }
-    }
-
     fn row_concat(
-        row_update: &RowRef<'_>,
+        row_update: impl Row,
         update_start_pos: usize,
-        row_matched: &OwnedRow,
+        row_matched: impl Row,
         matched_start_pos: usize,
     ) -> OwnedRow {
         let mut new_row = vec![None; row_update.len() + row_matched.len()];
@@ -966,28 +827,28 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
         for (i, datum_ref) in row_update.iter().enumerate() {
             new_row[i + update_start_pos] = datum_ref.to_owned_datum();
         }
-        for i in 0..row_matched.len() {
-            new_row[i + matched_start_pos] = row_matched[i].clone();
+        for (i, datum_ref) in row_matched.iter().enumerate() {
+            new_row[i + matched_start_pos] = datum_ref.to_owned_datum();
         }
         OwnedRow::new(new_row)
     }
 
     /// Used to forward `eq_join_oneside` to show join side in stack.
     fn eq_join_left(
-        args: EqJoinArgs<'_, K, S>,
+        args: EqJoinArgs<'_, K, S, E>,
     ) -> impl Stream<Item = Result<StreamChunk, StreamExecutorError>> + '_ {
         Self::eq_join_oneside::<{ SideType::Left }>(args)
     }
 
     /// Used to forward `eq_join_oneside` to show join side in stack.
     fn eq_join_right(
-        args: EqJoinArgs<'_, K, S>,
+        args: EqJoinArgs<'_, K, S, E>,
     ) -> impl Stream<Item = Result<StreamChunk, StreamExecutorError>> + '_ {
         Self::eq_join_oneside::<{ SideType::Right }>(args)
     }
 
     #[try_stream(ok = StreamChunk, error = StreamExecutorError)]
-    async fn eq_join_oneside<const SIDE: SideTypePrimitive>(args: EqJoinArgs<'_, K, S>) {
+    async fn eq_join_oneside<const SIDE: SideTypePrimitive>(args: EqJoinArgs<'_, K, S, E>) {
         let EqJoinArgs {
             ctx,
             side_l,
@@ -999,6 +860,8 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
             append_only_optimize,
             chunk_size,
             cnt_rows_received,
+            high_join_amplification_threshold,
+            entry_state_max_rows,
             ..
         } = args;
 
@@ -1018,257 +881,417 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
             })
             .collect_vec();
 
-        let mut hashjoin_chunk_builder = HashJoinChunkBuilder::<T, SIDE> {
-            stream_chunk_builder: JoinStreamChunkBuilder::new(
+        let mut hashjoin_chunk_builder =
+            JoinChunkBuilder::<T, SIDE>::new(JoinStreamChunkBuilder::new(
                 chunk_size,
                 actual_output_data_types.to_vec(),
                 side_update.i2o_mapping.clone(),
                 side_match.i2o_mapping.clone(),
-            ),
-        };
+            ));
 
         let join_matched_join_keys = ctx
             .streaming_metrics
             .join_matched_join_keys
-            .with_label_values(&[
+            .with_guarded_label_values(&[
                 &ctx.id.to_string(),
                 &ctx.fragment_id.to_string(),
                 &side_update.ht.table_id().to_string(),
             ]);
 
-        let keys = K::build(&side_update.join_key_indices, chunk.data_chunk())?;
+        let keys = K::build_many(&side_update.join_key_indices, chunk.data_chunk());
         for (r, key) in chunk.rows_with_holes().zip_eq_debug(keys.iter()) {
             let Some((op, row)) = r else {
                 continue;
             };
             Self::evict_cache(side_update, side_match, cnt_rows_received);
 
-            let matched_rows: Option<HashValueType> = if side_update
-                .non_null_fields
-                .iter()
-                .all(|column_idx| unsafe { row.datum_at_unchecked(*column_idx).is_some() })
-            {
-                Self::hash_eq_match(key, &mut side_match.ht).await?
-            } else {
-                None
+            let cache_lookup_result = {
+                let probe_non_null_requirement_satisfied = side_update
+                    .non_null_fields
+                    .iter()
+                    .all(|column_idx| unsafe { row.datum_at_unchecked(*column_idx).is_some() });
+                let build_non_null_requirement_satisfied =
+                    key.null_bitmap().is_subset(side_match.ht.null_matched());
+                if probe_non_null_requirement_satisfied && build_non_null_requirement_satisfied {
+                    side_match.ht.take_state_opt(key)
+                } else {
+                    CacheResult::NeverMatch
+                }
             };
+            let mut total_matches = 0;
 
-            if let Some(rows) = &matched_rows {
-                join_matched_join_keys.observe(rows.len() as _);
-            } else {
-                join_matched_join_keys.observe(0.0)
+            macro_rules! match_rows {
+                ($op:ident) => {
+                    Self::handle_match_rows::<SIDE, { JoinOp::$op }>(
+                        cache_lookup_result,
+                        row,
+                        key,
+                        &mut hashjoin_chunk_builder,
+                        side_match,
+                        side_update,
+                        &useful_state_clean_columns,
+                        cond,
+                        append_only_optimize,
+                        entry_state_max_rows,
+                    )
+                };
             }
 
             match op {
-                Op::Insert | Op::UpdateInsert => {
-                    let mut degree = 0;
-                    let mut append_only_matched_row: Option<JoinRow<OwnedRow>> = None;
-                    if let Some(mut matched_rows) = matched_rows {
-                        let mut matched_rows_to_clean = vec![];
-                        for (matched_row_ref, matched_row) in
-                            matched_rows.values_mut(&side_match.all_data_types)
-                        {
-                            let mut matched_row = matched_row?;
-                            // TODO(yuhao-su): We should find a better way to eval the expression
-                            // without concat two rows.
-                            // if there are non-equi expressions
-                            let check_join_condition = if let Some(ref mut cond) = cond {
-                                let new_row = Self::row_concat(
-                                    &row,
-                                    side_update.start_pos,
-                                    &matched_row.row,
-                                    side_match.start_pos,
-                                );
-
-                                cond.eval_row_infallible(&new_row)
-                                    .await
-                                    .map(|s| *s.as_bool())
-                                    .unwrap_or(false)
-                            } else {
-                                true
-                            };
-                            let mut need_state_clean = false;
-                            if check_join_condition {
-                                degree += 1;
-                                if !forward_exactly_once(T, SIDE) {
-                                    if let Some(chunk) = hashjoin_chunk_builder
-                                        .with_match_on_insert(&row, &matched_row)
-                                    {
-                                        yield chunk;
-                                    }
-                                }
-                                if side_match.need_degree_table {
-                                    side_match.ht.inc_degree(matched_row_ref, &mut matched_row);
-                                }
-                            } else {
-                                for (column_idx, watermark) in &useful_state_clean_columns {
-                                    if matched_row.row.datum_at(*column_idx).map_or(
-                                        false,
-                                        |scalar| {
-                                            scalar
-                                                .default_cmp(&watermark.val.as_scalar_ref_impl())
-                                                .is_lt()
-                                        },
-                                    ) {
-                                        need_state_clean = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            // If the stream is append-only and the join key covers pk in both side,
-                            // then we can remove matched rows since pk is unique and will not be
-                            // inserted again
-                            if append_only_optimize {
-                                // Since join key contains pk and pk is unique, there should be only
-                                // one row if matched.
-                                assert!(append_only_matched_row.is_none());
-                                append_only_matched_row = Some(matched_row);
-                            } else if need_state_clean {
-                                // `append_only_optimize` and `need_state_clean` won't both be true.
-                                // 'else' here is only to suppress compiler error.
-                                matched_rows_to_clean.push(matched_row);
-                            }
-                        }
-                        if degree == 0 {
-                            if let Some(chunk) =
-                                hashjoin_chunk_builder.forward_if_not_matched(Op::Insert, row)
-                            {
-                                yield chunk;
-                            }
-                        } else if let Some(chunk) =
-                            hashjoin_chunk_builder.forward_exactly_once_if_matched(Op::Insert, row)
-                        {
-                            yield chunk;
-                        }
-                        // Insert back the state taken from ht.
-                        side_match.ht.update_state(key, matched_rows);
-                        for matched_row in matched_rows_to_clean {
-                            if side_match.need_degree_table {
-                                side_match.ht.delete(key, matched_row);
-                            } else {
-                                side_match.ht.delete_row(key, matched_row.row);
-                            }
-                        }
-
-                        if append_only_optimize && let Some(row) = append_only_matched_row {
-                            side_match.ht.delete(key, row);
-                        } else if side_update.need_degree_table {
-                            side_update
-                                .ht
-                                .insert(key, JoinRow::new(row, degree))
-                                .await?;
-                        } else {
-                            side_update.ht.insert_row(key, row).await?;
-                        }
-                    } else {
-                        // Row which violates null-safe bitmap will never be matched so we need not
-                        // store.
-                        if let Some(chunk) =
-                            hashjoin_chunk_builder.forward_if_not_matched(Op::Insert, row)
-                        {
-                            yield chunk;
-                        }
+                Op::Insert | Op::UpdateInsert =>
+                {
+                    #[for_await]
+                    for chunk in match_rows!(Insert) {
+                        let chunk = chunk?;
+                        total_matches += chunk.cardinality();
+                        yield chunk;
                     }
                 }
-                Op::Delete | Op::UpdateDelete => {
-                    let mut degree = 0;
-                    if let Some(mut matched_rows) = matched_rows {
-                        let mut matched_rows_to_clean = vec![];
-                        for (matched_row_ref, matched_row) in
-                            matched_rows.values_mut(&side_match.all_data_types)
-                        {
-                            let mut matched_row = matched_row?;
-                            // TODO(yuhao-su): We should find a better way to eval the expression
-                            // without concat two rows.
-                            // if there are non-equi expressions
-                            let check_join_condition = if let Some(ref mut cond) = cond {
-                                let new_row = Self::row_concat(
-                                    &row,
-                                    side_update.start_pos,
-                                    &matched_row.row,
-                                    side_match.start_pos,
-                                );
+                Op::Delete | Op::UpdateDelete =>
+                {
+                    #[for_await]
+                    for chunk in match_rows!(Delete) {
+                        let chunk = chunk?;
+                        total_matches += chunk.cardinality();
+                        yield chunk;
+                    }
+                }
+            };
 
-                                cond.eval_row_infallible(&new_row)
-                                    .await
-                                    .map(|s| *s.as_bool())
-                                    .unwrap_or(false)
-                            } else {
-                                true
-                            };
-                            let mut need_state_clean = false;
-                            if check_join_condition {
-                                degree += 1;
-                                if side_match.need_degree_table {
-                                    side_match.ht.dec_degree(matched_row_ref, &mut matched_row);
-                                }
-                                if !forward_exactly_once(T, SIDE) {
-                                    if let Some(chunk) = hashjoin_chunk_builder
-                                        .with_match_on_delete(&row, &matched_row)
-                                    {
-                                        yield chunk;
-                                    }
-                                }
-                            } else {
-                                for (column_idx, watermark) in &useful_state_clean_columns {
-                                    if matched_row.row.datum_at(*column_idx).map_or(
-                                        false,
-                                        |scalar| {
-                                            scalar
-                                                .default_cmp(&watermark.val.as_scalar_ref_impl())
-                                                .is_lt()
-                                        },
-                                    ) {
-                                        need_state_clean = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if need_state_clean {
-                                matched_rows_to_clean.push(matched_row);
-                            }
-                        }
-                        if degree == 0 {
-                            if let Some(chunk) =
-                                hashjoin_chunk_builder.forward_if_not_matched(Op::Delete, row)
-                            {
-                                yield chunk;
-                            }
-                        } else if let Some(chunk) =
-                            hashjoin_chunk_builder.forward_exactly_once_if_matched(Op::Delete, row)
-                        {
-                            yield chunk;
-                        }
-                        // Insert back the state taken from ht.
-                        side_match.ht.update_state(key, matched_rows);
-                        for matched_row in matched_rows_to_clean {
-                            if side_match.need_degree_table {
-                                side_match.ht.delete(key, matched_row);
-                            } else {
-                                side_match.ht.delete_row(key, matched_row.row);
-                            }
-                        }
+            join_matched_join_keys.observe(total_matches as _);
+            if total_matches > high_join_amplification_threshold {
+                let join_key_data_types = side_update.ht.join_key_data_types();
+                let key = key.deserialize(join_key_data_types)?;
+                tracing::warn!(target: "high_join_amplification",
+                    matched_rows_len = total_matches,
+                    update_table_id = side_update.ht.table_id(),
+                    match_table_id = side_match.ht.table_id(),
+                    join_key = ?key,
+                    actor_id = ctx.id,
+                    fragment_id = ctx.fragment_id,
+                    "large rows matched for join key"
+                );
+            }
+        }
+        // NOTE(kwannoel): We don't track metrics for this last chunk.
+        if let Some(chunk) = hashjoin_chunk_builder.take() {
+            yield chunk;
+        }
+    }
 
-                        if append_only_optimize {
-                            unreachable!();
-                        } else if side_update.need_degree_table {
-                            side_update.ht.delete(key, JoinRow::new(row, degree));
-                        } else {
-                            side_update.ht.delete_row(key, row);
-                        };
-                    } else {
-                        // We do not store row which violates null-safe bitmap.
-                        if let Some(chunk) =
-                            hashjoin_chunk_builder.forward_if_not_matched(Op::Delete, row)
-                        {
-                            yield chunk;
-                        }
+    /// For the probe-side row, we need to check if it has values in cache, if not, we need to
+    /// fetch the matched rows from the state table.
+    ///
+    /// Every matched build-side row being processed needs to go through the following phases:
+    /// 1. Handle join condition evaluation.
+    /// 2. Always do cache refill, if the state count is good.
+    /// 3. Handle state cleaning.
+    /// 4. Handle degree table update.
+    #[allow(clippy::too_many_arguments)]
+    #[try_stream(ok = StreamChunk, error = StreamExecutorError)]
+    async fn handle_match_rows<
+        'a,
+        const SIDE: SideTypePrimitive,
+        const JOIN_OP: JoinOpPrimitive,
+    >(
+        cached_lookup_result: CacheResult<E>,
+        row: RowRef<'a>,
+        key: &'a K,
+        hashjoin_chunk_builder: &'a mut JoinChunkBuilder<T, SIDE>,
+        side_match: &'a mut JoinSide<K, S, E>,
+        side_update: &'a mut JoinSide<K, S, E>,
+        useful_state_clean_columns: &'a [(usize, &'a Watermark)],
+        cond: &'a mut Option<NonStrictExpression>,
+        append_only_optimize: bool,
+        entry_state_max_rows: usize,
+    ) {
+        let cache_hit = matches!(cached_lookup_result, CacheResult::Hit(_));
+        let mut entry_state: JoinEntryState<E> = JoinEntryState::default();
+        let mut entry_state_count = 0;
+
+        let mut degree = 0;
+        let mut append_only_matched_row: Option<JoinRow<OwnedRow>> = None;
+        let mut matched_rows_to_clean = vec![];
+
+        macro_rules! match_row {
+            (
+                $match_order_key_indices:expr,
+                $degree_table:expr,
+                $matched_row:expr,
+                $matched_row_ref:expr,
+                $from_cache:literal
+            ) => {
+                Self::handle_match_row::<SIDE, { JOIN_OP }, { $from_cache }>(
+                    row,
+                    $matched_row,
+                    $matched_row_ref,
+                    hashjoin_chunk_builder,
+                    $match_order_key_indices,
+                    $degree_table,
+                    side_update.start_pos,
+                    side_match.start_pos,
+                    cond,
+                    &mut degree,
+                    useful_state_clean_columns,
+                    append_only_optimize,
+                    &mut append_only_matched_row,
+                    &mut matched_rows_to_clean,
+                )
+            };
+        }
+
+        let entry_state = match cached_lookup_result {
+            CacheResult::NeverMatch => {
+                let op = match JOIN_OP {
+                    JoinOp::Insert => Op::Insert,
+                    JoinOp::Delete => Op::Delete,
+                };
+                if let Some(chunk) = hashjoin_chunk_builder.forward_if_not_matched(op, row) {
+                    yield chunk;
+                }
+                return Ok(());
+            }
+            CacheResult::Hit(mut cached_rows) => {
+                let (match_order_key_indices, match_degree_state) =
+                    side_match.ht.get_degree_state_mut_ref();
+                // Handle cached rows which match the probe-side row.
+                for (matched_row_ref, matched_row) in
+                    cached_rows.values_mut(&side_match.all_data_types)
+                {
+                    let matched_row = matched_row?;
+                    if let Some(chunk) = match_row!(
+                        match_order_key_indices,
+                        match_degree_state,
+                        matched_row,
+                        Some(matched_row_ref),
+                        true
+                    )
+                    .await
+                    {
+                        yield chunk;
+                    }
+                }
+
+                cached_rows
+            }
+            CacheResult::Miss => {
+                // Handle rows which are not in cache.
+                let (matched_rows, match_order_key_indices, degree_table) = side_match
+                    .ht
+                    .fetch_matched_rows_and_get_degree_table_ref(key)
+                    .await?;
+
+                #[for_await]
+                for matched_row in matched_rows {
+                    let (encoded_pk, matched_row) = matched_row?;
+
+                    let mut matched_row_ref = None;
+
+                    // cache refill
+                    if entry_state_count <= entry_state_max_rows {
+                        let row_ref = entry_state
+                            .insert(encoded_pk, E::encode(&matched_row), None) // TODO(kwannoel): handle ineq key for asof join.
+                            .with_context(|| format!("row: {}", row.display(),))?;
+                        matched_row_ref = Some(row_ref);
+                        entry_state_count += 1;
+                    }
+                    if let Some(chunk) = match_row!(
+                        match_order_key_indices,
+                        degree_table,
+                        matched_row,
+                        matched_row_ref,
+                        false
+                    )
+                    .await
+                    {
+                        yield chunk;
+                    }
+                }
+                Box::new(entry_state)
+            }
+        };
+
+        // forward rows depending on join types
+        let op = match JOIN_OP {
+            JoinOp::Insert => Op::Insert,
+            JoinOp::Delete => Op::Delete,
+        };
+        if degree == 0 {
+            if let Some(chunk) = hashjoin_chunk_builder.forward_if_not_matched(op, row) {
+                yield chunk;
+            }
+        } else if let Some(chunk) = hashjoin_chunk_builder.forward_exactly_once_if_matched(op, row)
+        {
+            yield chunk;
+        }
+
+        // cache refill
+        if cache_hit || entry_state_count <= entry_state_max_rows {
+            side_match.ht.update_state(key, entry_state);
+        }
+
+        // watermark state cleaning
+        for matched_row in matched_rows_to_clean {
+            side_match.ht.delete_handle_degree(key, matched_row)?;
+        }
+
+        // apply append_only optimization to clean matched_rows which have been persisted
+        if append_only_optimize && let Some(row) = append_only_matched_row {
+            assert_matches!(JOIN_OP, JoinOp::Insert);
+            side_match.ht.delete_handle_degree(key, row)?;
+            return Ok(());
+        }
+
+        // no append_only optimization, update state table(s).
+        match JOIN_OP {
+            JoinOp::Insert => {
+                side_update
+                    .ht
+                    .insert_handle_degree(key, JoinRow::new(row, degree))?;
+            }
+            JoinOp::Delete => {
+                side_update
+                    .ht
+                    .delete_handle_degree(key, JoinRow::new(row, degree))?;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    async fn handle_match_row<
+        'a,
+        const SIDE: SideTypePrimitive,
+        const JOIN_OP: JoinOpPrimitive,
+        const MATCHED_ROWS_FROM_CACHE: bool,
+    >(
+        update_row: RowRef<'a>,
+        mut matched_row: JoinRow<OwnedRow>,
+        mut matched_row_cache_ref: Option<&mut E::EncodedRow>,
+        hashjoin_chunk_builder: &'a mut JoinChunkBuilder<T, SIDE>,
+        match_order_key_indices: &[usize],
+        match_degree_table: &mut Option<TableInner<S>>,
+        side_update_start_pos: usize,
+        side_match_start_pos: usize,
+        cond: &Option<NonStrictExpression>,
+        update_row_degree: &mut u64,
+        useful_state_clean_columns: &[(usize, &'a Watermark)],
+        append_only_optimize: bool,
+        append_only_matched_row: &mut Option<JoinRow<OwnedRow>>,
+        matched_rows_to_clean: &mut Vec<JoinRow<OwnedRow>>,
+    ) -> Option<StreamChunk> {
+        let mut need_state_clean = false;
+        let mut chunk_opt = None;
+
+        // TODO(kwannoel): Instead of evaluating this every loop,
+        // we can call this only if there's a non-equi expression.
+        // check join cond
+        let join_condition_satisfied = Self::check_join_condition(
+            update_row,
+            side_update_start_pos,
+            &matched_row.row,
+            side_match_start_pos,
+            cond,
+        )
+        .await;
+
+        if join_condition_satisfied {
+            // update degree
+            *update_row_degree += 1;
+            // send matched row downstream
+
+            // Inserts must happen before degrees are updated,
+            // FIXME(kwannoel): We should let deletes and inserts happen BEFORE degree updates.
+            if matches!(JOIN_OP, JoinOp::Insert)
+                && !forward_exactly_once(T, SIDE)
+                && let Some(chunk) =
+                    hashjoin_chunk_builder.with_match::<JOIN_OP>(&update_row, &matched_row)
+            {
+                chunk_opt = Some(chunk);
+            }
+            // TODO(kwannoel): We can actually statically decide this, using join side + join type.
+            if let Some(degree_table) = match_degree_table {
+                update_degree::<S, { JOIN_OP }>(
+                    match_order_key_indices,
+                    degree_table,
+                    &mut matched_row,
+                );
+                if MATCHED_ROWS_FROM_CACHE || matched_row_cache_ref.is_some() {
+                    // update matched row in cache
+                    match JOIN_OP {
+                        JoinOp::Insert => matched_row_cache_ref.as_mut().unwrap().increase_degree(),
+                        JoinOp::Delete => matched_row_cache_ref.as_mut().unwrap().decrease_degree(),
                     }
                 }
             }
+
+            // Deletes must happen after degree table is updated.
+            // FIXME(kwannoel): We should let deletes and inserts happen BEFORE degree updates.
+            if matches!(JOIN_OP, JoinOp::Delete)
+                && !forward_exactly_once(T, SIDE)
+                && let Some(chunk) =
+                    hashjoin_chunk_builder.with_match::<JOIN_OP>(&update_row, &matched_row)
+            {
+                chunk_opt = Some(chunk);
+            }
+        } else {
+            // check if need state cleaning
+            for (column_idx, watermark) in useful_state_clean_columns {
+                if matched_row.row.datum_at(*column_idx).is_some_and(|scalar| {
+                    scalar
+                        .default_cmp(&watermark.val.as_scalar_ref_impl())
+                        .is_lt()
+                }) {
+                    need_state_clean = true;
+                    break;
+                }
+            }
         }
-        if let Some(chunk) = hashjoin_chunk_builder.take() {
-            yield chunk;
+        // If the stream is append-only and the join key covers pk in both side,
+        // then we can remove matched rows since pk is unique and will not be
+        // inserted again
+        if append_only_optimize {
+            assert_matches!(JOIN_OP, JoinOp::Insert);
+            // Since join key contains pk and pk is unique, there should be only
+            // one row if matched.
+            assert!(append_only_matched_row.is_none());
+            *append_only_matched_row = Some(matched_row);
+        } else if need_state_clean {
+            // `append_only_optimize` and `need_state_clean` won't both be true.
+            // 'else' here is only to suppress compiler error, otherwise
+            // `matched_row` will be moved twice.
+            matched_rows_to_clean.push(matched_row);
+        }
+
+        chunk_opt
+    }
+
+    // TODO(yuhao-su): We should find a better way to eval the expression
+    // without concat two rows.
+    // if there are non-equi expressions
+    // NOTE(kwannoel): We can probably let `eval` use `impl Row` instead of `OwnedRow`.
+    #[inline]
+    async fn check_join_condition(
+        row: impl Row,
+        side_update_start_pos: usize,
+        matched_row: impl Row,
+        side_match_start_pos: usize,
+        join_condition: &Option<NonStrictExpression>,
+    ) -> bool {
+        if let Some(join_condition) = join_condition {
+            let new_row = Self::row_concat(
+                row,
+                side_update_start_pos,
+                matched_row,
+                side_match_start_pos,
+            );
+            join_condition
+                .eval_row_infallible(&new_row)
+                .await
+                .map(|s| *s.as_bool())
+                .unwrap_or(false)
+        } else {
+            true
         }
     }
 }
@@ -1277,19 +1300,19 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
 mod tests {
     use std::sync::atomic::AtomicU64;
 
-    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
+    use pretty_assertions::assert_eq;
     use risingwave_common::array::*;
-    use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema, TableId};
-    use risingwave_common::hash::{Key128, Key64};
-    use risingwave_common::types::ScalarImpl;
+    use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, TableId};
+    use risingwave_common::hash::{Key64, Key128};
+    use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::sort_util::OrderType;
     use risingwave_storage::memory::MemoryStateStore;
 
     use super::*;
-    use crate::common::table::state_table::StateTable;
+    use crate::common::table::test_utils::gen_pbtable;
+    use crate::executor::MemoryEncoding;
     use crate::executor::test_utils::expr::build_from_pretty;
     use crate::executor::test_utils::{MessageSender, MockSource, StreamExecutorTestExt};
-    use crate::executor::{ActorContext, Barrier, EpochPair};
 
     async fn create_in_memory_state_table(
         mem_state: MemoryStateStore,
@@ -1303,12 +1326,16 @@ mod tests {
             .enumerate()
             .map(|(id, data_type)| ColumnDesc::unnamed(ColumnId::new(id as i32), data_type.clone()))
             .collect_vec();
-        let state_table = StateTable::new_without_distribution(
+        let state_table = StateTable::from_table_catalog(
+            &gen_pbtable(
+                TableId::new(table_id),
+                column_descs,
+                order_types.to_vec(),
+                pk_indices.to_vec(),
+                0,
+            ),
             mem_state.clone(),
-            TableId::new(table_id),
-            column_descs,
-            order_types.to_vec(),
-            pk_indices.to_vec(),
+            None,
         )
         .await;
 
@@ -1324,12 +1351,16 @@ mod tests {
             ColumnId::new(pk_indices.len() as i32),
             DataType::Int64,
         ));
-        let degree_state_table = StateTable::new_without_distribution(
+        let degree_state_table = StateTable::from_table_catalog(
+            &gen_pbtable(
+                TableId::new(table_id + 1),
+                degree_table_column_descs,
+                order_types.to_vec(),
+                pk_indices.to_vec(),
+                0,
+            ),
             mem_state,
-            TableId::new(table_id + 1),
-            degree_table_column_descs,
-            order_types.to_vec(),
-            pk_indices.to_vec(),
+            None,
         )
         .await;
         (state_table, degree_state_table)
@@ -1355,8 +1386,10 @@ mod tests {
                 Field::unnamed(DataType::Int64),
             ],
         };
-        let (tx_l, source_l) = MockSource::channel(schema.clone(), vec![1]);
-        let (tx_r, source_r) = MockSource::channel(schema, vec![1]);
+        let (tx_l, source_l) = MockSource::channel();
+        let source_l = source_l.into_executor(schema.clone(), vec![1]);
+        let (tx_r, source_r) = MockSource::channel();
+        let source_r = source_r.into_executor(schema, vec![1]);
         let params_l = JoinParams::new(vec![0], vec![1]);
         let params_r = JoinParams::new(vec![0], vec![1]);
         let cond = with_condition.then(|| create_cond(condition_text));
@@ -1390,17 +1423,13 @@ mod tests {
                 .collect(),
         };
         let schema_len = schema.len();
-        let info = ExecutorInfo {
-            schema,
-            pk_indices: vec![1],
-            identity: "HashJoinExecutor".to_string(),
-        };
+        let info = ExecutorInfo::new(schema, vec![1], "HashJoinExecutor".to_owned(), 0);
 
-        let executor = HashJoinExecutor::<Key64, MemoryStateStore, T>::new(
-            ActorContext::create(123),
+        let executor = HashJoinExecutor::<Key64, MemoryStateStore, T, MemoryEncoding>::new(
+            ActorContext::for_test(123),
             info,
-            Box::new(source_l),
-            Box::new(source_r),
+            source_l,
+            source_r,
             params_l,
             params_r,
             vec![null_safe],
@@ -1415,8 +1444,9 @@ mod tests {
             false,
             Arc::new(StreamingMetrics::unused()),
             1024,
+            2048,
         );
-        (tx_l, tx_r, Box::new(executor).execute())
+        (tx_l, tx_r, executor.boxed().execute())
     }
 
     async fn create_classical_executor<const T: JoinTypePrimitive>(
@@ -1437,8 +1467,10 @@ mod tests {
                 Field::unnamed(DataType::Int64),
             ],
         };
-        let (tx_l, source_l) = MockSource::channel(schema.clone(), vec![0]);
-        let (tx_r, source_r) = MockSource::channel(schema, vec![0]);
+        let (tx_l, source_l) = MockSource::channel();
+        let source_l = source_l.into_executor(schema.clone(), vec![0]);
+        let (tx_r, source_r) = MockSource::channel();
+        let source_r = source_r.into_executor(schema, vec![0]);
         let params_l = JoinParams::new(vec![0, 1], vec![]);
         let params_r = JoinParams::new(vec![0, 1], vec![]);
         let cond = with_condition.then(|| create_cond(None));
@@ -1467,7 +1499,7 @@ mod tests {
                 OrderType::ascending(),
             ],
             &[0, 1, 1],
-            0,
+            1,
         )
         .await;
 
@@ -1480,17 +1512,13 @@ mod tests {
                 .collect(),
         };
         let schema_len = schema.len();
-        let info = ExecutorInfo {
-            schema,
-            pk_indices: vec![1],
-            identity: "HashJoinExecutor".to_string(),
-        };
+        let info = ExecutorInfo::new(schema, vec![1], "HashJoinExecutor".to_owned(), 0);
 
-        let executor = HashJoinExecutor::<Key128, MemoryStateStore, T>::new(
-            ActorContext::create(123),
+        let executor = HashJoinExecutor::<Key128, MemoryStateStore, T, MemoryEncoding>::new(
+            ActorContext::for_test(123),
             info,
-            Box::new(source_l),
-            Box::new(source_r),
+            source_l,
+            source_r,
             params_l,
             params_r,
             vec![false],
@@ -1505,8 +1533,9 @@ mod tests {
             true,
             Arc::new(StreamingMetrics::unused()),
             1024,
+            2048,
         );
-        (tx_l, tx_r, Box::new(executor).execute())
+        (tx_l, tx_r, executor.boxed().execute())
     }
 
     #[tokio::test]
@@ -1543,8 +1572,8 @@ mod tests {
         .await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -1552,8 +1581,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -1624,8 +1653,8 @@ mod tests {
             create_classical_executor::<{ JoinType::Inner }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -1633,8 +1662,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -1694,8 +1723,8 @@ mod tests {
             create_classical_executor::<{ JoinType::Inner }>(false, true, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -1703,8 +1732,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -1776,8 +1805,8 @@ mod tests {
             create_classical_executor::<{ JoinType::LeftSemi }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -1785,8 +1814,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -1886,8 +1915,8 @@ mod tests {
             create_classical_executor::<{ JoinType::LeftSemi }>(false, true, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -1895,8 +1924,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -1985,8 +2014,8 @@ mod tests {
             create_append_only_executor::<{ JoinType::Inner }>(false).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -1994,8 +2023,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -2058,8 +2087,8 @@ mod tests {
             create_append_only_executor::<{ JoinType::LeftSemi }>(false).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2067,8 +2096,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -2131,8 +2160,8 @@ mod tests {
             create_append_only_executor::<{ JoinType::RightSemi }>(false).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2140,8 +2169,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -2215,8 +2244,8 @@ mod tests {
             create_classical_executor::<{ JoinType::RightSemi }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st right chunk
@@ -2224,8 +2253,8 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd right chunk
@@ -2327,8 +2356,8 @@ mod tests {
             create_classical_executor::<{ JoinType::LeftAnti }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2345,8 +2374,8 @@ mod tests {
         );
 
         // push the init barrier for left and right
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd left chunk
@@ -2457,8 +2486,8 @@ mod tests {
             create_classical_executor::<{ JoinType::LeftAnti }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_r.push_barrier(1, false);
-        tx_l.push_barrier(1, false);
+        tx_r.push_barrier(test_epoch(1), false);
+        tx_l.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st right chunk
@@ -2475,8 +2504,8 @@ mod tests {
         );
 
         // push the init barrier for left and right
-        tx_r.push_barrier(2, false);
-        tx_l.push_barrier(2, false);
+        tx_r.push_barrier(test_epoch(2), false);
+        tx_l.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 2nd right chunk
@@ -2573,8 +2602,8 @@ mod tests {
             create_classical_executor::<{ JoinType::Inner }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2582,7 +2611,7 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push a barrier to left side
-        tx_l.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
 
         // push the 2nd left chunk
         tx_l.push_chunk(chunk_l2);
@@ -2601,10 +2630,10 @@ mod tests {
         );
 
         // push a barrier to right side
-        tx_r.push_barrier(2, false);
+        tx_r.push_barrier(test_epoch(2), false);
 
         // get the aligned barrier here
-        let expected_epoch = EpochPair::new_test_epoch(2);
+        let expected_epoch = EpochPair::new_test_epoch(test_epoch(2));
         assert!(matches!(
             hash_join.next_unwrap_ready_barrier()?,
             Barrier {
@@ -2668,8 +2697,8 @@ mod tests {
             create_classical_executor::<{ JoinType::Inner }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2677,7 +2706,7 @@ mod tests {
         hash_join.next_unwrap_pending();
 
         // push a barrier to left side
-        tx_l.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
 
         // push the 2nd left chunk
         tx_l.push_chunk(chunk_l2);
@@ -2696,10 +2725,10 @@ mod tests {
         );
 
         // push a barrier to right side
-        tx_r.push_barrier(2, false);
+        tx_r.push_barrier(test_epoch(2), false);
 
         // get the aligned barrier here
-        let expected_epoch = EpochPair::new_test_epoch(2);
+        let expected_epoch = EpochPair::new_test_epoch(test_epoch(2));
         assert!(matches!(
             hash_join.next_unwrap_ready_barrier()?,
             Barrier {
@@ -2763,8 +2792,8 @@ mod tests {
             create_classical_executor::<{ JoinType::LeftOuter }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2847,8 +2876,8 @@ mod tests {
             create_classical_executor::<{ JoinType::LeftOuter }>(false, true, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -2931,8 +2960,8 @@ mod tests {
             create_classical_executor::<{ JoinType::RightOuter }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -3000,8 +3029,8 @@ mod tests {
             create_append_only_executor::<{ JoinType::LeftOuter }>(false).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -3090,8 +3119,8 @@ mod tests {
             create_append_only_executor::<{ JoinType::RightOuter }>(false).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -3159,8 +3188,8 @@ mod tests {
             create_classical_executor::<{ JoinType::FullOuter }>(false, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -3195,8 +3224,8 @@ mod tests {
             chunk,
             StreamChunk::from_pretty(
                 "  I I I I
-                U- 2 5 . .
-                U+ 2 5 2 7
+                U-  2 5 . .
+                U+  2 5 2 7
                 +  . . 4 8
                 +  . . 6 9"
             )
@@ -3211,6 +3240,67 @@ mod tests {
                 " I I I I
                 + . . 5 10
                 - . . 5 10"
+            )
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_hash_full_outer_join_update() -> StreamExecutorResult<()> {
+        let (mut tx_l, mut tx_r, mut hash_join) =
+            create_classical_executor::<{ JoinType::FullOuter }>(false, false, None).await;
+
+        // push the init barrier for left and right
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
+        hash_join.next_unwrap_ready_barrier()?;
+
+        tx_l.push_chunk(StreamChunk::from_pretty(
+            "  I I
+             + 1 1
+            ",
+        ));
+        let chunk = hash_join.next_unwrap_ready_chunk()?;
+        assert_eq!(
+            chunk,
+            StreamChunk::from_pretty(
+                " I I I I
+                + 1 1 . ."
+            )
+        );
+
+        tx_r.push_chunk(StreamChunk::from_pretty(
+            "  I I
+             + 1 1
+            ",
+        ));
+        let chunk = hash_join.next_unwrap_ready_chunk()?;
+
+        assert_eq!(
+            chunk,
+            StreamChunk::from_pretty(
+                " I I I I
+                U- 1 1 . .
+                U+ 1 1 1 1"
+            )
+        );
+
+        tx_l.push_chunk(StreamChunk::from_pretty(
+            "   I I
+              - 1 1
+              + 1 2
+            ",
+        ));
+        let chunk = hash_join.next_unwrap_ready_chunk()?;
+        let chunk = chunk.compact();
+        assert_eq!(
+            chunk,
+            StreamChunk::from_pretty(
+                " I I I I
+                - 1 1 1 1
+                + 1 2 1 1
+                "
             )
         );
 
@@ -3249,8 +3339,8 @@ mod tests {
             create_classical_executor::<{ JoinType::FullOuter }>(true, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -3287,8 +3377,8 @@ mod tests {
             chunk,
             StreamChunk::from_pretty(
                 "  I I I I
-                U- 2 5 . .
-                U+ 2 5 2 6
+                U-  2 5 . .
+                U+  2 5 2 6
                 +  . . 4 8
                 +  . . 3 4" /* regression test (#2420): 3 4 should be forwarded only once
                              * despite matching on eq join on 2
@@ -3341,8 +3431,8 @@ mod tests {
             create_classical_executor::<{ JoinType::Inner }>(true, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         // push the 1st left chunk
@@ -3377,16 +3467,16 @@ mod tests {
             create_classical_executor::<{ JoinType::Inner }>(true, false, None).await;
 
         // push the init barrier for left and right
-        tx_l.push_barrier(1, false);
-        tx_r.push_barrier(1, false);
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         tx_l.push_int64_watermark(0, 100);
 
         tx_l.push_int64_watermark(0, 200);
 
-        tx_l.push_barrier(2, false);
-        tx_r.push_barrier(2, false);
+        tx_l.push_barrier(test_epoch(2), false);
+        tx_r.push_barrier(test_epoch(2), false);
         hash_join.next_unwrap_ready_barrier()?;
 
         tx_r.push_int64_watermark(0, 50);

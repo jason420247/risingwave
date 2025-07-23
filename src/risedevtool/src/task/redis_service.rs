@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
+use crate::util::stylized_risedev_subcmd;
 use crate::{ExecuteContext, RedisConfig, Task};
 
 pub struct RedisService {
@@ -49,7 +50,11 @@ impl Task for RedisService {
         ctx.pb.set_message("starting");
         let path = self.redis_path()?;
         if !path.exists() {
-            return Err(anyhow!("Redis binary not found in {:?}\nDid you enable redis feature in `./risedev configure`?", path));
+            return Err(anyhow!(
+                "Redis binary not found in {:?}\nDid you enable redis feature in `{}`?",
+                path,
+                stylized_risedev_subcmd("configure")
+            ));
         }
 
         let mut cmd = self.redis()?;

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,17 +14,17 @@
 
 use std::collections::HashSet;
 
-use fixedbitset::FixedBitSet;
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
-use super::generic::{self, GenericPlanRef, PlanWindowFunction};
+use super::generic::{self, PlanWindowFunction};
 use super::stream::prelude::*;
-use super::utils::{impl_distill_by_unit, TableCatalogBuilder};
+use super::utils::{TableCatalogBuilder, impl_distill_by_unit};
 use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
-use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::stream_fragmenter::BuildFragmentGraphState;
 use crate::TableCatalog;
+use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::property::{MonotonicityMap, WatermarkColumns};
+use crate::stream_fragmenter::BuildFragmentGraphState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamEowcOverWindow {
@@ -50,7 +50,7 @@ impl StreamEowcOverWindow {
 
         // `EowcOverWindowExecutor` cannot produce any watermark columns, because there may be some
         // ancient rows in some rarely updated partitions that are emitted at the end of time.
-        let watermark_columns = FixedBitSet::with_capacity(core.output_len());
+        let watermark_columns = WatermarkColumns::new();
 
         let base = PlanBase::new_stream_with_core(
             &core,
@@ -58,6 +58,8 @@ impl StreamEowcOverWindow {
             true,
             true,
             watermark_columns,
+            // we cannot derive monotonicity for any column for the same reason as watermark columns
+            MonotonicityMap::new(),
         );
         StreamEowcOverWindow { base, core }
     }
@@ -82,8 +84,7 @@ impl StreamEowcOverWindow {
         // The EOWC over window state table has the same schema as the input.
 
         let in_fields = self.core.input.schema().fields();
-        let mut tbl_builder =
-            TableCatalogBuilder::new(self.ctx().with_options().internal_table_subset());
+        let mut tbl_builder = TableCatalogBuilder::default();
         for field in in_fields {
             tbl_builder.add_column(field);
         }
@@ -153,12 +154,12 @@ impl StreamNode for StreamEowcOverWindow {
             .with_id(state.gen_table_id_wrapped())
             .to_internal_table_prost();
 
-        PbNodeBody::EowcOverWindow(EowcOverWindowNode {
+        PbNodeBody::EowcOverWindow(Box::new(EowcOverWindowNode {
             calls,
             partition_by,
             order_by,
             state_table: Some(state_table),
-        })
+        }))
     }
 }
 

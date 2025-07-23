@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,17 +14,17 @@
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_common::error::Result;
 use risingwave_common::util::column_index_mapping::ColIndexMapping;
 
 use super::generic::TopNLimit;
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchGroupTopN, ColPrunable, ColumnPruningContext,
-    ExprRewritable, Logical, LogicalProject, PlanBase, PlanRef, PlanTreeNodeUnary,
-    PredicatePushdown, PredicatePushdownContext, RewriteStreamContext, StreamDedup,
-    StreamGroupTopN, ToBatch, ToStream, ToStreamContext,
+    BatchGroupTopN, ColPrunable, ColumnPruningContext, ExprRewritable, Logical, LogicalProject,
+    PlanBase, PlanRef, PlanTreeNodeUnary, PredicatePushdown, PredicatePushdownContext,
+    RewriteStreamContext, StreamDedup, StreamGroupTopN, ToBatch, ToStream, ToStreamContext,
+    gen_filter_and_pushdown, generic,
 };
+use crate::error::Result;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::property::{Order, RequiredDist};
 use crate::utils::Condition;
@@ -39,7 +39,7 @@ pub struct LogicalDedup {
 
 impl LogicalDedup {
     pub fn new(input: PlanRef, dedup_cols: Vec<usize>) -> Self {
-        let core = generic::Dedup { input, dedup_cols };
+        let core = generic::Dedup::new(input, dedup_cols);
         let base = PlanBase::new_logical_with_core(&core);
         LogicalDedup { base, core }
     }
@@ -58,7 +58,6 @@ impl PlanTreeNodeUnary for LogicalDedup {
         Self::new(input, self.dedup_cols().to_vec())
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -163,7 +162,12 @@ impl ColPrunable for LogicalDedup {
         );
 
         let new_input = self.input().prune_col(&input_required_cols, ctx);
-        let logical_dedup = Self::new(new_input, self.dedup_cols().to_vec()).into();
+        let new_dedup_cols = self
+            .dedup_cols()
+            .iter()
+            .map(|&idx| mapping.map(idx))
+            .collect_vec();
+        let logical_dedup = Self::new(new_input, new_dedup_cols).into();
 
         if input_required_cols == required_cols {
             logical_dedup

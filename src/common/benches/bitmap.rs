@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use itertools::Itertools;
-use risingwave_common::buffer::{Bitmap, BitmapIter};
+use risingwave_common::bitmap::{Bitmap, BitmapIter};
 
 fn bench_bitmap(c: &mut Criterion) {
     const CHUNK_SIZE: usize = 1024;

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 use std::io::{Cursor, Read};
 
 use ethnum::I256;
-use risingwave_pb::common::buffer::CompressionType;
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::common::Buffer;
+use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::data::PbArray;
 
 use crate::array::{Array, ArrayBuilder, ArrayImpl, ArrayResult};
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::{EstimateSize, ZeroHeapSize};
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::types::{DataType, Int256, Int256Ref, Scalar};
 
 #[derive(Debug, Clone, EstimateSize)]
@@ -35,8 +35,6 @@ pub struct Int256Array {
     bitmap: Bitmap,
     data: Box<[I256]>,
 }
-
-impl ZeroHeapSize for I256 {}
 
 #[rustfmt::skip]
 macro_rules! impl_array_for_num256 {
@@ -52,9 +50,9 @@ macro_rules! impl_array_for_num256 {
             type OwnedItem = $scalar;
             type RefItem<$gen> = $scalar_ref<$gen>;
 
-            unsafe fn raw_value_at_unchecked(&self, idx: usize) -> Self::RefItem<'_> {
+            unsafe fn raw_value_at_unchecked(&self, idx: usize) -> Self::RefItem<'_> { unsafe {
                 $scalar_ref(self.data.get_unchecked(idx))
-            }
+            }}
 
             fn len(&self) -> usize {
                 self.data.len()

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use itertools::Itertools;
 use yaml_rust::{Yaml, YamlEmitter, YamlLoader};
 
@@ -50,6 +50,24 @@ impl ConfigExpander {
 
     /// Transforms `risedev.yml` and `risedev-profiles.user.yml` to a fully expanded yaml file.
     ///
+    /// Format:
+    ///
+    /// ```yaml
+    /// my-profile:
+    ///   config-path: src/config/ci-recovery.toml
+    ///   env:
+    ///     RUST_LOG: "info,risingwave_storage::hummock=off"
+    ///     ENABLE_PRETTY_LOG: "true"
+    ///   steps:
+    ///     - use: minio
+    ///     - use: sqlite
+    ///     - use: meta-node
+    ///       meta-backend: sqlite
+    ///     - use: compute-node
+    ///       parallelism: 1
+    ///     - use: frontend
+    /// ```
+    ///
     /// # Arguments
     ///
     /// * `root` is the root directory of these YAML files.
@@ -58,8 +76,11 @@ impl ConfigExpander {
     ///
     /// # Returns
     ///
-    /// A pair of `config_path` and expanded steps (items in `{profile}.steps` section in YAML)
-    pub fn expand(root: impl AsRef<Path>, profile: &str) -> Result<(Option<String>, Yaml)> {
+    /// `(config_path, env, steps)`
+    pub fn expand(
+        root: impl AsRef<Path>,
+        profile: &str,
+    ) -> Result<(Option<String>, Vec<String>, Yaml)> {
         Self::expand_with_extra_info(root, profile, HashMap::new())
     }
 
@@ -72,7 +93,7 @@ impl ConfigExpander {
         root: impl AsRef<Path>,
         profile: &str,
         extra_info: HashMap<String, String>,
-    ) -> Result<(Option<String>, Yaml)> {
+    ) -> Result<(Option<String>, Vec<String>, Yaml)> {
         let global_path = root.as_ref().join(RISEDEV_CONFIG_FILE);
         let global_yaml = Self::load_yaml(global_path)?;
         let global_config = global_yaml
@@ -81,7 +102,7 @@ impl ConfigExpander {
 
         let all_profile_section = {
             let mut all = global_config
-                .get(&Yaml::String("profile".to_string()))
+                .get(&Yaml::String("profile".to_owned()))
                 .ok_or_else(|| anyhow!("expect `profile` section"))?
                 .as_hash()
                 .ok_or_else(|| anyhow!("expect `profile` section to be a hashmap"))?
@@ -107,22 +128,38 @@ impl ConfigExpander {
         };
 
         let template_section = global_config
-            .get(&Yaml::String("template".to_string()))
+            .get(&Yaml::String("template".to_owned()))
             .ok_or_else(|| anyhow!("expect `profile` section"))?;
 
         let profile_section = all_profile_section
-            .get(&Yaml::String(profile.to_string()))
+            .get(&Yaml::String(profile.to_owned()))
             .ok_or_else(|| anyhow!("profile '{}' not found", profile))?
             .as_hash()
             .ok_or_else(|| anyhow!("expect `profile` section to be a hashmap"))?;
 
         let config_path = profile_section
-            .get(&Yaml::String("config-path".to_string()))
+            .get(&Yaml::String("config-path".to_owned()))
             .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.to_owned());
+        let mut env = vec![];
+        if let Some(env_section) = profile_section.get(&Yaml::String("env".to_owned())) {
+            let env_section = env_section
+                .as_hash()
+                .ok_or_else(|| anyhow!("expect `env` section to be a hashmap"))?;
+
+            for (k, v) in env_section {
+                let key = k
+                    .as_str()
+                    .ok_or_else(|| anyhow!("expect env key to be a string"))?;
+                let value = v
+                    .as_str()
+                    .ok_or_else(|| anyhow!("expect env value to be a string"))?;
+                env.push(format!("{}={}", key, value));
+            }
+        }
 
         let steps = profile_section
-            .get(&Yaml::String("steps".to_string()))
+            .get(&Yaml::String("steps".to_owned()))
             .ok_or_else(|| anyhow!("expect `steps` section"))?
             .clone();
 
@@ -131,7 +168,7 @@ impl ConfigExpander {
         let steps = IdExpander::new(&steps)?.visit(steps)?;
         let steps = ProvideExpander::new(&steps)?.visit(steps)?;
 
-        Ok((config_path, steps))
+        Ok((config_path, env, steps))
     }
 
     /// Parses the expanded yaml into [`ServiceConfig`]s.
@@ -147,18 +184,18 @@ impl ConfigExpander {
                     .as_hash()
                     .ok_or_else(|| anyhow!("expect step to be a hashmap"))?;
                 let use_type = use_type
-                    .get(&Yaml::String("use".to_string()))
+                    .get(&Yaml::String("use".to_owned()))
                     .ok_or_else(|| anyhow!("expect `use` in step"))?;
                 let use_type = use_type
                     .as_str()
                     .ok_or_else(|| anyhow!("expect `use` to be a string"))?
-                    .to_string();
+                    .to_owned();
                 let mut out_str = String::new();
                 let mut emitter = YamlEmitter::new(&mut out_str);
                 emitter.dump(step)?;
                 let result = match use_type.as_str() {
                     "minio" => ServiceConfig::Minio(serde_yaml::from_str(&out_str)?),
-                    "etcd" => ServiceConfig::Etcd(serde_yaml::from_str(&out_str)?),
+                    "sqlite" => ServiceConfig::Sqlite(serde_yaml::from_str(&out_str)?),
                     "frontend" => ServiceConfig::Frontend(serde_yaml::from_str(&out_str)?),
                     "compactor" => ServiceConfig::Compactor(serde_yaml::from_str(&out_str)?),
                     "compute-node" => ServiceConfig::ComputeNode(serde_yaml::from_str(&out_str)?),
@@ -170,9 +207,14 @@ impl ConfigExpander {
                     "aws-s3" => ServiceConfig::AwsS3(serde_yaml::from_str(&out_str)?),
                     "kafka" => ServiceConfig::Kafka(serde_yaml::from_str(&out_str)?),
                     "pubsub" => ServiceConfig::Pubsub(serde_yaml::from_str(&out_str)?),
+                    "pulsar" => ServiceConfig::Pulsar(serde_yaml::from_str(&out_str)?),
                     "redis" => ServiceConfig::Redis(serde_yaml::from_str(&out_str)?),
-                    "zookeeper" => ServiceConfig::ZooKeeper(serde_yaml::from_str(&out_str)?),
-                    "redpanda" => ServiceConfig::RedPanda(serde_yaml::from_str(&out_str)?),
+                    "mysql" => ServiceConfig::MySql(serde_yaml::from_str(&out_str)?),
+                    "postgres" => ServiceConfig::Postgres(serde_yaml::from_str(&out_str)?),
+                    "sqlserver" => ServiceConfig::SqlServer(serde_yaml::from_str(&out_str)?),
+                    "schema-registry" => {
+                        ServiceConfig::SchemaRegistry(serde_yaml::from_str(&out_str)?)
+                    }
                     other => return Err(anyhow!("unsupported use type: {}", other)),
                 };
                 Ok(result)
@@ -181,7 +223,7 @@ impl ConfigExpander {
 
         let mut services = HashMap::new();
         for x in &config {
-            let id = x.id().to_string();
+            let id = x.id().to_owned();
             if services.insert(id.clone(), x).is_some() {
                 return Err(anyhow!("duplicate id: {}", id));
             }

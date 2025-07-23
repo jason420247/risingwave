@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use opendal::layers::{LoggingLayer, RetryLayer};
-use opendal::services::Obs;
-use opendal::Operator;
+use std::sync::Arc;
 
-use super::{EngineType, OpendalObjectStore};
+use opendal::Operator;
+use opendal::layers::LoggingLayer;
+use opendal::services::Obs;
+use risingwave_common::config::ObjectStoreConfig;
+
+use super::{MediaType, OpendalObjectStore};
 use crate::object::ObjectResult;
+use crate::object::object_metrics::ObjectStoreMetrics;
 
 impl OpendalObjectStore {
     /// create opendal obs engine.
-    pub fn new_obs_engine(bucket: String, root: String) -> ObjectResult<Self> {
+    pub fn new_obs_engine(
+        bucket: String,
+        root: String,
+        config: Arc<ObjectStoreConfig>,
+        metrics: Arc<ObjectStoreMetrics>,
+    ) -> ObjectResult<Self> {
         // Create obs backend builder.
-        let mut builder = Obs::default();
-
-        builder.bucket(&bucket);
-
-        builder.root(&root);
+        let mut builder = Obs::default().bucket(&bucket).root(&root);
 
         let endpoint = std::env::var("OBS_ENDPOINT")
             .unwrap_or_else(|_| panic!("OBS_ENDPOINT not found from environment variables"));
@@ -37,16 +42,19 @@ impl OpendalObjectStore {
             panic!("OBS_SECRET_ACCESS_KEY not found from environment variables")
         });
 
-        builder.endpoint(&endpoint);
-        builder.access_key_id(&access_key_id);
-        builder.secret_access_key(&secret_access_key);
+        builder = builder
+            .endpoint(&endpoint)
+            .access_key_id(&access_key_id)
+            .secret_access_key(&secret_access_key);
+
         let op: Operator = Operator::new(builder)?
             .layer(LoggingLayer::default())
-            .layer(RetryLayer::default())
             .finish();
         Ok(Self {
             op,
-            engine_type: EngineType::Obs,
+            media_type: MediaType::Obs,
+            config,
+            metrics,
         })
     }
 }

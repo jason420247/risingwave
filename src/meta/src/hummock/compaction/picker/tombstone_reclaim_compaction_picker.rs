@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,7 @@
 
 use std::sync::Arc;
 
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::InputLevel;
+use risingwave_hummock_sdk::level::{InputLevel, Levels};
 
 use crate::hummock::compaction::overlap_strategy::OverlapStrategy;
 use crate::hummock::compaction::picker::CompactionInput;
@@ -104,11 +103,11 @@ impl TombstoneReclaimCompactionPicker {
                     }
                 };
                 return Some(CompactionInput {
-                    select_input_size: select_input_ssts.iter().map(|sst| sst.file_size).sum(),
+                    select_input_size: select_input_ssts.iter().map(|sst| sst.sst_size).sum(),
                     target_input_size: target_level
                         .table_infos
                         .iter()
-                        .map(|sst| sst.file_size)
+                        .map(|sst| sst.sst_size)
                         .sum(),
                     total_file_count: (select_input_ssts.len() + target_level.table_infos.len())
                         as u64,
@@ -133,17 +132,16 @@ impl TombstoneReclaimCompactionPicker {
 
 #[cfg(test)]
 pub mod tests {
-    use risingwave_pb::hummock::OverlappingLevel;
-
     use super::*;
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
     use crate::hummock::compaction::create_overlap_strategy;
-    use crate::hummock::compaction::selector::tests::{generate_level, generate_table};
+    use crate::hummock::compaction::selector::tests::{
+        generate_level, generate_table, generate_table_impl,
+    };
 
     #[test]
     fn test_basic() {
         let mut levels = Levels {
-            l0: Some(OverlappingLevel::default()),
             levels: vec![
                 generate_level(1, vec![]),
                 generate_level(
@@ -154,7 +152,6 @@ pub mod tests {
                     ],
                 ),
             ],
-            member_table_ids: vec![1],
             ..Default::default()
         };
         let levels_handler = vec![
@@ -170,21 +167,21 @@ pub mod tests {
         let picker = TombstoneReclaimCompactionPicker::new(strategy.clone(), 40, 20);
         let ret = picker.pick_compaction(&levels, &levels_handler, &mut state);
         assert!(ret.is_none());
-        let mut sst = generate_table(3, 1, 201, 300, 1);
+        let mut sst = generate_table_impl(3, 1, 201, 300, 1);
         sst.stale_key_count = 40;
         sst.total_key_count = 100;
-        levels.levels[1].table_infos.push(sst);
+        levels.levels[1].table_infos.push(sst.into());
 
         let ret = picker
             .pick_compaction(&levels, &levels_handler, &mut state)
             .unwrap();
         assert_eq!(2, ret.input_levels.len());
         assert_eq!(3, ret.input_levels[0].table_infos[0].sst_id);
-        let mut sst = generate_table(4, 1, 1, 100, 1);
+        let mut sst = generate_table_impl(4, 1, 1, 100, 1);
         sst.stale_key_count = 30;
         sst.range_tombstone_count = 30;
         sst.total_key_count = 100;
-        levels.levels[0].table_infos.push(sst);
+        levels.levels[0].table_infos.push(sst.into());
         let picker = TombstoneReclaimCompactionPicker::new(strategy, 50, 10);
         let mut state = TombstoneReclaimPickerState::default();
         let ret = picker

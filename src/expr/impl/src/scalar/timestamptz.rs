@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,13 @@
 
 use std::fmt::Write;
 
+use chrono::LocalResult;
+use chrono_tz::Tz;
 use num_traits::CheckedNeg;
-use risingwave_common::types::{CheckedAdd, Interval, IntoOrdered, Timestamp, Timestamptz, F64};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_common::types::{
+    CheckedAdd, F64, Interval, IntoOrdered, Timestamp, Timestamptz, write_date_time_tz,
+};
+use risingwave_expr::{ExprError, Result, function};
 use thiserror_ext::AsReport;
 
 /// Just a wrapper to reuse the `map_err` logic.
@@ -28,7 +32,7 @@ pub fn time_zone_err(inner_err: String) -> ExprError {
     }
 }
 
-#[function("to_timestamp(float8) -> timestamptz")]
+#[function("sec_to_timestamptz(float8) -> timestamptz")]
 pub fn f64_sec_to_timestamptz(elem: F64) -> Result<Timestamptz> {
     // TODO(#4515): handle +/- infinity
     let micros = (elem.0 * 1e6)
@@ -38,28 +42,49 @@ pub fn f64_sec_to_timestamptz(elem: F64) -> Result<Timestamptz> {
     Ok(Timestamptz::from_micros(micros))
 }
 
+#[function("at_time_zone(timestamptz, varchar) -> timestamp")]
+pub fn timestamptz_at_time_zone(input: Timestamptz, time_zone: &str) -> Result<Timestamp> {
+    let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
+    Ok(timestamptz_at_time_zone_internal(input, time_zone))
+}
+
+pub fn timestamptz_at_time_zone_internal(input: Timestamptz, time_zone: Tz) -> Timestamp {
+    let instant_local = input.to_datetime_in_zone(time_zone);
+    let naive = instant_local.naive_local();
+    Timestamp(naive)
+}
+
 #[function("at_time_zone(timestamp, varchar) -> timestamptz")]
 pub fn timestamp_at_time_zone(input: Timestamp, time_zone: &str) -> Result<Timestamptz> {
     let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
+    timestamp_at_time_zone_internal(input, time_zone)
+}
+
+pub fn timestamp_at_time_zone_internal(input: Timestamp, time_zone: Tz) -> Result<Timestamptz> {
     // https://www.postgresql.org/docs/current/datetime-invalid-input.html
-    // Special cases:
-    // * invalid time during daylight forward
-    //   * PostgreSQL uses UTC offset before the transition
-    //   * We report an error (FIXME)
-    // * ambiguous time during daylight backward
-    //   * We follow PostgreSQL to use UTC offset after the transition
-    let instant_local = input
-        .0
-        .and_local_timezone(time_zone)
-        .latest()
-        .ok_or_else(|| ExprError::InvalidParam {
-            name: "local timestamp",
-            reason: format!(
-                "fail to interpret local timestamp \"{}\" in time zone \"{}\"",
-                input, time_zone
-            )
-            .into(),
-        })?;
+    let instant_local = match input.0.and_local_timezone(time_zone) {
+        LocalResult::Single(t) => t,
+        // invalid time during daylight forward, use UTC offset before the transition
+        // we minus 3 hours in naive time first, do the timezone conversion, and add 3 hours back in the UTC timeline.
+        // This assumes jump forwards are less than 3 hours and there is a single change within this 3-hour window.
+        // see <https://github.com/risingwavelabs/risingwave/pull/15670#discussion_r1524211006>
+        LocalResult::None => {
+            (input.0 - chrono::Duration::hours(3))
+                .and_local_timezone(time_zone)
+                .single()
+                .ok_or_else(|| ExprError::InvalidParam {
+                    name: "local timestamp",
+                    reason: format!(
+                        "fail to interpret local timestamp \"{}\" in time zone \"{}\"",
+                        input, time_zone
+                    )
+                    .into(),
+                })?
+                + chrono::Duration::hours(3)
+        }
+        // ambiguous time during daylight backward, use UTC offset after the transition
+        LocalResult::Ambiguous(_, latest) => latest,
+    };
     let usec = instant_local.timestamp_micros();
     Ok(Timestamptz::from_micros(usec))
 }
@@ -72,13 +97,7 @@ pub fn timestamptz_to_string(
 ) -> Result<()> {
     let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
     let instant_local = elem.to_datetime_in_zone(time_zone);
-    write!(
-        writer,
-        "{}",
-        instant_local.format("%Y-%m-%d %H:%M:%S%.f%:z")
-    )
-    .map_err(|e| ExprError::Internal(e.into()))?;
-    Ok(())
+    write_date_time_tz(instant_local, writer).map_err(|e| ExprError::Internal(e.into()))
 }
 
 // Tries to interpret the string with a timezone, and if failing, tries to interpret the string as a
@@ -92,14 +111,6 @@ pub fn str_to_timestamptz(elem: &str, time_zone: &str) -> Result<Timestamptz> {
             time_zone,
         )
     })
-}
-
-#[function("at_time_zone(timestamptz, varchar) -> timestamp")]
-pub fn timestamptz_at_time_zone(input: Timestamptz, time_zone: &str) -> Result<Timestamp> {
-    let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
-    let instant_local = input.to_datetime_in_zone(time_zone);
-    let naive = instant_local.naive_local();
-    Ok(Timestamp(naive))
 }
 
 /// This operation is zone agnostic.
@@ -134,6 +145,15 @@ pub fn timestamptz_interval_add(
     interval: Interval,
     time_zone: &str,
 ) -> Result<Timestamptz> {
+    let time_zone = Timestamptz::lookup_time_zone(time_zone).map_err(time_zone_err)?;
+    timestamptz_interval_add_internal(input, interval, time_zone)
+}
+
+pub fn timestamptz_interval_add_internal(
+    input: Timestamptz,
+    interval: Interval,
+    time_zone: Tz,
+) -> Result<Timestamptz> {
     use num_traits::Zero as _;
 
     // A month may have 28-31 days, a day may have 23 or 25 hours during Daylight Saving switch.
@@ -146,11 +166,11 @@ pub fn timestamptz_interval_add(
     if !qualitative.is_zero() {
         // Only convert into and from naive local when necessary because it is lossy.
         // See `e2e_test/batch/functions/issue_12072.slt.part` for the difference.
-        let naive = timestamptz_at_time_zone(t, time_zone)?;
+        let naive = timestamptz_at_time_zone_internal(t, time_zone);
         let naive = naive
             .checked_add(qualitative)
             .ok_or(ExprError::NumericOverflow)?;
-        t = timestamp_at_time_zone(naive, time_zone)?;
+        t = timestamp_at_time_zone_internal(naive, time_zone)?;
     }
     let t = timestamptz_interval_quantitative(t, quantitative, i64::checked_add)?;
     Ok(t)
@@ -236,15 +256,27 @@ mod tests {
     }
 
     #[test]
+    #[rustfmt::skip]
     fn test_time_zone_conversion_daylight_forward() {
-        for (local, zone) in [
-            ("2022-03-13 02:00:00", "US/Pacific"),
-            ("2022-03-13 02:59:00", "US/Pacific"),
-            ("2022-03-27 02:00:00", "europe/zurich"),
-            ("2022-03-27 02:59:00", "europe/zurich"),
-        ] {
-            let actual = timestamp_at_time_zone(local.parse().unwrap(), zone);
-            assert!(actual.is_err());
+        // [02:00. 03:00) are invalid
+        test("2022-03-13 02:00:00", "US/Pacific", "2022-03-13 10:00:00+00:00");
+        test("2022-03-13 03:00:00", "US/Pacific", "2022-03-13 10:00:00+00:00");
+        // [02:00. 03:00) are invalid
+        test("2022-03-27 02:00:00", "europe/zurich", "2022-03-27 01:00:00+00:00");
+        test("2022-03-27 03:00:00", "europe/zurich", "2022-03-27 01:00:00+00:00");
+        // [02:00. 02:30) are invalid
+        test("2023-10-01 02:00:00", "Australia/Lord_Howe", "2023-09-30 15:30:00+00:00");
+        test("2023-10-01 02:30:00", "Australia/Lord_Howe", "2023-09-30 15:30:00+00:00");
+        // FIXME: the jump should be        1981-12-31 23:29:59 to 1982-01-01 00:00:00,
+        //        but the actual jump is    1981-12-31 15:59:59 to 1981-12-31 16:30:00
+        // an arbitrary one-off change in Singapore jumping from 1981-12-31 23:29:59 to 1982-01-01 00:00:00
+        // test("1981-12-31 23:30:00", "Asia/Singapore", "1981-12-31 16:00:00+00:00");
+        // test("1982-01-01 00:00:00", "Asia/Singapore", "1981-12-31 16:00:00+00:00");
+
+        #[track_caller]
+        fn test(local: &str, zone: &str, instant: &str) {
+            let actual = timestamp_at_time_zone(local.parse().unwrap(), zone).unwrap().to_string();
+            assert_eq!(actual, instant);
         }
     }
 

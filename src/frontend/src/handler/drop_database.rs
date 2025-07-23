@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,30 +13,26 @@
 // limitations under the License.
 
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::error::{ErrorCode, Result};
-use risingwave_sqlparser::ast::{DropMode, ObjectName};
+use risingwave_sqlparser::ast::ObjectName;
 
 use super::RwPgResponse;
 use crate::binder::Binder;
+use crate::error::{ErrorCode, Result};
 use crate::handler::HandlerArgs;
 
 pub async fn handle_drop_database(
     handler_args: HandlerArgs,
     database_name: ObjectName,
     if_exists: bool,
-    mode: Option<DropMode>,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
     let catalog_reader = session.env().catalog_reader();
     let database_name = Binder::resolve_database_name(database_name)?;
     if session.database() == database_name {
-        return Err(ErrorCode::InternalError(
-            "cannot drop the currently open database".to_string(),
+        return Err(ErrorCode::PermissionDenied(
+            "cannot drop the currently open database".to_owned(),
         )
         .into());
-    }
-    if mode.is_some() {
-        return Err(ErrorCode::BindError("Drop database not support drop mode".to_string()).into());
     }
     let database = {
         let reader = catalog_reader.read_guard();
@@ -94,8 +90,8 @@ mod tests {
         let res = frontend
             .run_user_sql(
                 "DROP DATABASE database",
-                "dev".to_string(),
-                "user".to_string(),
+                "dev".to_owned(),
+                "user".to_owned(),
                 user_id,
             )
             .await;

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,24 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::{Ord, Ordering};
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
 use parse_display::Display;
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::common::{PbColumnOrder, PbDirection, PbNullsAre, PbOrderType};
 
 use super::iter_util::ZipEqDebug;
 use crate::array::{Array, DataChunk};
 use crate::catalog::{FieldDisplay, Schema};
 use crate::dispatch_array_variants;
-use crate::estimate_size::EstimateSize;
 use crate::row::Row;
 use crate::types::{DefaultOrdered, ToDatumRef};
 
 /// Sort direction, ascending/descending.
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug, Display, Default)]
-enum Direction {
+pub enum Direction {
     #[default]
     #[display("ASC")]
     Ascending,
@@ -38,7 +38,7 @@ enum Direction {
 }
 
 impl Direction {
-    pub fn from_protobuf(direction: &PbDirection) -> Self {
+    fn from_protobuf(direction: &PbDirection) -> Self {
         match direction {
             PbDirection::Ascending => Self::Ascending,
             PbDirection::Descending => Self::Descending,
@@ -46,7 +46,7 @@ impl Direction {
         }
     }
 
-    pub fn to_protobuf(self) -> PbDirection {
+    fn to_protobuf(self) -> PbDirection {
         match self {
             Self::Ascending => PbDirection::Ascending,
             Self::Descending => PbDirection::Descending,
@@ -74,7 +74,7 @@ enum NullsAre {
 }
 
 impl NullsAre {
-    pub fn from_protobuf(nulls_are: &PbNullsAre) -> Self {
+    fn from_protobuf(nulls_are: &PbNullsAre) -> Self {
         match nulls_are {
             PbNullsAre::Largest => Self::Largest,
             PbNullsAre::Smallest => Self::Smallest,
@@ -82,7 +82,7 @@ impl NullsAre {
         }
     }
 
-    pub fn to_protobuf(self) -> PbNullsAre {
+    fn to_protobuf(self) -> PbNullsAre {
         match self {
             Self::Largest => PbNullsAre::Largest,
             Self::Smallest => PbNullsAre::Smallest,
@@ -183,6 +183,10 @@ impl OrderType {
     /// Create a `DESC NULLS LAST` order type.
     pub fn descending_nulls_last() -> Self {
         Self::nulls_last(Direction::Descending)
+    }
+
+    pub fn direction(&self) -> Direction {
+        self.direction
     }
 
     pub fn is_ascending(&self) -> bool {
@@ -308,7 +312,7 @@ pub struct HeapElem {
     chunk: DataChunk,
     chunk_idx: usize,
     elem_idx: usize,
-    /// DataChunk can be encoded to accelerate the comparison.
+    /// `DataChunk` can be encoded to accelerate the comparison.
     /// Use `risingwave_common::util::encoding_for_comparison::encode_chunk`
     /// to perform encoding, otherwise the comparison will be performed
     /// column by column.
@@ -506,9 +510,7 @@ pub fn partial_cmp_datum_iter(
 ) -> Option<Ordering> {
     let mut order_types_iter = order_types.into_iter();
     lhs.into_iter().partial_cmp_by(rhs, |x, y| {
-        let Some(order_type) = order_types_iter.next() else {
-            return None;
-        };
+        let order_type = order_types_iter.next()?;
         partial_cmp_datum(x, y, order_type)
     })
 }
@@ -572,14 +574,12 @@ pub fn cmp_rows(lhs: impl Row, rhs: impl Row, order_types: &[OrderType]) -> Orde
 
 #[cfg(test)]
 mod tests {
-    use std::cmp::Ordering;
-
     use itertools::Itertools;
 
     use super::*;
-    use crate::array::{DataChunk, ListValue, StructValue};
-    use crate::row::{OwnedRow, Row};
-    use crate::types::{DataType, Datum, ScalarImpl};
+    use crate::array::{ListValue, StructValue};
+    use crate::row::OwnedRow;
+    use crate::types::{DataType, Datum, ScalarImpl, StructType};
 
     #[test]
     fn test_order_type() {
@@ -720,7 +720,7 @@ mod tests {
                 DataType::Date,
                 DataType::Timestamp,
                 DataType::Time,
-                DataType::new_struct(vec![DataType::Int32, DataType::Float32], vec![]),
+                StructType::unnamed(vec![DataType::Int32, DataType::Float32]).into(),
                 DataType::List(Box::new(DataType::Int32)),
             ],
         );

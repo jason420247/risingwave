@@ -1,10 +1,7 @@
-disallowed-methods = [
-]
+disallowed-methods = []
 
 disallowed-types = [
-    { path = "risingwave_common::error::ErrorCode", reason = "Please use per-crate error type instead." },
-    { path = "risingwave_common::error::RwError", reason = "Please use per-crate error type instead." },
-    { path = "risingwave_common::error::Result", reason = "Please use per-crate error type instead." },
+    { path = "iceberg::Error", reason = "Please use `risingwave_common::error::IcebergError` instead." },
 ]
 
 doc-valid-idents = [
@@ -16,7 +13,7 @@ doc-valid-idents = [
     "PostgreSQL",
     "MySQL",
     "TopN",
-    "VNode"
+    "VNode",
 ]
 avoid-breaking-exported-api = false
 upper-case-acronyms-aggressive = true

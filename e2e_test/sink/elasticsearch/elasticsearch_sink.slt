@@ -1,6 +1,9 @@
 statement ok
+set sink_decouple = false;
+
+statement ok
 CREATE TABLE t7 (
-  v1 int primary key,
+  v1 int,
   v2 bigint,
   v3 varchar,
   d date,
@@ -8,10 +11,55 @@ CREATE TABLE t7 (
   ts timestamp,
   tz timestamptz,
   st struct<st1 int, st2 int>,
+  primary key(v1,v3),
+);
+
+statement ok
+CREATE TABLE test_route (
+  v1 int primary key,
+  v2 int,
+  v3 varchar,
+);
+
+# Invalid field: foo, allowed fields: {"username", "url", "password"}
+statement error
+create connection es_conn_1 with (
+  type = 'elasticsearch',
+  foo = 'bar',
+  url = 'http://elasticsearch:9200',
+  username = 'elastic',
+  password = 'risingwave'
+);
+
+# please set the password when the username is set.
+statement error
+create connection es_conn_1 with (
+  type = 'elasticsearch',
+  url = 'http://elasticsearch:9200',
+  username = 'elastic'
+);
+
+
+statement ok
+create connection es_conn with (
+  type = 'elasticsearch',
+    url = 'http://elasticsearch:9200',
+    username = 'elastic',
+    password = 'risingwave',
+);
+
+statement ok
+CREATE SINK test_route_sink from test_route WITH (
+    type = 'upsert',
+    connector = 'elasticsearch',
+    index = 'test_route',
+    connection = es_conn,
+    routing_column = 'v3'
 );
 
 statement ok
 CREATE SINK s7 from t7 WITH (
+    type = 'upsert',
     connector = 'elasticsearch',
     index = 'test',
     url = 'http://elasticsearch:9200',
@@ -21,6 +69,7 @@ CREATE SINK s7 from t7 WITH (
 
 statement ok
 CREATE SINK s8 from t7 WITH (
+    type = 'upsert',
     connector = 'elasticsearch',
     index = 'test1',
     primary_key = 'v1,v3',
@@ -29,6 +78,12 @@ CREATE SINK s8 from t7 WITH (
     password = 'risingwave',
     delimiter = '_'
 );
+
+statement ok
+INSERT INTO test_route VALUES
+  (1,1,'test1'),
+  (2,2,'test2'),
+  (3,3,'test3');
 
 statement ok
 INSERT INTO t7 VALUES
@@ -46,6 +101,9 @@ statement ok
 INSERT INTO t7 VALUES (1, 50, '1-50', '2000-01-01', '00:00:00.123456', '2000-01-01 00:00:00.123456', '2000-01-01 00:00:00.123456Z',(1,1));
 
 statement ok
+update t7 set v2 = 55 where v1 = 2;
+
+statement ok
 FLUSH;
 
 statement ok
@@ -53,6 +111,12 @@ DROP SINK s7;
 
 statement ok
 DROP SINK s8;
+
+statement ok
+DROP SINK test_route_sink;
+
+statement ok
+DROP TABLE test_route;
 
 statement ok
 DROP TABLE t7;

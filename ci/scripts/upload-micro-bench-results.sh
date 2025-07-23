@@ -24,7 +24,7 @@ get_branch() {
 get_date() {
   curl -H "Authorization: Bearer $BUILDKITE_TOKEN" \
    "https://api.buildkite.com/v2/organizations/risingwavelabs/pipelines/main-cron/builds/$BUILDKITE_BUILD_NUMBER" \
-  | jq '.jobs | .[] | select ( .name | contains("micro benchmark")) | .finished_at' \
+  | jq '.jobs | .[] | select(.name != null) | select(.name | contains("micro benchmark")) | .finished_at' \
   | sed 's/\.[0-9]*Z/Z/' \
   | sed 's/\"//g'
 }
@@ -67,7 +67,7 @@ echo "Commit: $COMMIT"
 echo "Branch: $BRANCH"
 echo "Date: $END_DATE"
 
-./qa ctl -I 52.207.243.214:8081 execution create-micro-benchmark-executions \
+./qa ctl -I qa-infra.risingwave-cloud.xyz:8081 execution create-micro-benchmark-executions \
   --exec-url "${BUILDKITE_BUILD_URL}" \
   --branch "$BRANCH" \
   --tag latest \

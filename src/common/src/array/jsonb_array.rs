@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::{PbArray, PbArrayType};
 
 use super::{Array, ArrayBuilder, ArrayImpl, ArrayResult};
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::EstimateSize;
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::types::{DataType, JsonbRef, JsonbVal, Scalar};
 
 #[derive(Debug, Clone, EstimateSize)]
@@ -125,8 +125,8 @@ impl Array for JsonbArray {
     }
 
     fn to_protobuf(&self) -> PbArray {
-        use risingwave_pb::common::buffer::CompressionType;
         use risingwave_pb::common::Buffer;
+        use risingwave_pb::common::buffer::CompressionType;
 
         PbArray {
             null_bitmap: Some(self.null_bitmap().to_protobuf()),
@@ -174,17 +174,5 @@ impl FromIterator<Option<JsonbVal>> for JsonbArray {
 impl FromIterator<JsonbVal> for JsonbArray {
     fn from_iter<I: IntoIterator<Item = JsonbVal>>(iter: I) -> Self {
         iter.into_iter().map(Some).collect()
-    }
-}
-
-impl EstimateSize for jsonbb::Value {
-    fn estimated_heap_size(&self) -> usize {
-        self.capacity()
-    }
-}
-
-impl EstimateSize for jsonbb::Builder {
-    fn estimated_heap_size(&self) -> usize {
-        self.capacity()
     }
 }

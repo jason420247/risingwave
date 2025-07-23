@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,25 @@ use risingwave_common::error::{BoxedError, NotImplemented};
 use risingwave_common::util::value_encoding::error::ValueEncodingError;
 use risingwave_connector::error::ConnectorError;
 use risingwave_connector::sink::SinkError;
+use risingwave_dml::error::DmlError;
 use risingwave_expr::ExprError;
 use risingwave_pb::PbFieldNotFound;
 use risingwave_rpc_client::error::RpcError;
 use risingwave_storage::error::StorageError;
+use strum_macros::AsRefStr;
 
 use super::Barrier;
+use super::exchange::error::ExchangeChannelClosed;
 
 /// A specialized Result type for streaming executors.
 pub type StreamExecutorResult<T> = std::result::Result<T, StreamExecutorError>;
 
 /// The error type for streaming executors.
-#[derive(thiserror::Error, Debug, thiserror_ext::Box, thiserror_ext::Construct)]
-#[thiserror_ext(newtype(name = StreamExecutorError, backtrace, report_debug))]
+#[derive(
+    thiserror::Error, thiserror_ext::ReportDebug, thiserror_ext::Box, thiserror_ext::Construct,
+)]
+#[thiserror_ext(newtype(name = StreamExecutorError, backtrace))]
+#[derive(AsRefStr)]
 pub enum ErrorKind {
     #[error("Storage error: {0}")]
     Storage(
@@ -60,11 +66,12 @@ pub enum ErrorKind {
         BoxedError,
     ),
 
-    #[error("Sink error: {0}")]
+    #[error("Sink error: sink_id={1}, error: {0}")]
     SinkError(
-        #[from]
+        #[source]
         #[backtrace]
         SinkError,
+        u32,
     ),
 
     #[error(transparent)]
@@ -77,6 +84,13 @@ pub enum ErrorKind {
     #[error("Channel closed: {0}")]
     ChannelClosed(String),
 
+    #[error(transparent)]
+    ExchangeChannelClosed(
+        #[from]
+        #[backtrace]
+        ExchangeChannelClosed,
+    ),
+
     #[error("Failed to align barrier: expected `{0:?}` but got `{1:?}`")]
     AlignBarrier(Box<Barrier>, Box<Barrier>),
 
@@ -87,18 +101,18 @@ pub enum ErrorKind {
         BoxedError,
     ),
 
-    #[error("Dml error: {0}")]
+    #[error(transparent)]
     DmlError(
-        #[source]
+        #[from]
         #[backtrace]
-        BoxedError,
+        DmlError,
     ),
 
     #[error(transparent)]
     NotImplemented(#[from] NotImplemented),
 
     #[error(transparent)]
-    Internal(
+    Uncategorized(
         #[from]
         #[backtrace]
         anyhow::Error,
@@ -135,7 +149,19 @@ impl From<PbFieldNotFound> for StreamExecutorError {
 
 impl From<String> for StreamExecutorError {
     fn from(s: String) -> Self {
-        ErrorKind::Internal(anyhow::anyhow!(s)).into()
+        ErrorKind::Uncategorized(anyhow::anyhow!(s)).into()
+    }
+}
+
+impl From<(SinkError, u32)> for StreamExecutorError {
+    fn from((err, sink_id): (SinkError, u32)) -> Self {
+        ErrorKind::SinkError(err, sink_id).into()
+    }
+}
+
+impl StreamExecutorError {
+    pub fn variant_name(&self) -> &str {
+        self.0.inner().as_ref()
     }
 }
 

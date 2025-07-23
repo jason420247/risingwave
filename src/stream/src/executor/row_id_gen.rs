@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,30 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::StreamExt;
-use futures_async_stream::try_stream;
-use risingwave_common::array::stream_chunk::Ops;
-use risingwave_common::array::{
-    Array, ArrayBuilder, ArrayRef, Op, SerialArrayBuilder, StreamChunk,
-};
-use risingwave_common::buffer::Bitmap;
-use risingwave_common::catalog::Schema;
+use risingwave_common::array::{Array, ArrayBuilder, ArrayRef, Op, SerialArrayBuilder};
+use risingwave_common::bitmap::Bitmap;
 use risingwave_common::hash::VnodeBitmapExt;
 use risingwave_common::types::Serial;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::row_id::RowIdGenerator;
 
-use super::{
-    expect_first_barrier, ActorContextRef, BoxedExecutor, Executor, ExecutorInfo, PkIndicesRef,
-};
-use crate::executor::{Message, StreamExecutorError};
+use crate::executor::prelude::*;
 
 /// [`RowIdGenExecutor`] generates row id for data, where the user has not specified a pk.
 pub struct RowIdGenExecutor {
     ctx: ActorContextRef,
-    info: ExecutorInfo,
 
-    upstream: Option<BoxedExecutor>,
+    upstream: Option<Executor>,
 
     row_id_index: usize,
 
@@ -45,14 +35,12 @@ pub struct RowIdGenExecutor {
 impl RowIdGenExecutor {
     pub fn new(
         ctx: ActorContextRef,
-        info: ExecutorInfo,
-        upstream: BoxedExecutor,
+        upstream: Executor,
         row_id_index: usize,
         vnodes: Bitmap,
     ) -> Self {
         Self {
             ctx,
-            info,
             upstream: Some(upstream),
             row_id_index,
             row_id_generator: Self::new_generator(&vnodes),
@@ -61,14 +49,14 @@ impl RowIdGenExecutor {
 
     /// Create a new row id generator based on the assigned vnodes.
     fn new_generator(vnodes: &Bitmap) -> RowIdGenerator {
-        RowIdGenerator::new(vnodes.iter_vnodes())
+        RowIdGenerator::new(vnodes.iter_vnodes(), vnodes.len())
     }
 
     /// Generate a row ID column according to ops.
     fn gen_row_id_column_by_op(
         &mut self,
         column: &ArrayRef,
-        ops: Ops<'_>,
+        ops: &'_ [Op],
         vis: &Bitmap,
     ) -> ArrayRef {
         let len = column.len();
@@ -126,62 +114,48 @@ impl RowIdGenExecutor {
     }
 }
 
-impl Executor for RowIdGenExecutor {
+impl Execute for RowIdGenExecutor {
     fn execute(self: Box<Self>) -> super::BoxedMessageStream {
         self.execute_inner().boxed()
-    }
-
-    fn schema(&self) -> &Schema {
-        &self.info.schema
-    }
-
-    fn pk_indices(&self) -> PkIndicesRef<'_> {
-        &self.info.pk_indices
-    }
-
-    fn identity(&self) -> &str {
-        &self.info.identity
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::{Array, PrimitiveArray};
-    use risingwave_common::catalog::{Field, Schema};
+    use risingwave_common::array::PrimitiveArray;
+    use risingwave_common::catalog::Field;
     use risingwave_common::hash::VirtualNode;
     use risingwave_common::test_prelude::StreamChunkTestExt;
-    use risingwave_common::types::DataType;
+    use risingwave_common::util::epoch::test_epoch;
 
     use super::*;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::{ActorContext, Executor};
 
     #[tokio::test]
     async fn test_row_id_gen_executor() {
+        // This test only works when vnode count is 256.
+        assert_eq!(VirtualNode::COUNT_FOR_TEST, 256);
+
         let schema = Schema::new(vec![
             Field::unnamed(DataType::Serial),
             Field::unnamed(DataType::Int64),
         ]);
         let pk_indices = vec![0];
         let row_id_index = 0;
-        let row_id_generator = Bitmap::ones(VirtualNode::COUNT);
-        let (mut tx, upstream) = MockSource::channel(schema.clone(), pk_indices.clone());
-        let row_id_gen_executor = Box::new(RowIdGenExecutor::new(
-            ActorContext::create(233),
-            ExecutorInfo {
-                schema,
-                pk_indices,
-                identity: "RowIdGenExecutor".to_string(),
-            },
-            Box::new(upstream),
+        let row_id_generator = Bitmap::ones(VirtualNode::COUNT_FOR_TEST);
+        let (mut tx, upstream) = MockSource::channel();
+        let upstream = upstream.into_executor(schema.clone(), pk_indices.clone());
+
+        let row_id_gen_executor = RowIdGenExecutor::new(
+            ActorContext::for_test(233),
+            upstream,
             row_id_index,
             row_id_generator,
-        ));
-
-        let mut row_id_gen_executor = row_id_gen_executor.execute();
+        );
+        let mut row_id_gen_executor = row_id_gen_executor.boxed().execute();
 
         // Init barrier
-        tx.push_barrier(1, false);
+        tx.push_barrier(test_epoch(1), false);
         row_id_gen_executor.next().await.unwrap().unwrap();
 
         // Insert operation

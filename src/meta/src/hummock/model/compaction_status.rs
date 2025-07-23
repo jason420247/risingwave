@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,32 +13,8 @@
 // limitations under the License.
 
 use itertools::Itertools;
-use risingwave_hummock_sdk::CompactionGroupId;
 
 use crate::hummock::compaction::CompactStatus;
-use crate::hummock::model::HUMMOCK_COMPACTION_STATUS_CF_NAME;
-use crate::model::{MetadataModel, MetadataModelResult};
-
-impl MetadataModel for CompactStatus {
-    type KeyType = CompactionGroupId;
-    type PbType = risingwave_pb::hummock::CompactStatus;
-
-    fn cf_name() -> String {
-        String::from(HUMMOCK_COMPACTION_STATUS_CF_NAME)
-    }
-
-    fn to_protobuf(&self) -> Self::PbType {
-        self.into()
-    }
-
-    fn from_protobuf(prost: Self::PbType) -> Self {
-        (&prost).into()
-    }
-
-    fn key(&self) -> MetadataModelResult<Self::KeyType> {
-        Ok(self.compaction_group_id)
-    }
-}
 
 impl From<&CompactStatus> for risingwave_pb::hummock::CompactStatus {
     fn from(status: &CompactStatus) -> Self {

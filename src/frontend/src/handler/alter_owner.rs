@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +16,19 @@ use std::sync::Arc;
 
 use pgwire::pg_response::StatementType;
 use risingwave_common::acl::AclMode;
-use risingwave_common::error::ErrorCode::PermissionDenied;
-use risingwave_common::error::Result;
+use risingwave_common::catalog::{DEFAULT_SUPER_USER_FOR_ADMIN, is_reserved_admin_user};
 use risingwave_pb::ddl_service::alter_owner_request::Object;
 use risingwave_pb::user::grant_privilege;
 use risingwave_sqlparser::ast::{Ident, ObjectName};
 
 use super::{HandlerArgs, RwPgResponse};
+use crate::Binder;
 use crate::catalog::root_catalog::SchemaPath;
 use crate::catalog::{CatalogError, OwnedByUserCatalog};
+use crate::error::ErrorCode::PermissionDenied;
+use crate::error::Result;
 use crate::session::SessionImpl;
 use crate::user::user_catalog::UserCatalog;
-use crate::Binder;
 
 pub fn check_schema_create_privilege(
     session: &Arc<SessionImpl>,
@@ -38,13 +39,13 @@ pub fn check_schema_create_privilege(
         return Ok(());
     }
     if !new_owner.is_super
-        && !new_owner.check_privilege(
+        && !new_owner.has_privilege(
             &grant_privilege::Object::SchemaId(schema_id),
             AclMode::Create,
         )
     {
         return Err(PermissionDenied(
-            "Require new owner to have create privilege on the object.".to_string(),
+            "Require new owner to have create privilege on the object.".to_owned(),
         )
         .into());
     }
@@ -58,11 +59,10 @@ pub async fn handle_alter_owner(
     stmt_type: StatementType,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, real_obj_name) =
-        Binder::resolve_schema_qualified_name(db_name, obj_name.clone())?;
+    let db_name = &session.database();
+    let (schema_name, real_obj_name) = Binder::resolve_schema_qualified_name(db_name, &obj_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let new_owner_name = Binder::resolve_user_name(vec![new_owner_name].into())?;
@@ -72,12 +72,21 @@ pub async fn handle_alter_owner(
         let new_owner = user_reader
             .get_user_by_name(&new_owner_name)
             .ok_or(CatalogError::NotFound("user", new_owner_name))?;
+        if is_reserved_admin_user(&new_owner.name) {
+            return Err(PermissionDenied(
+                format!("{} is reserved for admin", DEFAULT_SUPER_USER_FOR_ADMIN).to_owned(),
+            )
+            .into());
+        }
         let owner_id = new_owner.id;
         (
             match stmt_type {
                 StatementType::ALTER_TABLE | StatementType::ALTER_MATERIALIZED_VIEW => {
-                    let (table, schema_name) =
-                        catalog_reader.get_table_by_name(db_name, schema_path, &real_obj_name)?;
+                    let (table, schema_name) = catalog_reader.get_created_table_by_name(
+                        db_name,
+                        schema_path,
+                        &real_obj_name,
+                    )?;
                     session.check_privilege_for_drop_alter(schema_name, &**table)?;
                     let schema_id = catalog_reader
                         .get_schema_by_name(db_name, schema_name)?
@@ -115,8 +124,11 @@ pub async fn handle_alter_owner(
                     Object::SourceId(source.id)
                 }
                 StatementType::ALTER_SINK => {
-                    let (sink, schema_name) =
-                        catalog_reader.get_sink_by_name(db_name, schema_path, &real_obj_name)?;
+                    let (sink, schema_name) = catalog_reader.get_created_sink_by_name(
+                        db_name,
+                        schema_path,
+                        &real_obj_name,
+                    )?;
                     session.check_privilege_for_drop_alter(schema_name, &**sink)?;
                     let schema_id = catalog_reader
                         .get_schema_by_name(db_name, schema_name)?
@@ -126,6 +138,22 @@ pub async fn handle_alter_owner(
                         return Ok(RwPgResponse::empty_result(stmt_type));
                     }
                     Object::SinkId(sink.id.sink_id)
+                }
+                StatementType::ALTER_SUBSCRIPTION => {
+                    let (subscription, schema_name) = catalog_reader.get_subscription_by_name(
+                        db_name,
+                        schema_path,
+                        &real_obj_name,
+                    )?;
+                    session.check_privilege_for_drop_alter(schema_name, &**subscription)?;
+                    let schema_id = catalog_reader
+                        .get_schema_by_name(db_name, schema_name)?
+                        .id();
+                    check_schema_create_privilege(&session, new_owner, schema_id)?;
+                    if subscription.owner() == owner_id {
+                        return Ok(RwPgResponse::empty_result(stmt_type));
+                    }
+                    Object::SubscriptionId(subscription.id.subscription_id)
                 }
                 StatementType::ALTER_DATABASE => {
                     let database = catalog_reader.get_database_by_name(&obj_name.real_value())?;
@@ -143,6 +171,18 @@ pub async fn handle_alter_owner(
                         return Ok(RwPgResponse::empty_result(stmt_type));
                     }
                     Object::SchemaId(schema.id())
+                }
+                StatementType::ALTER_CONNECTION => {
+                    let (connection, schema_name) = catalog_reader.get_connection_by_name(
+                        db_name,
+                        schema_path,
+                        &real_obj_name,
+                    )?;
+                    session.check_privilege_for_drop_alter(schema_name, &**connection)?;
+                    if connection.owner() == owner_id {
+                        return Ok(RwPgResponse::empty_result(stmt_type));
+                    }
+                    Object::ConnectionId(connection.id)
                 }
                 _ => unreachable!(),
             },

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use risingwave_common::types::DataType;
-use risingwave_expr::aggregate::AggKind;
+use risingwave_expr::aggregate::{AggType, PbAggKind};
 use risingwave_pb::plan_common::JoinType;
 
 use super::{ApplyOffsetRewriter, BoxedRule, Rule};
 use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef};
+use crate::optimizer::PlanRef;
 use crate::optimizer::plan_node::generic::Agg;
 use crate::optimizer::plan_node::{LogicalAgg, LogicalApply, LogicalFilter, LogicalProject};
-use crate::optimizer::PlanRef;
 use crate::utils::{Condition, IndexSet};
 
 /// Transpose `LogicalApply` and `LogicalAgg`.
@@ -106,10 +106,11 @@ impl Rule for ApplyAggTransposeRule {
                 correlated_id,
                 correlated_indices.clone(),
                 false,
+                false,
             )
             .translate_apply(left, eq_predicates)
         } else {
-            LogicalApply::new(
+            LogicalApply::create(
                 left,
                 input,
                 JoinType::Inner,
@@ -118,7 +119,6 @@ impl Rule for ApplyAggTransposeRule {
                 correlated_indices.clone(),
                 false,
             )
-            .into()
         };
 
         let group_agg = {
@@ -140,9 +140,55 @@ impl Rule for ApplyAggTransposeRule {
                 // convert count(*) to count(1).
                 let pos_of_constant_column = node.schema().len() - 1;
                 agg_calls.iter_mut().for_each(|agg_call| {
-                    if agg_call.agg_kind == AggKind::Count && agg_call.inputs.is_empty() {
-                        let input_ref = InputRef::new(pos_of_constant_column, DataType::Int32);
-                        agg_call.inputs.push(input_ref);
+                    match agg_call.agg_type {
+                        AggType::Builtin(PbAggKind::Count) if agg_call.inputs.is_empty() => {
+                            let input_ref = InputRef::new(pos_of_constant_column, DataType::Int32);
+                            agg_call.inputs.push(input_ref);
+                        }
+                        AggType::Builtin(PbAggKind::ArrayAgg
+                        | PbAggKind::JsonbAgg
+                        | PbAggKind::JsonbObjectAgg)
+                        | AggType::UserDefined(_)
+                        | AggType::WrapScalar(_) => {
+                            let input_ref = InputRef::new(pos_of_constant_column, DataType::Int32);
+                            let cond = FunctionCall::new(ExprType::IsNotNull, vec![input_ref.into()]).unwrap();
+                            agg_call.filter.conjunctions.push(cond.into());
+                        }
+                        AggType::Builtin(PbAggKind::Count
+                        | PbAggKind::Sum
+                        | PbAggKind::Sum0
+                        | PbAggKind::Avg
+                        | PbAggKind::Min
+                        | PbAggKind::Max
+                        | PbAggKind::BitAnd
+                        | PbAggKind::BitOr
+                        | PbAggKind::BitXor
+                        | PbAggKind::BoolAnd
+                        | PbAggKind::BoolOr
+                        | PbAggKind::StringAgg
+                        // not in PostgreSQL
+                        | PbAggKind::ApproxCountDistinct
+                        | PbAggKind::FirstValue
+                        | PbAggKind::LastValue
+                        | PbAggKind::InternalLastSeenValue
+                        // All statistical aggregates only consider non-null inputs.
+                        | PbAggKind::ApproxPercentile
+                        | PbAggKind::VarPop
+                        | PbAggKind::VarSamp
+                        | PbAggKind::StddevPop
+                        | PbAggKind::StddevSamp
+                        // All ordered-set aggregates ignore null values in their aggregated input.
+                        | PbAggKind::PercentileCont
+                        | PbAggKind::PercentileDisc
+                        | PbAggKind::Mode
+                        // `grouping` has no *aggregate* input and unreachable when `is_scalar_agg`.
+                        | PbAggKind::Grouping)
+                        => {
+                            // no-op when `agg(0 rows) == agg(1 row of nulls)`
+                        }
+                        AggType::Builtin(PbAggKind::Unspecified | PbAggKind::UserDefined | PbAggKind::WrapScalar) => {
+                            panic!("Unexpected aggregate function: {:?}", agg_call.agg_type)
+                        }
                     }
                 });
             }

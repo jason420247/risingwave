@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,9 @@ pub use split::*;
 use with_options::WithOptions;
 
 use self::source::reader::PulsarSplitReader;
-use crate::common::{AwsAuthProps, PulsarCommon, PulsarOauthCommon};
+use crate::connector_common::{AwsAuthProps, PulsarCommon, PulsarOauthCommon};
+use crate::enforce_secret::EnforceSecret;
+use crate::error::ConnectorError;
 use crate::source::SourceProperties;
 
 pub const PULSAR_CONNECTOR: &str = "pulsar";
@@ -42,6 +44,15 @@ impl SourceProperties for PulsarProperties {
 impl crate::source::UnknownFields for PulsarProperties {
     fn unknown_fields(&self) -> HashMap<String, String> {
         self.unknown_fields.clone()
+    }
+}
+
+impl EnforceSecret for PulsarProperties {
+    fn enforce_secret<'a>(prop_iter: impl Iterator<Item = &'a str>) -> Result<(), ConnectorError> {
+        for prop in prop_iter {
+            PulsarCommon::enforce_one(prop)?;
+        }
+        Ok(())
     }
 }
 
@@ -73,6 +84,16 @@ pub struct PulsarProperties {
 
     #[serde(rename = "iceberg.bucket", default)]
     pub iceberg_bucket: Option<String>,
+
+    /// Specify a custom consumer group id prefix for the source.
+    /// Defaults to `rw-consumer`.
+    ///
+    /// Notes:
+    /// - Each job (materialized view) will have multiple subscriptions and
+    ///   contains a generated suffix in the subscription name.
+    ///   The subscription name will be `{subscription_name_prefix}-{fragment_id}-{actor_id}`.
+    #[serde(rename = "subscription.name.prefix")]
+    pub subscription_name_prefix: Option<String>,
 
     #[serde(flatten)]
     pub unknown_fields: HashMap<String, String>,

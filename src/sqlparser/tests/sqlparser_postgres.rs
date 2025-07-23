@@ -16,7 +16,6 @@
 #[macro_use]
 mod test_utils;
 use risingwave_sqlparser::ast::*;
-use risingwave_sqlparser::parser::ParserError;
 use test_utils::*;
 
 #[test]
@@ -52,7 +51,7 @@ fn parse_create_table_with_defaults() {
                         None,
                         vec![ColumnOptionDef {
                             name: None,
-                            option: ColumnOption::DefaultColumns(verified_expr(
+                            option: ColumnOption::DefaultValue(verified_expr(
                                 "nextval(public.customer_customer_id_seq)"
                             ))
                         }],
@@ -101,7 +100,7 @@ fn parse_create_table_with_defaults() {
                         vec![
                             ColumnOptionDef {
                                 name: None,
-                                option: ColumnOption::DefaultColumns(Expr::Value(Value::Boolean(
+                                option: ColumnOption::DefaultValue(Expr::Value(Value::Boolean(
                                     true
                                 ))),
                             },
@@ -118,7 +117,7 @@ fn parse_create_table_with_defaults() {
                         vec![
                             ColumnOptionDef {
                                 name: None,
-                                option: ColumnOption::DefaultColumns(verified_expr(
+                                option: ColumnOption::DefaultValue(verified_expr(
                                     "CAST(now() AS TEXT)"
                                 ))
                             },
@@ -135,7 +134,7 @@ fn parse_create_table_with_defaults() {
                         vec![
                             ColumnOptionDef {
                                 name: None,
-                                option: ColumnOption::DefaultColumns(verified_expr("now()")),
+                                option: ColumnOption::DefaultValue(verified_expr("now()")),
                             },
                             ColumnOptionDef {
                                 name: None,
@@ -160,15 +159,15 @@ fn parse_create_table_with_defaults() {
                 vec![
                     SqlOption {
                         name: vec!["fillfactor".into()].into(),
-                        value: number("20")
+                        value: number("20").into(),
                     },
                     SqlOption {
                         name: vec!["user_catalog_table".into()].into(),
-                        value: Value::Boolean(true)
+                        value: Value::Boolean(true).into(),
                     },
                     SqlOption {
                         name: vec!["autovacuum_vacuum_threshold".into()].into(),
-                        value: number("100")
+                        value: number("100").into(),
                     },
                 ]
             );
@@ -193,7 +192,9 @@ fn parse_create_table_from_pg_dump() {
             release_year public.year,
             active integer
         )";
-    one_statement_parses_to(sql, "CREATE TABLE public.customer (\
+    one_statement_parses_to(
+        sql,
+        "CREATE TABLE public.customer (\
             customer_id INT DEFAULT nextval(CAST('public.customer_customer_id_seq' AS REGCLASS)) NOT NULL, \
             store_id SMALLINT NOT NULL, \
             first_name CHARACTER VARYING NOT NULL, \
@@ -206,7 +207,8 @@ fn parse_create_table_from_pg_dump() {
             last_update TIMESTAMP DEFAULT now(), \
             release_year public.year, \
             active INT\
-        )");
+        )",
+    );
 }
 
 #[test]
@@ -280,7 +282,7 @@ fn parse_alter_table_alter_column() {
         } => {
             assert_eq!("tab", name.to_string());
             assert_eq!("is_active", column_name.to_string());
-            let using_expr = Expr::Value(Value::SingleQuotedString("text".to_string()));
+            let using_expr = Expr::Value(Value::SingleQuotedString("text".to_owned()));
             assert_eq!(
                 op,
                 AlterColumnOperation::SetDataType {
@@ -314,19 +316,19 @@ fn parse_bad_if_not_exists() {
     for (sql, err_msg) in [
         (
             "CREATE TABLE NOT EXISTS uk_cities ()",
-            "Expected end of statement, found: EXISTS",
+            "expected end of statement, found: EXISTS",
         ),
         (
             "CREATE TABLE IF EXISTS uk_cities ()",
-            "Expected end of statement, found: EXISTS",
+            "expected end of statement, found: EXISTS",
         ),
         (
             "CREATE TABLE IF uk_cities ()",
-            "Expected end of statement, found: uk_cities",
+            "expected end of statement, found: uk_cities",
         ),
         (
             "CREATE TABLE IF NOT uk_cities ()",
-            "Expected end of statement, found: NOT",
+            "expected end of statement, found: NOT",
         ),
     ] {
         let res = parse_sql_statements(sql);
@@ -342,6 +344,7 @@ fn parse_create_schema_if_not_exists() {
         Statement::CreateSchema {
             if_not_exists: true,
             schema_name,
+            ..
         } => assert_eq!("schema_name", schema_name.to_string()),
         _ => unreachable!(),
     }
@@ -439,12 +442,17 @@ fn parse_set() {
     one_statement_parses_to("SET a TO b", "SET a = b");
     one_statement_parses_to("SET SESSION a = b", "SET a = b");
     for (sql, err_msg) in [
-        ("SET", "Expected identifier, found: EOF"),
-        ("SET a b", "Expected equals sign or TO, found: b"),
-        ("SET a =", "Expected parameter value, found: EOF"),
+        ("SET", "expected identifier, found: EOF"),
+        (
+            "SET a b",
+            "expected '=' or 'TO' after config parameter, found: b",
+        ),
+        ("SET a =", "expected parameter value"),
     ] {
-        let res = parse_sql_statements(sql);
-        assert!(format!("{}", res.unwrap_err()).contains(err_msg));
+        let error = parse_sql_statements(sql).unwrap_err().to_string();
+        if !error.contains(err_msg) {
+            panic!("expected error '{}' not found in '{}'", err_msg, error);
+        }
     }
 }
 
@@ -458,11 +466,12 @@ fn parse_show() {
         }
     );
 
+    // XXX: shouldn't ALL be a keyword instead?
     let stmt = verified_stmt("SHOW ALL ALL");
     assert_eq!(
         stmt,
         Statement::ShowVariable {
-            variable: vec!["ALL".into(), "ALL".into()]
+            variable: vec![Ident::new_unchecked("ALL"), Ident::new_unchecked("ALL")]
         }
     )
 }
@@ -473,16 +482,17 @@ fn parse_deallocate() {
     assert_eq!(
         stmt,
         Statement::Deallocate {
-            name: "a".into(),
+            name: Some("a".into()),
             prepare: false,
         }
     );
 
+    // XXX: shouldn't ALL be a keyword instead?
     let stmt = verified_stmt("DEALLOCATE ALL");
     assert_eq!(
         stmt,
         Statement::Deallocate {
-            name: "ALL".into(),
+            name: None,
             prepare: false,
         }
     );
@@ -491,16 +501,17 @@ fn parse_deallocate() {
     assert_eq!(
         stmt,
         Statement::Deallocate {
-            name: "a".into(),
+            name: Some("a".into()),
             prepare: true,
         }
     );
 
+    // XXX: shouldn't ALL be a keyword instead?
     let stmt = verified_stmt("DEALLOCATE PREPARE ALL");
     assert_eq!(
         stmt,
         Statement::Deallocate {
-            name: "ALL".into(),
+            name: None,
             prepare: true,
         }
     );
@@ -524,7 +535,7 @@ fn parse_execute() {
             name: "a".into(),
             parameters: vec![
                 Expr::Value(number("1")),
-                Expr::Value(Value::SingleQuotedString("t".to_string()))
+                Expr::Value(Value::SingleQuotedString("t".to_owned()))
             ],
         }
     );
@@ -597,9 +608,9 @@ fn parse_prepare() {
 #[test]
 fn parse_pg_bitwise_binary_ops() {
     let bitwise_ops = &[
-        ("#", BinaryOperator::PGBitwiseXor),
-        (">>", BinaryOperator::PGBitwiseShiftRight),
-        ("<<", BinaryOperator::PGBitwiseShiftLeft),
+        ("#", BinaryOperator::Custom("#".to_owned())),
+        (">>", BinaryOperator::Custom(">>".to_owned())),
+        ("<<", BinaryOperator::Custom("<<".to_owned())),
     ];
 
     for (str_op, op) in bitwise_ops {
@@ -618,11 +629,10 @@ fn parse_pg_bitwise_binary_ops() {
 #[test]
 fn parse_pg_unary_ops() {
     let pg_unary_ops = &[
-        ("~", UnaryOperator::PGBitwiseNot),
-        ("|/", UnaryOperator::PGSquareRoot),
-        ("||/", UnaryOperator::PGCubeRoot),
-        ("!!", UnaryOperator::PGPrefixFactorial),
-        ("@", UnaryOperator::PGAbs),
+        ("~", UnaryOperator::Custom("~".to_owned())),
+        ("|/", UnaryOperator::Custom("|/".to_owned())),
+        ("||/", UnaryOperator::Custom("||/".to_owned())),
+        ("@", UnaryOperator::Custom("@".to_owned())),
     ];
 
     for (str_op, op) in pg_unary_ops {
@@ -638,28 +648,12 @@ fn parse_pg_unary_ops() {
 }
 
 #[test]
-fn parse_pg_postfix_factorial() {
-    let postfix_factorial = &[("!", UnaryOperator::PGPostfixFactorial)];
-
-    for (str_op, op) in postfix_factorial {
-        let select = verified_only_select(&format!("SELECT a{}", &str_op));
-        assert_eq!(
-            SelectItem::UnnamedExpr(Expr::UnaryOp {
-                op: op.clone(),
-                expr: Box::new(Expr::Identifier(Ident::new_unchecked("a"))),
-            }),
-            select.projection[0]
-        );
-    }
-}
-
-#[test]
 fn parse_pg_regex_match_ops() {
     let pg_regex_match_ops = &[
-        ("~", BinaryOperator::PGRegexMatch),
-        ("~*", BinaryOperator::PGRegexIMatch),
-        ("!~", BinaryOperator::PGRegexNotMatch),
-        ("!~*", BinaryOperator::PGRegexNotIMatch),
+        ("~", BinaryOperator::Custom("~".to_owned())),
+        ("~*", BinaryOperator::Custom("~*".to_owned())),
+        ("!~", BinaryOperator::Custom("!~".to_owned())),
+        ("!~*", BinaryOperator::Custom("!~*".to_owned())),
     ];
 
     for (str_op, op) in pg_regex_match_ops {
@@ -686,7 +680,9 @@ fn test_transaction_statement() {
             session: false
         }
     );
-    let statement = verified_stmt("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY, READ WRITE, ISOLATION LEVEL SERIALIZABLE");
+    let statement = verified_stmt(
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY, READ WRITE, ISOLATION LEVEL SERIALIZABLE",
+    );
     assert_eq!(
         statement,
         Statement::SetTransaction {
@@ -751,6 +747,7 @@ fn parse_create_function() {
         Statement::CreateFunction {
             or_replace: false,
             temporary: false,
+            if_not_exists: false,
             name: ObjectName(vec![Ident::new_unchecked("add")]),
             args: Some(vec![
                 OperateFunctionArg::unnamed(DataType::Int),
@@ -758,13 +755,14 @@ fn parse_create_function() {
             ]),
             returns: Some(CreateFunctionReturns::Value(DataType::Int)),
             params: CreateFunctionBody {
-                language: Some("SQL".into()),
+                language: Some(Ident::new_unchecked("SQL")),
                 behavior: Some(FunctionBehavior::Immutable),
                 as_: Some(FunctionDefinition::SingleQuotedDef(
                     "select $1 + $2;".into()
                 )),
                 ..Default::default()
             },
+            with_options: Default::default(),
         }
     );
 
@@ -774,6 +772,7 @@ fn parse_create_function() {
         Statement::CreateFunction {
             or_replace: false,
             temporary: false,
+            if_not_exists: false,
             name: ObjectName(vec![Ident::new_unchecked("sub")]),
             args: Some(vec![
                 OperateFunctionArg::unnamed(DataType::Int),
@@ -781,12 +780,13 @@ fn parse_create_function() {
             ]),
             returns: Some(CreateFunctionReturns::Value(DataType::Int)),
             params: CreateFunctionBody {
-                language: Some("SQL".into()),
+                language: Some(Ident::new_unchecked("SQL")),
                 as_: Some(FunctionDefinition::DoubleDollarDef(
                     "select $1 - $2;".into()
                 )),
                 ..Default::default()
-            }
+            },
+            with_options: Default::default(),
         },
     );
 
@@ -797,6 +797,7 @@ fn parse_create_function() {
         Statement::CreateFunction {
             or_replace: false,
             temporary: false,
+            if_not_exists: false,
             name: ObjectName(vec![Ident::new_unchecked("return_test")]),
             args: Some(vec![
                 OperateFunctionArg::unnamed(DataType::Int),
@@ -804,14 +805,15 @@ fn parse_create_function() {
             ]),
             returns: Some(CreateFunctionReturns::Value(DataType::Int)),
             params: CreateFunctionBody {
-                language: Some("SQL".into()),
+                language: Some(Ident::new_unchecked("SQL")),
                 return_: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Parameter { index: 1 }),
                     op: BinaryOperator::Plus,
                     right: Box::new(Expr::Parameter { index: 2 }),
                 }),
                 ..Default::default()
-            }
+            },
+            with_options: Default::default(),
         },
     );
 
@@ -821,6 +823,7 @@ fn parse_create_function() {
         Statement::CreateFunction {
             or_replace: true,
             temporary: false,
+            if_not_exists: false,
             name: ObjectName(vec![Ident::new_unchecked("add")]),
             args: Some(vec![
                 OperateFunctionArg::with_name("a", DataType::Int),
@@ -833,7 +836,7 @@ fn parse_create_function() {
             ]),
             returns: Some(CreateFunctionReturns::Value(DataType::Int)),
             params: CreateFunctionBody {
-                language: Some("SQL".into()),
+                language: Some(Ident::new_unchecked("SQL")),
                 behavior: Some(FunctionBehavior::Immutable),
                 return_: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Identifier("a".into())),
@@ -842,15 +845,18 @@ fn parse_create_function() {
                 }),
                 ..Default::default()
             },
+            with_options: Default::default(),
         }
     );
 
-    let sql = "CREATE FUNCTION unnest(a INT[]) RETURNS TABLE (x INT) LANGUAGE SQL RETURN a";
+    let sql =
+        "CREATE TEMPORARY FUNCTION unnest(a INT[]) RETURNS TABLE (x INT) LANGUAGE SQL RETURN a";
     assert_eq!(
         verified_stmt(sql),
         Statement::CreateFunction {
             or_replace: false,
-            temporary: false,
+            temporary: true,
+            if_not_exists: false,
             name: ObjectName(vec![Ident::new_unchecked("unnest")]),
             args: Some(vec![OperateFunctionArg::with_name(
                 "a",
@@ -861,25 +867,70 @@ fn parse_create_function() {
                 data_type: DataType::Int,
             }])),
             params: CreateFunctionBody {
-                language: Some("SQL".into()),
+                language: Some(Ident::new_unchecked("SQL")),
                 return_: Some(Expr::Identifier("a".into())),
                 ..Default::default()
             },
+            with_options: Default::default(),
+        }
+    );
+
+    let sql = "CREATE FUNCTION IF NOT EXISTS add(INT, INT) RETURNS INT LANGUAGE SQL IMMUTABLE AS 'select $1 + $2;'";
+    assert_eq!(
+        verified_stmt(sql),
+        Statement::CreateFunction {
+            or_replace: false,
+            temporary: false,
+            if_not_exists: true,
+            name: ObjectName(vec![Ident::new_unchecked("add")]),
+            args: Some(vec![
+                OperateFunctionArg::unnamed(DataType::Int),
+                OperateFunctionArg::unnamed(DataType::Int),
+            ]),
+            returns: Some(CreateFunctionReturns::Value(DataType::Int)),
+            params: CreateFunctionBody {
+                language: Some(Ident::new_unchecked("SQL")),
+                behavior: Some(FunctionBehavior::Immutable),
+                as_: Some(FunctionDefinition::SingleQuotedDef(
+                    "select $1 + $2;".into()
+                )),
+                ..Default::default()
+            },
+            with_options: Default::default(),
         }
     );
 }
 
 #[test]
 fn parse_create_aggregate() {
-    let sql =
-        "CREATE OR REPLACE AGGREGATE sum(INT) RETURNS BIGINT APPEND ONLY LANGUAGE python AS 'sum' USING LINK 'xxx'";
+    let sql = "CREATE OR REPLACE AGGREGATE sum(INT) RETURNS BIGINT APPEND ONLY LANGUAGE python AS 'sum' USING LINK 'xxx'";
     assert_eq!(
         verified_stmt(sql),
         Statement::CreateAggregate {
             or_replace: true,
+            if_not_exists: false,
             name: ObjectName(vec![Ident::new_unchecked("sum")]),
             args: vec![OperateFunctionArg::unnamed(DataType::Int)],
-            returns: Some(DataType::BigInt),
+            returns: DataType::BigInt,
+            append_only: true,
+            params: CreateFunctionBody {
+                language: Some("python".into()),
+                as_: Some(FunctionDefinition::SingleQuotedDef("sum".into())),
+                using: Some(CreateFunctionUsing::Link("xxx".into())),
+                ..Default::default()
+            },
+        }
+    );
+
+    let sql = "CREATE AGGREGATE IF NOT EXISTS sum(INT) RETURNS BIGINT APPEND ONLY LANGUAGE python AS 'sum' USING LINK 'xxx'";
+    assert_eq!(
+        verified_stmt(sql),
+        Statement::CreateAggregate {
+            or_replace: false,
+            if_not_exists: true,
+            name: ObjectName(vec![Ident::new_unchecked("sum")]),
+            args: vec![OperateFunctionArg::unnamed(DataType::Int)],
+            returns: DataType::BigInt,
             append_only: true,
             params: CreateFunctionBody {
                 language: Some("python".into()),
@@ -995,7 +1046,8 @@ fn parse_array() {
                 lateral_views: vec![],
                 selection: None,
                 group_by: vec![],
-                having: None
+                having: None,
+                window: vec![],
             })),
             order_by: vec![],
             limit: None,
@@ -1034,7 +1086,8 @@ fn parse_array() {
                 lateral_views: vec![],
                 selection: None,
                 group_by: vec![],
-                having: None
+                having: None,
+                window: vec![],
             })),
             order_by: vec![],
             limit: None,
@@ -1079,7 +1132,8 @@ fn parse_array() {
                 lateral_views: vec![],
                 selection: None,
                 group_by: vec![],
-                having: None
+                having: None,
+                window: vec![],
             })),
             order_by: vec![],
             limit: None,
@@ -1089,41 +1143,19 @@ fn parse_array() {
     );
 
     let sql = "SELECT ARRAY[ARRAY[1, 2], [3, 4]]";
-    assert_eq!(
-        parse_sql_statements(sql),
-        Err(ParserError::ParserError(
-            "syntax error at or near [ at line:1, column:28".to_string()
-        ))
-    );
+    assert!(parse_sql_statements(sql).is_err());
 
     let sql = "SELECT ARRAY[ARRAY[], []]";
-    assert_eq!(
-        parse_sql_statements(sql),
-        Err(ParserError::ParserError(
-            "syntax error at or near [ at line:1, column:24".to_string()
-        ))
-    );
+    assert!(parse_sql_statements(sql).is_err());
 
     let sql = "SELECT ARRAY[[1, 2], ARRAY[3, 4]]";
-    assert_eq!(
-        parse_sql_statements(sql),
-        Err(ParserError::ParserError(
-            "syntax error at or near ARRAY at line:1, column:27".to_string()
-        ))
-    );
+    assert!(parse_sql_statements(sql).is_err());
 
     let sql = "SELECT ARRAY[[], ARRAY[]]";
-    assert_eq!(
-        parse_sql_statements(sql),
-        Err(ParserError::ParserError(
-            "syntax error at or near ARRAY at line:1, column:23".to_string()
-        ))
-    );
+    assert!(parse_sql_statements(sql).is_err());
 
     let sql = "SELECT [[1, 2], [3, 4]]";
-    let res = parse_sql_statements(sql);
-    let err_msg = "Expected an expression:, found: [";
-    assert!(format!("{}", res.unwrap_err()).contains(err_msg));
+    assert!(parse_sql_statements(sql).is_err());
 }
 
 #[test]
@@ -1270,4 +1302,18 @@ fn parse_double_quoted_string_as_alias() {
 
     let sql = "SELECT x \"x1\" FROM t";
     assert!(parse_sql_statements(sql).is_ok());
+}
+
+#[test]
+fn parse_variadic_argument() {
+    let sql = "SELECT foo(a, b, VARIADIC c)";
+    _ = verified_stmt(sql);
+
+    let sql = "SELECT foo(VARIADIC a, b, VARIADIC c)";
+    assert!(
+        parse_sql_statements(sql)
+            .unwrap_err()
+            .to_string()
+            .contains("VARIADIC argument must be the last"),
+    );
 }

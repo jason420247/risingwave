@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use risingwave_common::array::Op;
 use risingwave_common::catalog::{Field, Schema};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use super::{Result, SinkFormatter, StreamChunk};
 use crate::sink::encoder::{
-    DateHandlingMode, JsonEncoder, RowEncoder, TimeHandlingMode, TimestampHandlingMode,
-    TimestamptzHandlingMode,
+    DateHandlingMode, JsonEncoder, JsonbHandlingMode, RowEncoder, TimeHandlingMode,
+    TimestampHandlingMode, TimestamptzHandlingMode,
 };
 use crate::tri;
 
@@ -69,6 +69,7 @@ impl DebeziumJsonFormatter {
             TimestampHandlingMode::Milli,
             TimestamptzHandlingMode::UtcString,
             TimeHandlingMode::Milli,
+            JsonbHandlingMode::String,
         );
         let val_encoder = JsonEncoder::new(
             schema.clone(),
@@ -77,6 +78,7 @@ impl DebeziumJsonFormatter {
             TimestampHandlingMode::Milli,
             TimestamptzHandlingMode::UtcString,
             TimeHandlingMode::Milli,
+            JsonbHandlingMode::String,
         );
         Self {
             schema,
@@ -98,100 +100,103 @@ impl SinkFormatter for DebeziumJsonFormatter {
         &self,
         chunk: &StreamChunk,
     ) -> impl Iterator<Item = Result<(Option<Value>, Option<Value>)>> {
-        std::iter::from_coroutine(|| {
-            let DebeziumJsonFormatter {
-                schema,
-                pk_indices,
-                db_name,
-                sink_from_name,
-                opts,
-                key_encoder,
-                val_encoder,
-            } = self;
-            let ts_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let source_field = json!({
-                // todo: still some missing fields in source field
-                // ref https://debezium.io/documentation/reference/2.4/connectors/postgresql.html#postgresql-create-events
-                "db": db_name,
-                "table": sink_from_name,
-                "ts_ms": ts_ms,
-            });
+        std::iter::from_coroutine(
+            #[coroutine]
+            || {
+                let DebeziumJsonFormatter {
+                    schema,
+                    pk_indices,
+                    db_name,
+                    sink_from_name,
+                    opts,
+                    key_encoder,
+                    val_encoder,
+                } = self;
+                let ts_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let source_field = json!({
+                    // todo: still some missing fields in source field
+                    // ref https://debezium.io/documentation/reference/2.4/connectors/postgresql.html#postgresql-create-events
+                    "db": db_name,
+                    "table": sink_from_name,
+                    "ts_ms": ts_ms,
+                });
 
-            let mut update_cache: Option<Map<String, Value>> = None;
+                let mut update_cache: Option<Map<String, Value>> = None;
 
-            for (op, row) in chunk.rows() {
-                let event_key_object: Option<Value> = Some(json!({
-                    "schema": json!({
-                        "type": "struct",
-                        "fields": fields_pk_to_json(&schema.fields, pk_indices),
-                        "optional": false,
-                        "name": concat_debezium_name_field(db_name, sink_from_name, "Key"),
-                    }),
-                    "payload": tri!(key_encoder.encode(row)),
-                }));
-                let event_object: Option<Value> = match op {
-                    Op::Insert => Some(json!({
-                        "schema": schema_to_json(schema, db_name, sink_from_name),
-                        "payload": {
-                            "before": null,
-                            "after": tri!(val_encoder.encode(row)),
-                            "op": "c",
-                            "ts_ms": ts_ms,
-                            "source": source_field,
-                        }
-                    })),
-                    Op::Delete => {
-                        let value_obj = Some(json!({
+                for (op, row) in chunk.rows() {
+                    let event_key_object: Option<Value> = Some(json!({
+                        "schema": json!({
+                            "type": "struct",
+                            "fields": fields_pk_to_json(&schema.fields, pk_indices),
+                            "optional": false,
+                            "name": concat_debezium_name_field(db_name, sink_from_name, "Key"),
+                        }),
+                        "payload": tri!(key_encoder.encode(row)),
+                    }));
+                    let event_object: Option<Value> = match op {
+                        Op::Insert => Some(json!({
                             "schema": schema_to_json(schema, db_name, sink_from_name),
                             "payload": {
-                                "before": tri!(val_encoder.encode(row)),
-                                "after": null,
-                                "op": "d",
+                                "before": null,
+                                "after": tri!(val_encoder.encode(row)),
+                                "op": "c",
                                 "ts_ms": ts_ms,
                                 "source": source_field,
                             }
-                        }));
-                        yield Ok((event_key_object.clone(), value_obj));
-
-                        if opts.gen_tombstone {
-                            // Tomestone event
-                            // https://debezium.io/documentation/reference/2.1/connectors/postgresql.html#postgresql-delete-events
-                            yield Ok((event_key_object, None));
-                        }
-
-                        continue;
-                    }
-                    Op::UpdateDelete => {
-                        update_cache = Some(tri!(val_encoder.encode(row)));
-                        continue;
-                    }
-                    Op::UpdateInsert => {
-                        if let Some(before) = update_cache.take() {
-                            Some(json!({
+                        })),
+                        Op::Delete => {
+                            let value_obj = Some(json!({
                                 "schema": schema_to_json(schema, db_name, sink_from_name),
                                 "payload": {
-                                    "before": before,
-                                    "after": tri!(val_encoder.encode(row)),
-                                    "op": "u",
+                                    "before": tri!(val_encoder.encode(row)),
+                                    "after": null,
+                                    "op": "d",
                                     "ts_ms": ts_ms,
                                     "source": source_field,
                                 }
-                            }))
-                        } else {
-                            warn!(
-                                "not found UpdateDelete in prev row, skipping, row index {:?}",
-                                row.index()
-                            );
+                            }));
+                            yield Ok((event_key_object.clone(), value_obj));
+
+                            if opts.gen_tombstone {
+                                // Tomestone event
+                                // https://debezium.io/documentation/reference/2.1/connectors/postgresql.html#postgresql-delete-events
+                                yield Ok((event_key_object, None));
+                            }
+
                             continue;
                         }
-                    }
-                };
-                yield Ok((event_key_object, event_object));
-            }
-        })
+                        Op::UpdateDelete => {
+                            update_cache = Some(tri!(val_encoder.encode(row)));
+                            continue;
+                        }
+                        Op::UpdateInsert => {
+                            if let Some(before) = update_cache.take() {
+                                Some(json!({
+                                    "schema": schema_to_json(schema, db_name, sink_from_name),
+                                    "payload": {
+                                        "before": before,
+                                        "after": tri!(val_encoder.encode(row)),
+                                        "op": "u",
+                                        "ts_ms": ts_ms,
+                                        "source": source_field,
+                                    }
+                                }))
+                            } else {
+                                warn!(
+                                    "not found UpdateDelete in prev row, skipping, row index {:?}",
+                                    row.index()
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    yield Ok((event_key_object, event_object));
+                }
+            },
+        )
     }
 }
 
@@ -309,6 +314,8 @@ pub(crate) fn field_to_json(field: &Field) -> Value {
         // we do the same here
         risingwave_common::types::DataType::Struct(_) => ("string", ""),
         risingwave_common::types::DataType::List { .. } => ("string", ""),
+        risingwave_common::types::DataType::Map(_) => ("string", ""),
+        risingwave_common::types::DataType::Vector(_) => todo!("VECTOR_PLACEHOLDER"),
     };
 
     if name.is_empty() {
@@ -330,7 +337,7 @@ pub(crate) fn field_to_json(field: &Field) -> Value {
 #[cfg(test)]
 mod tests {
     use risingwave_common::test_prelude::StreamChunkTestExt;
-    use risingwave_common::types::DataType;
+    use risingwave_common::types::{DataType, StructType};
 
     use super::*;
     use crate::sink::utils::chunk_to_json;
@@ -357,36 +364,18 @@ mod tests {
             Field {
                 data_type: DataType::Int32,
                 name: "v1".into(),
-                sub_fields: vec![],
-                type_name: "".into(),
             },
             Field {
                 data_type: DataType::Float32,
                 name: "v2".into(),
-                sub_fields: vec![],
-                type_name: "".into(),
             },
             Field {
-                data_type: DataType::new_struct(
-                    vec![DataType::Int32, DataType::Float32],
-                    vec!["v4".to_string(), "v5".to_string()],
-                ),
+                data_type: StructType::new(vec![
+                    ("v4", DataType::Int32),
+                    ("v5", DataType::Float32),
+                ])
+                .into(),
                 name: "v3".into(),
-                sub_fields: vec![
-                    Field {
-                        data_type: DataType::Int32,
-                        name: "v4".into(),
-                        sub_fields: vec![],
-                        type_name: "".into(),
-                    },
-                    Field {
-                        data_type: DataType::Float32,
-                        name: "v5".into(),
-                        sub_fields: vec![],
-                        type_name: "".into(),
-                    },
-                ],
-                type_name: "".into(),
             },
         ]);
 
@@ -397,6 +386,7 @@ mod tests {
             TimestampHandlingMode::Milli,
             TimestamptzHandlingMode::UtcString,
             TimeHandlingMode::Milli,
+            JsonbHandlingMode::String,
         );
         let json_chunk = chunk_to_json(chunk, &encoder).unwrap();
         let schema_json = schema_to_json(&schema, "test_db", "test_table");

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::error::ErrorCode::ProtocolError;
-use risingwave_common::error::{Result, RwError};
-use risingwave_pb::plan_common::AdditionalColumnType;
+use risingwave_common::bail;
+use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 
 use super::bytes_parser::BytesAccessBuilder;
-use super::unified::upsert::UpsertChangeEvent;
-use super::unified::util::apply_row_operation_on_stream_chunk_writer_with_op;
 use super::unified::{AccessImpl, ChangeEventOperation};
 use super::{
-    AccessBuilderImpl, ByteStreamSourceParser, BytesProperties, EncodingProperties, EncodingType,
+    AccessBuilderImpl, ByteStreamSourceParser, BytesProperties, EncodingProperties,
     SourceStreamChunkRowWriter, SpecificParserConfig,
 };
+use crate::error::ConnectorResult;
 use crate::parser::ParserFormat;
+use crate::parser::unified::kv_event::KvEvent;
 use crate::source::{SourceColumnDesc, SourceContext, SourceContextRef};
 
 #[derive(Debug)]
@@ -35,25 +34,21 @@ pub struct UpsertParser {
     source_ctx: SourceContextRef,
 }
 
-async fn build_accessor_builder(
-    config: EncodingProperties,
-    encoding_type: EncodingType,
-) -> Result<AccessBuilderImpl> {
+async fn build_accessor_builder(config: EncodingProperties) -> ConnectorResult<AccessBuilderImpl> {
     match config {
         EncodingProperties::Json(_)
         | EncodingProperties::Protobuf(_)
-        | EncodingProperties::Avro(_) => {
-            Ok(AccessBuilderImpl::new_default(config, encoding_type).await?)
-        }
-        _ => Err(RwError::from(ProtocolError(
-            "unsupported encoding for Upsert".to_string(),
-        ))),
+        | EncodingProperties::Avro(_) => Ok(AccessBuilderImpl::new_default(config).await?),
+        _ => bail!("unsupported encoding for Upsert"),
     }
 }
 
 pub fn get_key_column_name(columns: &[SourceColumnDesc]) -> Option<String> {
     columns.iter().find_map(|column| {
-        if column.additional_column_type == AdditionalColumnType::Key {
+        if matches!(
+            column.additional_column.column_type,
+            Some(AdditionalColumnType::Key(_))
+        ) {
             Some(column.name.clone())
         } else {
             None
@@ -66,7 +61,7 @@ impl UpsertParser {
         props: SpecificParserConfig,
         rw_columns: Vec<SourceColumnDesc>,
         source_ctx: SourceContextRef,
-    ) -> Result<Self> {
+    ) -> ConnectorResult<Self> {
         // check whether columns has Key as AdditionalColumnType, if so, the key accessor should be
         // bytes
         let key_builder = if let Some(key_column_name) = get_key_column_name(&rw_columns) {
@@ -80,8 +75,7 @@ impl UpsertParser {
         } else {
             unreachable!("format upsert must have key column")
         };
-        let payload_builder =
-            build_accessor_builder(props.encoding_config, EncodingType::Value).await?;
+        let payload_builder = build_accessor_builder(props.encoding_config).await?;
         Ok(Self {
             key_builder,
             payload_builder,
@@ -95,23 +89,34 @@ impl UpsertParser {
         key: Option<Vec<u8>>,
         payload: Option<Vec<u8>>,
         mut writer: SourceStreamChunkRowWriter<'_>,
-    ) -> Result<()> {
-        let mut row_op: UpsertChangeEvent<AccessImpl<'_, '_>, AccessImpl<'_, '_>> =
-            UpsertChangeEvent::default();
-        let mut change_event_op = ChangeEventOperation::Delete;
+    ) -> ConnectorResult<()> {
+        let meta = writer.source_meta();
+        let mut row_op: KvEvent<AccessImpl<'_>, AccessImpl<'_>> = KvEvent::default();
         if let Some(data) = key {
-            row_op = row_op.with_key(self.key_builder.generate_accessor(data).await?);
+            row_op.with_key(self.key_builder.generate_accessor(data, meta).await?);
         }
         // Empty payload of kafka is Some(vec![])
+        let change_event_op;
         if let Some(data) = payload
             && !data.is_empty()
         {
-            row_op = row_op.with_value(self.payload_builder.generate_accessor(data).await?);
+            row_op.with_value(self.payload_builder.generate_accessor(data, meta).await?);
             change_event_op = ChangeEventOperation::Upsert;
+        } else {
+            change_event_op = ChangeEventOperation::Delete;
         }
 
-        apply_row_operation_on_stream_chunk_writer_with_op(row_op, &mut writer, change_event_op)
-            .map_err(Into::into)
+        match change_event_op {
+            ChangeEventOperation::Upsert => {
+                let f = |column: &SourceColumnDesc| row_op.access_field::<false>(column);
+                writer.do_insert(f)?
+            }
+            ChangeEventOperation::Delete => {
+                let f = |column: &SourceColumnDesc| row_op.access_field::<true>(column);
+                writer.do_delete(f)?
+            }
+        }
+        Ok(())
     }
 }
 
@@ -133,7 +138,7 @@ impl ByteStreamSourceParser for UpsertParser {
         key: Option<Vec<u8>>,
         payload: Option<Vec<u8>>,
         writer: SourceStreamChunkRowWriter<'a>,
-    ) -> Result<()> {
+    ) -> ConnectorResult<()> {
         self.parse_inner(key, payload, writer).await
     }
 }

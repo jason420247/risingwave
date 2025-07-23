@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 use risingwave_common::catalog::{ColumnDesc, ColumnId, TableId};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::DataType;
-use risingwave_common::util::epoch::EpochPair;
+use risingwave_common::util::epoch::{EpochPair, test_epoch};
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_hummock_test::test_utils::prepare_hummock_test_env;
 use risingwave_stream::common::table::state_table::StateTable;
-use risingwave_stream::common::table::test_utils::gen_prost_table;
+use risingwave_stream::common::table::test_utils::gen_pbtable;
 
 #[tokio::test]
 async fn test_mem_table_spill_in_streaming() {
@@ -51,7 +51,7 @@ async fn test_mem_table_spill_in_streaming() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -64,8 +64,8 @@ async fn test_mem_table_spill_in_streaming() {
         StateTable::from_table_catalog_inconsistent_op(&table, test_env.storage.clone(), None)
             .await;
 
-    let epoch = EpochPair::new_test_epoch(65536);
-    state_table.init_epoch(epoch);
+    let epoch = EpochPair::new_test_epoch(test_epoch(1));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),
@@ -181,7 +181,7 @@ async fn test_mem_table_spill_in_streaming_multiple_times() {
     let order_types = vec![OrderType::ascending()];
     let pk_index = vec![0_usize];
     let read_prefix_len_hint = 1;
-    let table = gen_prost_table(
+    let table = gen_pbtable(
         TEST_TABLE_ID,
         column_descs,
         order_types,
@@ -194,8 +194,8 @@ async fn test_mem_table_spill_in_streaming_multiple_times() {
         StateTable::from_table_catalog_inconsistent_op(&table, test_env.storage.clone(), None)
             .await;
 
-    let epoch = EpochPair::new_test_epoch(65536);
-    state_table.init_epoch(epoch);
+    let epoch = EpochPair::new_test_epoch(test_epoch(1));
+    state_table.init_epoch(epoch).await.unwrap();
 
     state_table.insert(OwnedRow::new(vec![
         Some(1_i32.into()),

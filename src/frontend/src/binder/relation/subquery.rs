@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::error::Result;
 use risingwave_sqlparser::ast::{Query, TableAlias};
 
 use crate::binder::statement::RewriteExprsRecursive;
 use crate::binder::{Binder, BoundQuery, UNNAMED_SUBQUERY};
+use crate::error::Result;
 
 #[derive(Debug, Clone)]
 pub struct BoundSubquery {
@@ -37,8 +37,8 @@ impl Binder {
     /// After finishing binding, we update the current context with the output of the subquery.
     pub(super) fn bind_subquery_relation(
         &mut self,
-        query: Query,
-        alias: Option<TableAlias>,
+        query: &Query,
+        alias: Option<&TableAlias>,
         lateral: bool,
     ) -> Result<BoundSubquery> {
         let query = self.bind_query(query)?;

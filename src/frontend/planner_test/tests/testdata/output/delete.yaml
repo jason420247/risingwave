@@ -6,7 +6,8 @@
   logical_plan: |-
     LogicalProject { exprs: [t.a, t.b, t.a, (t.a + t.b) as $expr1] }
     └─LogicalDelete { table: t, returning: true }
-      └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id] }
+      └─LogicalProject { exprs: [t.a, t.b, t._row_id] }
+        └─LogicalScan { table: t, columns: [t.a, t.b, t._row_id, t._rw_timestamp] }
   batch_plan: |-
     BatchExchange { order: [], dist: Single }
     └─BatchProject { exprs: [t.a, t.b, t.a, (t.a + t.b) as $expr1] }
@@ -20,7 +21,8 @@
   logical_plan: |-
     LogicalProject { exprs: [114514:Int32] }
     └─LogicalDelete { table: t, returning: true }
-      └─LogicalScan { table: t, columns: [t.v, t._row_id] }
+      └─LogicalProject { exprs: [t.v, t._row_id] }
+        └─LogicalScan { table: t, columns: [t.v, t._row_id, t._rw_timestamp] }
   batch_plan: |-
     BatchExchange { order: [], dist: Single }
     └─BatchProject { exprs: [114514:Int32] }
@@ -32,3 +34,14 @@
     create table t (a int, b int);
     delete from t returning sum(a);
   binder_error: 'Bind error: should not have agg/window in the `RETURNING` list'
+- name: distributed delete
+  sql: |
+    set batch_enable_distributed_dml = true;
+    create table t (a int, b int);
+    delete from t;
+  batch_distributed_plan: |-
+    BatchSimpleAgg { aggs: [sum()] }
+    └─BatchExchange { order: [], dist: Single }
+      └─BatchDelete { table: t }
+        └─BatchExchange { order: [], dist: HashShard(t.a, t.b, t._row_id) }
+          └─BatchScan { table: t, columns: [t.a, t.b, t._row_id], distribution: UpstreamHashShard(t._row_id) }

@@ -31,50 +31,107 @@ buildkite-agent artifact download risingwave-connector.tar.gz ./
 mkdir ./connector-node
 tar xf ./risingwave-connector.tar.gz -C ./connector-node
 
+echo "--- Install dependencies"
+python3 -m pip install --break-system-packages -r ./e2e_test/requirements.txt
+
+echo "install sqlserver client"
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+curl https://packages.microsoft.com/config/ubuntu/20.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+apt-get update -y
+ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get install -y mssql-tools unixodbc-dev
+export PATH="/opt/mssql-tools/bin/:$PATH"
+export SQLCMDSERVER=sqlserver-server SQLCMDUSER=SA SQLCMDPASSWORD="SomeTestOnly@SA" SQLCMDDBNAME=mydb SQLCMDPORT=1433
+
+echo "--- e2e, inline test"
+RUST_LOG="debug,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info,risingwave_meta=info" \
+risedev ci-start ci-inline-source-test
+
+# check if run debug only test
+if [ "$profile" == "ci-dev" ]; then
+    echo "--- Run debug mode only tests"
+    risedev slt './e2e_test/debug_mode_only/debug_splits.slt'
+fi
+
+echo "--- Run kafka sasl test"
+risedev slt './e2e_test/kafka-sasl/**/*.slt' -j4
+echo "--- Run kafka sasl test done"
+
+risedev slt './e2e_test/source_inline/**/*.slt' -j4
+risedev slt './e2e_test/source_inline/**/*.slt.serial'
+
+if [ "$profile" == "ci-release" ]; then
+    # NOTE(kwannoel): This test has an execution time in main-cron of about ~1 minute.
+    # It takes too long to run in pull-request workflow.
+    # Further, it involves waiting for backfill progress to tick up.
+    # Even with rate limit, the test time is not deterministic.
+    # It may take too long or too slow, since there are joins involved,
+    # and the performance varies between release and debug builds.
+    # it's simpler to keep it in release mode only
+    echo "--- Run release mode only tests"
+    risedev slt './e2e_test/backfill/backfill_progress/create_materialized_view_mix_source_and_normal.slt'
+fi
+
+echo "--- Kill cluster"
+risedev ci-kill
+
 echo "--- Prepare data"
 cp src/connector/src/test_data/simple-schema.avsc ./avro-simple-schema.avsc
 cp src/connector/src/test_data/complex-schema.avsc ./avro-complex-schema.avsc
-cp src/connector/src/test_data/complex-schema ./proto-complex-schema
 cp src/connector/src/test_data/complex-schema.json ./json-complex-schema
 
 
 echo "--- e2e, ci-1cn-1fe, mysql & postgres cdc"
 
 # import data to mysql
-mysql --host=mysql --port=3306 -u root -p123456 < ./e2e_test/source/cdc/mysql_cdc.sql
+mysql --host=mysql --port=3306 -u root -p123456 < ./e2e_test/source_legacy/cdc/mysql_cdc.sql
 
+echo "run mysql-async integration test"
+cargo test --package risingwave_mysql_test -- --ignored
 # import data to postgres
-export PGHOST=db PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=cdc_test
+export PGHOST=db PGPORT=5432 PGUSER=postgres PGPASSWORD='post\tgres' PGDATABASE=cdc_test
 createdb
-psql < ./e2e_test/source/cdc/postgres_cdc.sql
+psql < ./e2e_test/source_legacy/cdc/postgres_cdc.sql
 
 echo "--- starting risingwave cluster"
-RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
-cargo make ci-start ci-1cn-1fe-with-recovery
+RUST_LOG="debug,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
+risedev ci-start ci-1cn-1fe-with-recovery
+
+
+echo "--- mongodb cdc test"
+# install the mongo shell
+wget --no-verbose http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+wget --no-verbose https://repo.mongodb.org/apt/ubuntu/dists/focal/mongodb-org/4.4/multiverse/binary-amd64/mongodb-org-shell_4.4.28_amd64.deb
+dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+dpkg -i mongodb-org-shell_4.4.28_amd64.deb
+
+echo '> ping mongodb'
+echo 'db.runCommand({ping: 1})' | mongo mongodb://mongodb:27017
+echo '> rs config'
+echo 'rs.conf()' | mongo mongodb://mongodb:27017
+echo '> run test..'
+risedev slt './e2e_test/source_legacy/cdc/mongodb/**/*.slt'
 
 echo "--- inline cdc test"
 export MYSQL_HOST=mysql MYSQL_TCP_PORT=3306 MYSQL_PWD=123456
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc_inline/**/*.slt'
-
-echo "--- opendal source test"
-sqllogictest -p 4566 -d dev './e2e_test/source/opendal/**/*.slt'
+risedev slt './e2e_test/source_legacy/cdc_inline/**/*.slt'
 
 echo "--- mysql & postgres cdc validate test"
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc.validate.mysql.slt'
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc.validate.postgres.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc.validate.mysql.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc.validate.postgres.slt'
 
+echo "--- cdc share source test"
 # cdc share stream test cases
 export MYSQL_HOST=mysql MYSQL_TCP_PORT=3306 MYSQL_PWD=123456
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc.share_stream.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc.share_stream.slt'
 
 echo "--- mysql & postgres load and check"
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc.load.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc.load.slt'
 # wait for cdc loading
 sleep 10
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc.check.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc.check.slt'
 
 # kill cluster
-cargo make kill
+risedev kill
 echo "> cluster killed "
 
 echo "--- mysql & postgres recovery check"
@@ -87,62 +144,56 @@ mysql --protocol=tcp -u root mytest -e "INSERT INTO products
 
 
 # insert new rows
-mysql --host=mysql --port=3306 -u root -p123456 < ./e2e_test/source/cdc/mysql_cdc_insert.sql
+mysql --host=mysql --port=3306 -u root -p123456 < ./e2e_test/source_legacy/cdc/mysql_cdc_insert.sql
 echo "> inserted new rows into mysql"
 
-psql < ./e2e_test/source/cdc/postgres_cdc_insert.sql
+psql < ./e2e_test/source_legacy/cdc/postgres_cdc_insert.sql
 echo "> inserted new rows into postgres"
 
 # start cluster w/o clean-data
 unset RISINGWAVE_CI
-export RUST_LOG="events::stream::message::chunk=trace,risingwave_stream=debug,risingwave_batch=info,risingwave_storage=info" \
+export RUST_LOG="risingwave_stream=debug,risingwave_batch=info,risingwave_storage=info"
 
-cargo make dev ci-1cn-1fe-with-recovery
+risedev dev ci-1cn-1fe-with-recovery
 echo "> wait for cluster recovery finish"
 sleep 20
 echo "> check mviews after cluster recovery"
 # check results
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc.check_new_rows.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc.check_new_rows.slt'
 
 # drop relations
-sqllogictest -p 4566 -d dev './e2e_test/source/cdc/cdc_share_stream_drop.slt'
+risedev slt './e2e_test/source_legacy/cdc/cdc_share_stream_drop.slt'
 
 echo "--- Kill cluster"
-cargo make ci-kill
-
-echo "--- e2e, ci-1cn-1fe, protobuf schema registry"
+risedev ci-kill
 export RISINGWAVE_CI=true
+
+echo "--- e2e, ci-kafka-plus-pubsub, legacy kafka tests"
 RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
-cargo make ci-start ci-1cn-1fe
-python3 -m pip install requests protobuf confluent-kafka
-python3 e2e_test/schema_registry/pb.py "message_queue:29092" "http://message_queue:8081" "sr_pb_test" 20
-echo "make sure google/protobuf/source_context.proto is NOT in schema registry"
-curl --silent 'http://message_queue:8081/subjects'; echo
-# curl --silent --head -X GET 'http://message_queue:8081/subjects/google%2Fprotobuf%2Fsource_context.proto/versions' | grep 404
-curl --silent 'http://message_queue:8081/subjects' | grep -v 'google/protobuf/source_context.proto'
-sqllogictest -p 4566 -d dev './e2e_test/schema_registry/pb.slt'
-
-echo "--- Kill cluster"
-cargo make ci-kill
-
-echo "--- e2e, ci-kafka-plus-pubsub, kafka and pubsub source"
-RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
-cargo make ci-start ci-pubsub
-./scripts/source/prepare_ci_kafka.sh
-cargo run --bin prepare_ci_pubsub
-sqllogictest -p 4566 -d dev './e2e_test/source/basic/*.slt'
-sqllogictest -p 4566 -d dev './e2e_test/source/basic/old_row_format_syntax/*.slt'
-sqllogictest -p 4566 -d dev './e2e_test/source/basic/alter/kafka.slt'
-
-echo "--- e2e, kafka alter source"
-chmod +x ./scripts/source/prepare_data_after_alter.sh
-./scripts/source/prepare_data_after_alter.sh 2
-sqllogictest -p 4566 -d dev './e2e_test/source/basic/alter/kafka_after_new_data.slt'
-
-echo "--- e2e, kafka alter source again"
-./scripts/source/prepare_data_after_alter.sh 3
-sqllogictest -p 4566 -d dev './e2e_test/source/basic/alter/kafka_after_new_data_2.slt'
+risedev ci-start ci-kafka
+./e2e_test/source_legacy/basic/scripts/prepare_ci_kafka.sh
+risedev slt './e2e_test/source_legacy/basic/*.slt'
+risedev slt './e2e_test/source_legacy/basic/old_row_format_syntax/*.slt'
 
 echo "--- Run CH-benCHmark"
-./risedev slt -p 4566 -d dev './e2e_test/ch_benchmark/batch/ch_benchmark.slt'
-./risedev slt -p 4566 -d dev './e2e_test/ch_benchmark/streaming/*.slt'
+risedev slt './e2e_test/ch_benchmark/batch/ch_benchmark.slt'
+risedev slt './e2e_test/ch_benchmark/streaming/*.slt'
+
+risedev ci-kill
+echo "--- cluster killed "
+
+echo "--- starting risingwave cluster for webhook source test"
+risedev ci-start ci-1cn-1fe-with-recovery
+sleep 5
+# check results
+risedev slt "e2e_test/webhook/webhook_source.slt"
+
+risedev kill
+
+risedev dev ci-1cn-1fe-with-recovery
+echo "--- wait for cluster recovery finish"
+sleep 20
+risedev slt "e2e_test/webhook/webhook_source_recovery.slt"
+
+risedev ci-kill
+echo "--- cluster killed "

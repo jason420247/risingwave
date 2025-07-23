@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use either::Either;
 use risingwave_common::util::addr::HostAddr;
 use risingwave_meta::rpc::ElectionClientRef;
 use risingwave_pb::common::HostAddress;
@@ -20,60 +19,37 @@ use risingwave_pb::meta::meta_member_service_server::MetaMemberService;
 use risingwave_pb::meta::{MembersRequest, MembersResponse, MetaMember};
 use tonic::{Request, Response, Status};
 
-use crate::AddressInfo;
 #[derive(Clone)]
 pub struct MetaMemberServiceImpl {
-    election_client_or_self: Either<ElectionClientRef, AddressInfo>,
+    election_client: ElectionClientRef,
 }
 
 impl MetaMemberServiceImpl {
-    pub fn new(election_client_or_self: Either<ElectionClientRef, AddressInfo>) -> Self {
-        MetaMemberServiceImpl {
-            election_client_or_self,
-        }
+    pub fn new(election_client: ElectionClientRef) -> Self {
+        MetaMemberServiceImpl { election_client }
     }
 }
 
 #[async_trait::async_trait]
 impl MetaMemberService for MetaMemberServiceImpl {
-    #[cfg_attr(coverage, coverage(off))]
     async fn members(
         &self,
         _request: Request<MembersRequest>,
     ) -> Result<Response<MembersResponse>, Status> {
-        let members = match &self.election_client_or_self {
-            Either::Left(election_client) => {
-                let mut members = vec![];
-                for member in election_client.get_members().await? {
-                    let host_addr = member
-                        .id
-                        .parse::<HostAddr>()
-                        .map_err(|err| Status::from_error(err.into()))?;
-                    members.push(MetaMember {
-                        address: Some(HostAddress {
-                            host: host_addr.host,
-                            port: host_addr.port.into(),
-                        }),
-                        is_leader: member.is_leader,
-                    })
-                }
-
-                members
-            }
-            Either::Right(self_as_leader) => {
-                let host_addr = self_as_leader
-                    .advertise_addr
-                    .parse::<HostAddr>()
-                    .map_err(|err| Status::from_error(err.into()))?;
-                vec![MetaMember {
-                    address: Some(HostAddress {
-                        host: host_addr.host,
-                        port: host_addr.port.into(),
-                    }),
-                    is_leader: true,
-                }]
-            }
-        };
+        let mut members = vec![];
+        for member in self.election_client.get_members().await? {
+            let host_addr = member
+                .id
+                .parse::<HostAddr>()
+                .map_err(|err| Status::from_error(err.into()))?;
+            members.push(MetaMember {
+                address: Some(HostAddress {
+                    host: host_addr.host,
+                    port: host_addr.port.into(),
+                }),
+                is_leader: member.is_leader,
+            })
+        }
 
         Ok(Response::new(MembersResponse { members }))
     }

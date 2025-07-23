@@ -1,0 +1,81 @@
+
+query T
+show timezone;
+----
+UTC
+
+# Double quoted string
+statement ok
+set timezone = "America/Los_Angeles"
+
+query T
+show timezone;
+----
+America/Los_Angeles
+
+statement error
+set timezone = "Invalid"
+
+# timezone has not changed
+query T
+show timezone;
+----
+America/Los_Angeles
+
+# Single quoted string
+statement ok
+set timezone = 'GMT'
+
+query T
+show timezone;
+----
+GMT
+
+statement ok
+set time zone local;
+
+statement ok
+set time zone default;
+
+statement ok
+set time zone 'utc';
+
+statement error Invalid value
+set time zone 'utcx';
+
+statement ok
+set time zone utc;
+
+statement error Invalid value
+set time zone utcx;
+
+statement ok
+set time zone "utc";
+
+statement error Invalid value
+set time zone "utcx";
+
+statement error Invalid value
+set time zone "default";
+
+statement error Invalid value
+set time zone "local";
+
+statement error Invalid value
+set time zone null;
+
+# The following are valid in PostgreSQL but we do not support them for simplicity.
+
+statement error Invalid value
+set time zone 12.3;
+
+statement error
+set time zone interval '1' hour;
+
+# support a special case for clients which would send when initializing the connection
+statement ok
+SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE;
+
+# only support '+00:00'
+statement error
+SET TIME ZONE INTERVAL '+01:00' HOUR TO MINUTE;

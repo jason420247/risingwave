@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use pretty_xmlish::XmlNode;
-use risingwave_pb::stream_plan::stream_node::PbNodeBody;
-use risingwave_pb::stream_plan::PbStreamNode;
+use std::cell::RefCell;
 
-use super::generic::GenericPlanRef;
+use pretty_xmlish::XmlNode;
+use risingwave_pb::stream_plan::PbStreamNode;
+use risingwave_pb::stream_plan::stream_node::PbNodeBody;
+
 use super::stream::prelude::*;
 use super::utils::Distill;
-use super::{generic, ExprRewritable, PlanRef, PlanTreeNodeUnary, StreamExchange, StreamNode};
+use super::{ExprRewritable, PlanRef, PlanTreeNodeUnary, StreamExchange, StreamNode, generic};
+use crate::Explain;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::{LogicalShare, PlanBase, PlanTreeNode};
+use crate::scheduler::SchedulerResult;
 use crate::stream_fragmenter::BuildFragmentGraphState;
-use crate::Explain;
 
 /// `StreamShare` will be translated into an `ExchangeNode` based on its distribution finally.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,10 +46,18 @@ impl StreamShare {
                 input.append_only(),
                 input.emit_on_window_close(),
                 input.watermark_columns().clone(),
+                input.columns_monotonicity().clone(),
             )
         };
 
         StreamShare { base, core }
+    }
+
+    pub fn new_from_input(input: PlanRef) -> Self {
+        let core = generic::Share {
+            input: RefCell::new(input),
+        };
+        Self::new(core)
     }
 }
 
@@ -79,12 +89,17 @@ impl_plan_tree_node_for_unary! { StreamShare }
 
 impl StreamNode for StreamShare {
     fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> PbNodeBody {
-        unreachable!("stream scan cannot be converted into a prost body -- call `adhoc_to_stream_prost` instead.")
+        unreachable!(
+            "stream scan cannot be converted into a prost body -- call `adhoc_to_stream_prost` instead."
+        )
     }
 }
 
 impl StreamShare {
-    pub fn adhoc_to_stream_prost(&self, state: &mut BuildFragmentGraphState) -> PbStreamNode {
+    pub fn adhoc_to_stream_prost(
+        &self,
+        state: &mut BuildFragmentGraphState,
+    ) -> SchedulerResult<PbStreamNode> {
         let operator_id = self.base.id().0 as u32;
 
         match state.get_share_stream_node(operator_id) {
@@ -96,7 +111,7 @@ impl StreamShare {
                     .inputs()
                     .into_iter()
                     .map(|plan| plan.to_stream_prost(state))
-                    .collect();
+                    .try_collect()?;
 
                 let stream_node = PbStreamNode {
                     input,
@@ -115,10 +130,10 @@ impl StreamShare {
                 };
 
                 state.add_share_stream_node(operator_id, stream_node.clone());
-                stream_node
+                Ok(stream_node)
             }
 
-            Some(stream_node) => stream_node.clone(),
+            Some(stream_node) => Ok(stream_node.clone()),
         }
     }
 }

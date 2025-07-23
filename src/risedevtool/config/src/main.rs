@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use console::style;
 use dialoguer::MultiSelect;
-use enum_iterator::{all, Sequence};
+use enum_iterator::{Sequence, all};
 use fs_err::OpenOptions;
 use itertools::Itertools;
 
@@ -61,20 +61,21 @@ pub enum Components {
     Minio,
     Hdfs,
     PrometheusAndGrafana,
-    Etcd,
-    Kafka,
     Pubsub,
     Redis,
     Tracing,
     RustComponents,
+    UseSystem,
     BuildConnectorNode,
     Dashboard,
     Release,
-    AllInOne,
     Sanitizer,
     DynamicLinking,
     HummockTrace,
     Coredump,
+    NoBacktrace,
+    Udf,
+    NoDefaultFeatures,
 }
 
 impl Components {
@@ -83,20 +84,21 @@ impl Components {
             Self::Minio => "[Component] Hummock: MinIO + MinIO-CLI",
             Self::Hdfs => "[Component] Hummock: Hdfs Backend",
             Self::PrometheusAndGrafana => "[Component] Metrics: Prometheus + Grafana",
-            Self::Etcd => "[Component] Etcd",
-            Self::Kafka => "[Component] Kafka",
             Self::Pubsub => "[Component] Google Pubsub",
             Self::Redis => "[Component] Redis",
             Self::BuildConnectorNode => "[Build] Build RisingWave Connector (Java)",
             Self::RustComponents => "[Build] Rust components",
+            Self::UseSystem => "[Build] Use system RisingWave",
             Self::Dashboard => "[Build] Dashboard",
             Self::Tracing => "[Component] Tracing: Grafana Tempo",
             Self::Release => "[Build] Enable release mode",
-            Self::AllInOne => "[Build] Enable all-in-one binary",
             Self::Sanitizer => "[Build] Enable sanitizer",
             Self::DynamicLinking => "[Build] Enable dynamic linking",
             Self::HummockTrace => "[Build] Hummock Trace",
             Self::Coredump => "[Runtime] Enable coredump",
+            Self::NoBacktrace => "[Runtime] Disable backtrace",
+            Self::Udf => "[Build] Enable UDF",
+            Self::NoDefaultFeatures => "[Build] Disable default features",
         }
         .into()
     }
@@ -115,16 +117,6 @@ Required by Hummock state store."
                 "
 Required if you want to view metrics."
             }
-            Self::Etcd => {
-                "
-Required if you want to persistent meta-node data.
-                "
-            }
-            Self::Kafka => {
-                "
-Required if you want to create source from Kafka.
-                "
-            }
             Self::Pubsub => {
                 "
 Required if you want to create source from Emulated Google Pub/sub.
@@ -133,12 +125,23 @@ Required if you want to create source from Emulated Google Pub/sub.
             Self::RustComponents => {
                 "
 Required if you want to build compute-node and meta-node.
-Otherwise you will need to manually download and copy it
-to RiseDev directory."
+Otherwise you will need to enable `USE_SYSTEM_RISINGWAVE`, or
+manually download a binary and copy it to RiseDev directory."
+            }
+            Self::UseSystem => {
+                "
+Use the RisingWave installed in the PATH, instead of building it
+from source. This implies `ENABLE_BUILD_RUST` to be false.
+                "
             }
             Self::Dashboard => {
                 "
-Required if you want to build dashboard from source."
+Required if you want to build dashboard from source.
+This is generally not the option you want to use to develop the
+dashboard. Instead, directly run `npm run dev` in the dashboard
+directory to start the development server, set the API endpoint
+to a running RisingWave cluster in the settings page.
+"
             }
             Self::Tracing => {
                 "
@@ -148,12 +151,6 @@ you download Grafana Tempo."
             Self::Release => {
                 "
 Build RisingWave in release mode"
-            }
-            Self::AllInOne => {
-                "
-With this option enabled, RiseDev will help you create
-symlinks to `risingwave` all-in-one binary, so as to build
-and use `risingwave` in all-in-one mode."
             }
             Self::Sanitizer => {
                 "
@@ -195,6 +192,22 @@ the binaries will also be codesigned with `get-task-allow` enabled.
 As a result, RisingWave will dump the core on panics.
                 "
             }
+            Self::NoBacktrace => {
+                "
+With this option enabled, RiseDev will not set `RUST_BACKTRACE` when launching nodes.
+                "
+            }
+            Self::Udf => {
+                "
+Add --features udf to build command (by default disabled).
+Required if you want to support UDF."
+            }
+            Self::NoDefaultFeatures => {
+                "
+Add --no-default-features to build command.
+Currently, default features are: rw-static-link, all-connectors
+"
+            }
         }
         .into()
     }
@@ -204,19 +217,21 @@ As a result, RisingWave will dump the core on panics.
             "ENABLE_MINIO" => Some(Self::Minio),
             "ENABLE_HDFS" => Some(Self::Hdfs),
             "ENABLE_PROMETHEUS_GRAFANA" => Some(Self::PrometheusAndGrafana),
-            "ENABLE_ETCD" => Some(Self::Etcd),
-            "ENABLE_KAFKA" => Some(Self::Kafka),
             "ENABLE_PUBSUB" => Some(Self::Pubsub),
             "ENABLE_BUILD_RUST" => Some(Self::RustComponents),
+            "USE_SYSTEM_RISINGWAVE" => Some(Self::UseSystem),
             "ENABLE_BUILD_DASHBOARD" => Some(Self::Dashboard),
             "ENABLE_COMPUTE_TRACING" => Some(Self::Tracing),
             "ENABLE_RELEASE_PROFILE" => Some(Self::Release),
             "ENABLE_DYNAMIC_LINKING" => Some(Self::DynamicLinking),
-            "ENABLE_ALL_IN_ONE" => Some(Self::AllInOne),
             "ENABLE_SANITIZER" => Some(Self::Sanitizer),
             "ENABLE_REDIS" => Some(Self::Redis),
             "ENABLE_BUILD_RW_CONNECTOR" => Some(Self::BuildConnectorNode),
             "ENABLE_HUMMOCK_TRACE" => Some(Self::HummockTrace),
+            "ENABLE_COREDUMP" => Some(Self::Coredump),
+            "DISABLE_BACKTRACE" => Some(Self::NoBacktrace),
+            "ENABLE_UDF" => Some(Self::Udf),
+            "DISABLE_DEFAULT_FEATURES" => Some(Self::NoDefaultFeatures),
             _ => None,
         }
     }
@@ -226,20 +241,21 @@ As a result, RisingWave will dump the core on panics.
             Self::Minio => "ENABLE_MINIO",
             Self::Hdfs => "ENABLE_HDFS",
             Self::PrometheusAndGrafana => "ENABLE_PROMETHEUS_GRAFANA",
-            Self::Etcd => "ENABLE_ETCD",
-            Self::Kafka => "ENABLE_KAFKA",
             Self::Pubsub => "ENABLE_PUBSUB",
             Self::Redis => "ENABLE_REDIS",
             Self::RustComponents => "ENABLE_BUILD_RUST",
+            Self::UseSystem => "USE_SYSTEM_RISINGWAVE",
             Self::Dashboard => "ENABLE_BUILD_DASHBOARD",
             Self::Tracing => "ENABLE_COMPUTE_TRACING",
             Self::Release => "ENABLE_RELEASE_PROFILE",
-            Self::AllInOne => "ENABLE_ALL_IN_ONE",
             Self::Sanitizer => "ENABLE_SANITIZER",
             Self::BuildConnectorNode => "ENABLE_BUILD_RW_CONNECTOR",
             Self::DynamicLinking => "ENABLE_DYNAMIC_LINKING",
             Self::HummockTrace => "ENABLE_HUMMOCK_TRACE",
             Self::Coredump => "ENABLE_COREDUMP",
+            Self::NoBacktrace => "DISABLE_BACKTRACE",
+            Self::Udf => "ENABLE_UDF",
+            Self::NoDefaultFeatures => "DISABLE_DEFAULT_FEATURES",
         }
         .into()
     }
@@ -261,7 +277,7 @@ fn configure(chosen: &[Components]) -> Result<Option<Vec<Components>>> {
         .map(|c| {
             let title = c.title();
             let desc = style(
-                ("\n".to_string() + c.description().trim())
+                ("\n".to_owned() + c.description().trim())
                     .split('\n')
                     .join("\n      "),
             )
@@ -300,40 +316,43 @@ fn main() -> Result<()> {
     let file_path = opts.file;
 
     let chosen = {
-        if let Ok(file) = OpenOptions::new().read(true).open(&file_path) {
-            let reader = BufReader::new(file);
-            let mut enabled = vec![];
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() || line.trim().starts_with('#') {
-                    continue;
-                }
-                let Some((component, val)) = line.split_once('=') else {
-                    println!("invalid config line {}, discarded", line);
-                    continue;
-                };
-                if component == "RISEDEV_CONFIGURED" {
-                    continue;
-                }
-                match Components::from_env(component) {
-                    Some(component) => {
-                        if val == "true" {
-                            enabled.push(component);
-                        }
-                    }
-                    None => {
-                        println!("unknown configure {}, discarded", component);
+        match OpenOptions::new().read(true).open(&file_path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                let mut enabled = vec![];
+                for line in reader.lines() {
+                    let line = line?;
+                    if line.trim().is_empty() || line.trim().starts_with('#') {
                         continue;
                     }
+                    let Some((component, val)) = line.split_once('=') else {
+                        println!("invalid config line {}, discarded", line);
+                        continue;
+                    };
+                    if component == "RISEDEV_CONFIGURED" {
+                        continue;
+                    }
+                    match Components::from_env(component) {
+                        Some(component) => {
+                            if val == "true" {
+                                enabled.push(component);
+                            }
+                        }
+                        None => {
+                            println!("unknown configure {}, discarded", component);
+                            continue;
+                        }
+                    }
                 }
+                enabled
             }
-            enabled
-        } else {
-            println!(
-                "RiseDev component config not found, generating {}",
-                file_path
-            );
-            Components::default_enabled().to_vec()
+            _ => {
+                println!(
+                    "RiseDev component config not found, generating {}",
+                    file_path
+                );
+                Components::default_enabled().to_vec()
+            }
         }
     };
 

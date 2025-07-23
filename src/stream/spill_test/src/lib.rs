@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,9 +13,7 @@
 // limitations under the License.
 #![feature(proc_macro_hygiene, stmt_expr_attributes)]
 #![feature(custom_test_frameworks)]
-#![feature(bound_map)]
 #![feature(type_alias_impl_trait)]
-#![feature(associated_type_bounds)]
 
 #[cfg(test)]
 mod test_mem_table;

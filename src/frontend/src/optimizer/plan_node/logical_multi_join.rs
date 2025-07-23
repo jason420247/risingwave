@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,21 +18,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::Schema;
-use risingwave_common::error::{ErrorCode, Result, RwError};
 use risingwave_pb::plan_common::JoinType;
 
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
     ColPrunable, ExprRewritable, Logical, LogicalFilter, LogicalJoin, LogicalProject, PlanBase,
     PlanNodeType, PlanRef, PlanTreeNodeBinary, PlanTreeNodeUnary, PredicatePushdown, ToBatch,
     ToStream,
 };
+use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{ExprImpl, ExprRewriter, ExprType, ExprVisitor, FunctionCall};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::{
     ColumnPruningContext, PlanTreeNode, PredicatePushdownContext, RewriteStreamContext,
     ToStreamContext,
 };
+use crate::optimizer::plan_visitor::TemporalJoinValidator;
 use crate::optimizer::property::FunctionalDependencySet;
 use crate::utils::{
     ColIndexMapping, ColIndexMappingRewriteExt, Condition, ConditionDisplay,
@@ -54,8 +55,8 @@ pub struct LogicalMultiJoin {
     inner2output: ColIndexMapping,
     // NOTE(st1page): these fields will be used in prune_col and
     // pk_derive soon.
-    /// the mapping output_col_idx -> (input_idx, input_col_idx), **"output_col_idx" is internal,
-    /// not consider output_indices**
+    /// the mapping `output_col_idx` -> (`input_idx`, `input_col_idx`), **"`output_col_idx`" is internal,
+    /// not consider `output_indices`**
     inner_o2i_mapping: Vec<(usize, usize)>,
     inner_i2o_mappings: Vec<ColIndexMapping>,
 }
@@ -131,6 +132,13 @@ impl LogicalMultiJoinBuilder {
         }
         let left = join.left();
         let right = join.right();
+
+        if TemporalJoinValidator::exist_dangling_temporal_scan(left.clone()) {
+            return Self::with_input(plan);
+        }
+        if TemporalJoinValidator::exist_dangling_temporal_scan(right.clone()) {
+            return Self::with_input(plan);
+        }
 
         let mut builder = Self::new(left);
 
@@ -387,26 +395,31 @@ impl LogicalMultiJoin {
         output
     }
 
+    #[allow(clippy::doc_overindented_list_items)]
     /// Our heuristic join reordering algorithm will try to perform a left-deep join.
     /// It will try to do the following:
     ///
     /// 1. First, split the join graph, with eq join conditions as graph edges, into their connected
     ///    components. Repeat the procedure in 2. with the largest connected components down to
     ///    the smallest.
+    ///
     /// 2. For each connected component, add joins to the chain, prioritizing adding those
     ///    joins to the bottom of the chain if their join conditions have:
-    ///       a. eq joins between primary keys on both sides
-    ///       b. eq joins with primary keys on one side
-    ///       c. more equijoin conditions
+    ///
+    ///      a. eq joins between primary keys on both sides
+    ///      b. eq joins with primary keys on one side
+    ///      c. more equijoin conditions
+    ///
     ///    in that order. This forms our selectivity heuristic.
+    ///
     /// 3. Thirdly, we will emit a left-deep cross-join of each of the left-deep joins of the
     ///    connected components. Depending on the type of plan, this may result in a planner failure
     ///    (e.g. for streaming). No cross-join will be emitted for a single connected component.
+    ///
     /// 4. Finally, we will emit, above the left-deep join tree:
-    ///        a. a filter with the non eq conditions
-    ///        b. a projection which reorders the output column ordering to agree with the
-    ///           original ordering of the joins.
-    ///   The filter will then be pushed down by another filter pushdown pass.
+    ///    a. a filter with the non eq conditions
+    ///    b. a projection which reorders the output column ordering to agree with the original ordering of the joins.
+    ///    The filter will then be pushed down by another filter pushdown pass.
     pub(crate) fn heuristic_ordering(&self) -> Result<Vec<usize>> {
         let mut labeller = ConnectedComponentLabeller::new(self.inputs.len());
 
@@ -488,15 +501,15 @@ impl LogicalMultiJoin {
         Ok(join_ordering)
     }
 
+    #[allow(clippy::doc_overindented_list_items)]
     /// transform multijoin into bushy tree join.
     ///
     /// 1. First, use equivalent condition derivation to get derive join relation.
     /// 2. Second, for every isolated node will create connection to every other nodes.
     /// 3. Third, select and merge one node for a iteration, and use a bfs policy for which node the
     ///    selected node merged with.
-    ///   i. The select node mentioned above is the node with least number of relations and the
-    ///      lowerst join tree.
-    ///   ii. nodes with a join tree higher than the temporal optimal join tree will be pruned.
+    ///    i. The select node mentioned above is the node with least number of relations and the lowerst join tree.
+    ///    ii. nodes with a join tree higher than the temporal optimal join tree will be pruned.
     pub fn as_bushy_tree_join(&self) -> Result<PlanRef> {
         let (nodes, condition) = self.get_join_graph()?;
 
@@ -771,7 +784,7 @@ impl LogicalMultiJoin {
             (_, _) => {
                 return Err(RwError::from(ErrorCode::InternalError(
                     "only leaf node can have None subtree".into(),
-                )))
+                )));
             }
         })
     }
@@ -871,10 +884,10 @@ mod test {
     use risingwave_pb::expr::expr_node::Type;
 
     use super::*;
-    use crate::expr::{FunctionCall, InputRef};
+    use crate::expr::InputRef;
     use crate::optimizer::optimizer_context::OptimizerContext;
-    use crate::optimizer::plan_node::generic::GenericPlanRef;
     use crate::optimizer::plan_node::LogicalValues;
+    use crate::optimizer::plan_node::generic::GenericPlanRef;
     use crate::optimizer::property::FunctionalDependency;
     #[tokio::test]
     async fn fd_derivation_multi_join() {

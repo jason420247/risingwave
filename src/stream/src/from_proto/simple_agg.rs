@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,7 @@ use super::agg_common::{
 };
 use super::*;
 use crate::common::table::state_table::StateTable;
-use crate::executor::agg_common::{AggExecutorArgs, SimpleAggExecutorExtraArgs};
-use crate::executor::SimpleAggExecutor;
+use crate::executor::aggregate::{AggExecutorArgs, SimpleAggExecutor, SimpleAggExecutorExtraArgs};
 
 pub struct SimpleAggExecutorBuilder;
 
@@ -34,8 +33,7 @@ impl ExecutorBuilder for SimpleAggExecutorBuilder {
         params: ExecutorParams,
         node: &Self::Node,
         store: impl StateStore,
-        stream: &mut LocalStreamManagerCore,
-    ) -> StreamResult<BoxedExecutor> {
+    ) -> StreamResult<Executor> {
         let [input]: [_; 1] = params.input.try_into().unwrap();
         let agg_calls: Vec<AggCall> = node
             .get_agg_calls()
@@ -46,7 +44,7 @@ impl ExecutorBuilder for SimpleAggExecutorBuilder {
             build_agg_state_storages_from_proto(node.get_agg_call_states(), store.clone(), None)
                 .await;
         // disable sanity check so that old value is not required when updating states
-        let intermediate_state_table = StateTable::from_table_catalog_inconsistent_op(
+        let intermediate_state_table = StateTable::from_table_catalog(
             node.get_intermediate_state_table().unwrap(),
             store.clone(),
             None,
@@ -55,24 +53,28 @@ impl ExecutorBuilder for SimpleAggExecutorBuilder {
         let distinct_dedup_tables =
             build_distinct_dedup_table_from_proto(node.get_distinct_dedup_tables(), store, None)
                 .await;
+        let must_output_per_barrier = node.get_must_output_per_barrier();
 
-        Ok(SimpleAggExecutor::new(AggExecutorArgs {
+        let exec = SimpleAggExecutor::new(AggExecutorArgs {
             version: node.version(),
 
             input,
             actor_ctx: params.actor_context,
-            info: params.info,
+            info: params.info.clone(),
 
-            extreme_cache_size: stream.config.developer.unsafe_extreme_cache_size,
+            extreme_cache_size: params.env.config().developer.unsafe_extreme_cache_size,
 
             agg_calls,
             row_count_index: node.get_row_count_index() as usize,
             storages,
             intermediate_state_table,
             distinct_dedup_tables,
-            watermark_epoch: stream.get_watermark_epoch(),
-            extra: SimpleAggExecutorExtraArgs {},
-        })?
-        .boxed())
+            watermark_epoch: params.watermark_epoch,
+            extra: SimpleAggExecutorExtraArgs {
+                must_output_per_barrier,
+            },
+        })?;
+
+        Ok((params.info, exec).into())
     }
 }

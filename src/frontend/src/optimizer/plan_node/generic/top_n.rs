@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ use risingwave_common::catalog::{FieldDisplay, Schema};
 use risingwave_common::util::sort_util::OrderType;
 
 use super::super::utils::TableCatalogBuilder;
-use super::{stream, DistillUnit, GenericPlanNode, GenericPlanRef};
+use super::{DistillUnit, GenericPlanNode, GenericPlanRef, stream};
+use crate::TableCatalog;
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::utils::childless_record;
 use crate::optimizer::property::{FunctionalDependencySet, Order, OrderDisplay};
-use crate::TableCatalog;
 
 /// `TopN` sorts the input data and fetches up to `limit` rows from `offset`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -41,15 +41,13 @@ impl<PlanRef: stream::StreamPlanRef> TopN<PlanRef> {
     pub fn infer_internal_table_catalog(
         &self,
         schema: &Schema,
-        ctx: OptimizerContextRef,
+        _ctx: OptimizerContextRef,
         input_stream_key: &[usize],
         vnode_col_idx: Option<usize>,
     ) -> TableCatalog {
         let columns_fields = schema.fields().to_vec();
         let column_orders = &self.order.column_orders;
-        let mut internal_table_catalog_builder =
-            TableCatalogBuilder::new(ctx.with_options().internal_table_subset());
-
+        let mut internal_table_catalog_builder = TableCatalogBuilder::default();
         columns_fields.iter().for_each(|field| {
             internal_table_catalog_builder.add_column(field);
         });
@@ -114,6 +112,13 @@ impl<PlanRef: GenericPlanRef> TopN<PlanRef> {
         if limit_attr.with_ties() {
             assert!(offset == 0, "WITH TIES is not supported with OFFSET");
         }
+
+        debug_assert!(
+            group_key.iter().all(|&idx| idx < input.schema().len()),
+            "Invalid group keys {:?} input schema size = {}",
+            &group_key,
+            input.schema().len()
+        );
 
         Self {
             input,

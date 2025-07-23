@@ -17,6 +17,8 @@ use core::fmt;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use super::ObjectName;
+
 /// Primitive SQL values such as number and string
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -150,7 +152,7 @@ impl fmt::Display for CstyleEscapedString {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum DateTimeField {
     Year,
@@ -176,7 +178,7 @@ impl fmt::Display for DateTimeField {
 
 pub struct EscapeSingleQuoteString<'a>(&'a str);
 
-impl<'a> fmt::Display for EscapeSingleQuoteString<'a> {
+impl fmt::Display for EscapeSingleQuoteString<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for c in self.0.chars() {
             if c == '\'' {
@@ -212,7 +214,7 @@ impl fmt::Display for TrimWhereField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum JsonPredicateType {
     #[default]
@@ -231,5 +233,39 @@ impl fmt::Display for JsonPredicateType {
             Object => " OBJECT",
             Scalar => " SCALAR",
         })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SecretRefValue {
+    pub secret_name: ObjectName,
+    pub ref_as: SecretRefAsType,
+}
+
+impl fmt::Display for SecretRefValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.ref_as {
+            SecretRefAsType::Text => write!(f, "{}", self.secret_name),
+            SecretRefAsType::File => write!(f, "{} AS FILE", self.secret_name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum SecretRefAsType {
+    Text,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ConnectionRefValue {
+    pub connection_name: ObjectName,
+}
+
+impl fmt::Display for ConnectionRefValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.connection_name)
     }
 }

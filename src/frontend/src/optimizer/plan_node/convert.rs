@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,10 @@ use std::collections::HashMap;
 
 use paste::paste;
 use risingwave_common::catalog::FieldDisplay;
+use risingwave_pb::stream_plan::StreamScanType;
 
 use super::*;
-use crate::optimizer::property::{Order, RequiredDist};
-use crate::utils::ColIndexMapping;
+use crate::optimizer::property::RequiredDist;
 use crate::{for_batch_plan_nodes, for_logical_plan_nodes, for_stream_plan_nodes};
 
 /// `ToStream` converts a logical plan node to streaming physical node
@@ -65,30 +65,25 @@ pub fn stream_enforce_eowc_requirement(
     emit_on_window_close: bool,
 ) -> Result<PlanRef> {
     if emit_on_window_close && !plan.emit_on_window_close() {
-        let watermark_cols = plan.watermark_columns();
-        let n_watermark_cols = watermark_cols.count_ones(..);
-        if n_watermark_cols == 0 {
+        let watermark_groups = plan.watermark_columns().grouped();
+        let n_watermark_groups = watermark_groups.len();
+        if n_watermark_groups == 0 {
             Err(ErrorCode::NotSupported(
-                "The query cannot be executed in Emit-On-Window-Close mode.".to_string(),
-                "Try define a watermark column in the source, or avoid aggregation without GROUP BY"
-                    .to_string(),
+                "The query cannot be executed in Emit-On-Window-Close mode.".to_owned(),
+                "Try define a watermark column in the source, or avoid aggregation without GROUP BY".to_owned(),
             )
             .into())
         } else {
-            let watermark_col_idx = watermark_cols.ones().next().unwrap();
-            if n_watermark_cols > 1 {
+            let first_watermark_group = watermark_groups.values().next().unwrap();
+            let watermark_col_idx = first_watermark_group.indices().next().unwrap();
+            if n_watermark_groups > 1 {
                 ctx.warn_to_user(format!(
-                    "There are multiple watermark columns in the query, the first one `{}` is used.",
+                    "There are multiple unrelated watermark columns in the query, the first one `{}` is used.",
                     FieldDisplay(&plan.schema()[watermark_col_idx])
                 ));
             }
             Ok(StreamEowcSort::new(plan, watermark_col_idx).into())
         }
-    } else if !emit_on_window_close && plan.emit_on_window_close() {
-        Err(ErrorCode::InternalError(
-            "Some bad thing happened, the generated plan is not correct.".to_string(),
-        )
-        .into())
     } else {
         Ok(plan)
     }
@@ -124,14 +119,27 @@ impl RewriteStreamContext {
 pub struct ToStreamContext {
     share_to_stream_map: HashMap<PlanNodeId, PlanRef>,
     emit_on_window_close: bool,
+    stream_scan_type: StreamScanType,
 }
 
 impl ToStreamContext {
     pub fn new(emit_on_window_close: bool) -> Self {
+        Self::new_with_stream_scan_type(emit_on_window_close, StreamScanType::Backfill)
+    }
+
+    pub fn new_with_stream_scan_type(
+        emit_on_window_close: bool,
+        stream_scan_type: StreamScanType,
+    ) -> Self {
         Self {
             share_to_stream_map: HashMap::new(),
             emit_on_window_close,
+            stream_scan_type,
         }
+    }
+
+    pub fn stream_scan_type(&self) -> StreamScanType {
+        self.stream_scan_type
     }
 
     pub fn add_to_stream_result(&mut self, plan_node_id: PlanNodeId, plan_ref: PlanRef) {

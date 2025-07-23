@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ mod trivial_move_compaction_picker;
 mod ttl_reclaim_compaction_picker;
 
 mod compaction_task_validator;
+mod vnode_watermark_picker;
 
 pub use base_level_compaction_picker::LevelCompactionPicker;
 pub use compaction_task_validator::{CompactionTaskValidator, ValidationRuleType};
@@ -31,8 +32,7 @@ pub use emergency_compaction_picker::EmergencyCompactionPicker;
 pub use intra_compaction_picker::IntraCompactionPicker;
 pub use manual_compaction_picker::ManualCompactionPicker;
 pub use min_overlap_compaction_picker::MinOverlappingPicker;
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::InputLevel;
+use risingwave_hummock_sdk::level::{InputLevel, Levels};
 pub use space_reclaim_compaction_picker::{SpaceReclaimCompactionPicker, SpaceReclaimPickerState};
 pub use tier_compaction_picker::TierCompactionPicker;
 pub use tombstone_reclaim_compaction_picker::{
@@ -40,10 +40,9 @@ pub use tombstone_reclaim_compaction_picker::{
 };
 pub use trivial_move_compaction_picker::TrivialMovePicker;
 pub use ttl_reclaim_compaction_picker::{TtlPickerState, TtlReclaimCompactionPicker};
+pub use vnode_watermark_picker::VnodeWatermarkCompactionPicker;
 
 use crate::hummock::level_handler::LevelHandler;
-
-pub const MAX_COMPACT_LEVEL_COUNT: usize = 42;
 
 #[derive(Default, Debug)]
 pub struct LocalPickerStatistic {
@@ -61,6 +60,7 @@ pub struct CompactionInput {
     pub select_input_size: u64,
     pub target_input_size: u64,
     pub total_file_count: u64,
+    pub vnode_partition_count: u32,
 }
 
 impl CompactionInput {

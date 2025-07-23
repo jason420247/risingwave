@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,28 +16,23 @@ use std::collections::BTreeMap;
 use std::mem;
 
 use either::Either;
-use futures::StreamExt;
-use futures_async_stream::try_stream;
-use risingwave_common::array::StreamChunk;
-use risingwave_common::catalog::{ColumnDesc, Schema, TableId, TableVersionId};
+use futures::TryStreamExt;
+use risingwave_common::catalog::{ColumnDesc, TableId, TableVersionId};
 use risingwave_common::transaction::transaction_id::TxnId;
 use risingwave_common::transaction::transaction_message::TxnMsg;
-use risingwave_source::dml_manager::DmlManagerRef;
+use risingwave_common_rate_limit::{MonitoredRateLimiter, RateLimit, RateLimiter};
+use risingwave_dml::dml_manager::DmlManagerRef;
+use risingwave_expr::codegen::BoxStream;
 
-use super::error::StreamExecutorError;
-use super::{
-    expect_first_barrier, BoxedExecutor, BoxedMessageStream, Executor, ExecutorInfo, Message,
-    Mutation, PkIndicesRef,
-};
-use crate::common::StreamChunkBuilder;
+use crate::executor::prelude::*;
 use crate::executor::stream_reader::StreamReaderWithPause;
 
 /// [`DmlExecutor`] accepts both stream data and batch data for data manipulation on a specific
 /// table. The two streams will be merged into one and then sent to downstream.
 pub struct DmlExecutor {
-    info: ExecutorInfo,
+    actor_ctx: ActorContextRef,
 
-    upstream: BoxedExecutor,
+    upstream: Executor,
 
     /// Stores the information of batch data channels.
     dml_manager: DmlManagerRef,
@@ -52,6 +47,8 @@ pub struct DmlExecutor {
     column_descs: Vec<ColumnDesc>,
 
     chunk_size: usize,
+
+    rate_limiter: Arc<MonitoredRateLimiter>,
 }
 
 /// If a transaction's data is less than `MAX_CHUNK_FOR_ATOMICITY` * `CHUNK_SIZE`, we can provide
@@ -73,28 +70,33 @@ struct TxnBuffer {
 impl DmlExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        info: ExecutorInfo,
-        upstream: BoxedExecutor,
+        actor_ctx: ActorContextRef,
+        upstream: Executor,
         dml_manager: DmlManagerRef,
         table_id: TableId,
         table_version_id: TableVersionId,
         column_descs: Vec<ColumnDesc>,
         chunk_size: usize,
+        rate_limit: RateLimit,
     ) -> Self {
+        let rate_limiter = Arc::new(RateLimiter::new(rate_limit).monitored(table_id));
         Self {
-            info,
+            actor_ctx,
             upstream,
             dml_manager,
             table_id,
             table_version_id,
             column_descs,
             chunk_size,
+            rate_limiter,
         }
     }
 
     #[try_stream(ok = Message, error = StreamExecutorError)]
     async fn execute_inner(self: Box<Self>) {
         let mut upstream = self.upstream.execute();
+
+        let actor_id = self.actor_ctx.id;
 
         // The first barrier message should be propagated.
         let barrier = expect_first_barrier(&mut upstream).await?;
@@ -106,21 +108,29 @@ impl DmlExecutor {
         // Note(bugen): Only register after the first barrier message is received, which means the
         // current executor is activated. This avoids the new reader overwriting the old one during
         // the preparation of schema change.
-        let batch_reader = self
-            .dml_manager
-            .register_reader(self.table_id, self.table_version_id, &self.column_descs)
-            .map_err(StreamExecutorError::connector_error)?;
-        let batch_reader = batch_reader.stream_reader().into_stream();
+        let handle = self.dml_manager.register_reader(
+            self.table_id,
+            self.table_version_id,
+            &self.column_descs,
+        )?;
+        let reader = apply_dml_rate_limit(
+            handle.stream_reader().into_stream(),
+            self.rate_limiter.clone(),
+        )
+        .boxed()
+        .map_err(StreamExecutorError::from);
 
         // Merge the two streams using `StreamReaderWithPause` because when we receive a pause
         // barrier, we should stop receiving the data from DML. We poll data from the two streams in
         // a round robin way.
-        let mut stream = StreamReaderWithPause::<false, TxnMsg>::new(upstream, batch_reader);
+        let mut stream = StreamReaderWithPause::<false, TxnMsg>::new(upstream, reader);
 
         // If the first barrier requires us to pause on startup, pause the stream.
         if barrier.is_pause_on_startup() {
             stream.pause_stream();
         }
+
+        let mut epoch = barrier.get_curr_epoch();
 
         yield Message::Barrier(barrier);
 
@@ -142,12 +152,31 @@ impl DmlExecutor {
                 Either::Left(msg) => {
                     // Stream messages.
                     if let Message::Barrier(barrier) = &msg {
+                        epoch = barrier.get_curr_epoch();
                         // We should handle barrier messages here to pause or resume the data from
                         // DML.
                         if let Some(mutation) = barrier.mutation.as_deref() {
                             match mutation {
                                 Mutation::Pause => stream.pause_stream(),
                                 Mutation::Resume => stream.resume_stream(),
+                                Mutation::Throttle(actor_to_apply) => {
+                                    if let Some(new_rate_limit) =
+                                        actor_to_apply.get(&self.actor_ctx.id)
+                                    {
+                                        let new_rate_limit = (*new_rate_limit).into();
+                                        let old_rate_limit =
+                                            self.rate_limiter.update(new_rate_limit);
+
+                                        if old_rate_limit != new_rate_limit {
+                                            tracing::info!(
+                                                old_rate_limit = ?old_rate_limit,
+                                                new_rate_limit = ?new_rate_limit,
+                                                actor_id,
+                                                "dml rate limit changed",
+                                            );
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -179,7 +208,10 @@ impl DmlExecutor {
                                     panic!("Transaction id collision txn_id = {}.", txn_id)
                                 });
                         }
-                        TxnMsg::End(txn_id) => {
+                        TxnMsg::End(txn_id, epoch_notifier) => {
+                            if let Some(sender) = epoch_notifier {
+                                let _ = sender.send(epoch);
+                            }
                             let mut txn_buffer = active_txn_map.remove(&txn_id)
                                 .unwrap_or_else(|| panic!("Receive an unexpected transaction end message. Active transaction map doesn't contain this transaction txn_id = {}.", txn_id));
 
@@ -240,7 +272,10 @@ impl DmlExecutor {
                             let txn_buffer = active_txn_map.remove(&txn_id)
                                 .unwrap_or_else(|| panic!("Receive an unexpected transaction rollback message. Active transaction map doesn't contain this transaction txn_id = {}.", txn_id));
                             if txn_buffer.overflow {
-                                tracing::warn!("txn_id={} large transaction tries to rollback, but part of its data has already been sent to the downstream.", txn_id);
+                                tracing::warn!(
+                                    "txn_id={} large transaction tries to rollback, but part of its data has already been sent to the downstream.",
+                                    txn_id
+                                );
                             }
                         }
                         TxnMsg::Data(txn_id, chunk) => {
@@ -255,14 +290,20 @@ impl DmlExecutor {
                                     txn_buffer.vec.push(chunk);
                                     if txn_buffer.vec.len() > MAX_CHUNK_FOR_ATOMICITY {
                                         // Too many chunks for atomicity. Drain and yield them.
-                                        tracing::warn!("txn_id={} Too many chunks for atomicity. Sent them to the downstream anyway.", txn_id);
+                                        tracing::warn!(
+                                            "txn_id={} Too many chunks for atomicity. Sent them to the downstream anyway.",
+                                            txn_id
+                                        );
                                         for chunk in txn_buffer.vec.drain(..) {
                                             yield Message::Chunk(chunk);
                                         }
                                         txn_buffer.overflow = true;
                                     }
                                 }
-                                None => panic!("Receive an unexpected transaction data message. Active transaction map doesn't contain this transaction txn_id = {}.", txn_id),
+                                None => panic!(
+                                    "Receive an unexpected transaction data message. Active transaction map doesn't contain this transaction txn_id = {}.",
+                                    txn_id
+                                ),
                             };
                         }
                     }
@@ -272,34 +313,79 @@ impl DmlExecutor {
     }
 }
 
-impl Executor for DmlExecutor {
+impl Execute for DmlExecutor {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.execute_inner().boxed()
     }
+}
 
-    fn schema(&self) -> &Schema {
-        &self.info.schema
-    }
+type BoxTxnMessageStream = BoxStream<'static, risingwave_dml::error::Result<TxnMsg>>;
+#[try_stream(ok = TxnMsg, error = risingwave_dml::error::DmlError)]
+async fn apply_dml_rate_limit(
+    stream: BoxTxnMessageStream,
+    rate_limiter: Arc<MonitoredRateLimiter>,
+) {
+    #[for_await]
+    for txn_msg in stream {
+        match txn_msg? {
+            TxnMsg::Begin(txn_id) => {
+                yield TxnMsg::Begin(txn_id);
+            }
+            TxnMsg::End(txn_id, epoch_notifier) => {
+                yield TxnMsg::End(txn_id, epoch_notifier);
+            }
+            TxnMsg::Rollback(txn_id) => {
+                yield TxnMsg::Rollback(txn_id);
+            }
+            TxnMsg::Data(txn_id, chunk) => {
+                let chunk_size = chunk.capacity();
+                if chunk_size == 0 {
+                    // empty chunk
+                    yield TxnMsg::Data(txn_id, chunk);
+                    continue;
+                }
+                let rate_limit = loop {
+                    match rate_limiter.rate_limit() {
+                        RateLimit::Pause => rate_limiter.wait(0).await,
+                        limit => break limit,
+                    }
+                };
 
-    fn pk_indices(&self) -> PkIndicesRef<'_> {
-        &self.info.pk_indices
-    }
-
-    fn identity(&self) -> &str {
-        &self.info.identity
+                match rate_limit {
+                    RateLimit::Pause => unreachable!(),
+                    RateLimit::Disabled => {
+                        yield TxnMsg::Data(txn_id, chunk);
+                        continue;
+                    }
+                    RateLimit::Fixed(limit) => {
+                        let max_permits = limit.get();
+                        let required_permits = chunk.compute_rate_limit_chunk_permits();
+                        if required_permits <= max_permits {
+                            rate_limiter.wait(required_permits).await;
+                            yield TxnMsg::Data(txn_id, chunk);
+                        } else {
+                            // Split the chunk into smaller chunks.
+                            for small_chunk in chunk.split(max_permits as _) {
+                                let required_permits =
+                                    small_chunk.compute_rate_limit_chunk_permits();
+                                rate_limiter.wait(required_permits).await;
+                                yield TxnMsg::Data(txn_id, small_chunk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
-    use risingwave_common::array::StreamChunk;
     use risingwave_common::catalog::{ColumnId, Field, INITIAL_TABLE_VERSION_ID};
     use risingwave_common::test_prelude::StreamChunkTestExt;
-    use risingwave_common::transaction::transaction_id::TxnId;
-    use risingwave_common::types::DataType;
-    use risingwave_source::dml_manager::DmlManager;
+    use risingwave_common::util::epoch::test_epoch;
+    use risingwave_dml::dml_manager::DmlManager;
 
     use super::*;
     use crate::executor::test_utils::MockSource;
@@ -321,23 +407,20 @@ mod tests {
         let pk_indices = vec![0];
         let dml_manager = Arc::new(DmlManager::for_test());
 
-        let (mut tx, source) = MockSource::channel(schema.clone(), pk_indices.clone());
-        let info = ExecutorInfo {
-            schema,
-            pk_indices,
-            identity: "DmlExecutor".to_string(),
-        };
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(schema, pk_indices);
 
-        let dml_executor = Box::new(DmlExecutor::new(
-            info,
-            Box::new(source),
+        let dml_executor = DmlExecutor::new(
+            ActorContext::for_test(0),
+            source,
             dml_manager.clone(),
             table_id,
             INITIAL_TABLE_VERSION_ID,
             column_descs,
             1024,
-        ));
-        let mut dml_executor = dml_executor.execute();
+            RateLimit::Disabled,
+        );
+        let mut dml_executor = dml_executor.boxed().execute();
 
         let stream_chunk1 = StreamChunk::from_pretty(
             " I I
@@ -363,7 +446,7 @@ mod tests {
         );
 
         // The first barrier
-        tx.push_barrier(1, false);
+        tx.push_barrier(test_epoch(1), false);
         let msg = dml_executor.next().await.unwrap().unwrap();
         assert!(matches!(msg, Message::Barrier(_)));
 
@@ -387,7 +470,7 @@ mod tests {
         tokio::spawn(async move {
             write_handle.end().await.unwrap();
             // a barrier to trigger batch group flush
-            tx.push_barrier(2, false);
+            tx.push_barrier(test_epoch(2), false);
         });
 
         // Consume the 1st message from upstream executor

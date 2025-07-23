@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::hummock::iterator::concat_inner::ConcatIteratorInner;
 use crate::hummock::BackwardSstableIterator;
+use crate::hummock::iterator::concat_inner::ConcatIteratorInner;
 
 /// Iterates backwards on multiple non-overlapping tables.
 pub type BackwardConcatIterator = ConcatIteratorInner<BackwardSstableIterator>;
@@ -24,16 +24,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::hummock::iterator::test_utils::{
-        default_builder_opt_for_test, gen_iterator_test_sstable_info, iterator_test_key_of,
-        iterator_test_value_of, mock_sstable_store, TEST_KEYS_COUNT,
-    };
     use crate::hummock::iterator::HummockIterator;
+    use crate::hummock::iterator::test_utils::{
+        TEST_KEYS_COUNT, default_builder_opt_for_test, gen_iterator_test_sstable_info,
+        iterator_test_key_of, iterator_test_value_of, mock_sstable_store,
+    };
     use crate::hummock::sstable::SstableIteratorReadOptions;
 
     #[tokio::test]
     async fn test_backward_concat_iterator() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         let table0 = gen_iterator_test_sstable_info(
             0,
             default_builder_opt_for_test(),
@@ -92,7 +92,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backward_concat_seek_exists() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         let table1 = gen_iterator_test_sstable_info(
             0,
             default_builder_opt_for_test(),
@@ -169,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backward_concat_seek_not_exists() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         let table0 = gen_iterator_test_sstable_info(
             0,
             default_builder_opt_for_test(),

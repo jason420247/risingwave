@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::io;
-use std::result::Result;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use parking_lot::Mutex;
 use risingwave_common::types::DataType;
+use risingwave_common::util::runtime::BackgroundShutdownRuntime;
+use risingwave_common::util::tokio_util::sync::CancellationToken;
+use risingwave_jni_core::jvm_runtime::register_jvm_builder;
 use risingwave_sqlparser::ast::Statement;
+use serde::Deserialize;
 use thiserror_ext::AsReport;
-use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::net::{AddressRef, Listener};
+use crate::error::{PsqlError, PsqlResult};
+use crate::net::{AddressRef, Listener, TcpKeepalive};
 use crate::pg_field_descriptor::PgFieldDescriptor;
 use crate::pg_message::TransactionStatus;
-use crate::pg_protocol::{PgProtocol, TlsConfig};
+use crate::pg_protocol::{ConnectionContext, PgByteStream, PgProtocol};
 use crate::pg_response::{PgResponse, ValuesStream};
 use crate::types::Format;
 
@@ -41,6 +47,14 @@ pub type SessionId = (ProcessId, SecretKey);
 pub trait SessionManager: Send + Sync + 'static {
     type Session: Session;
 
+    /// In the process of auto schema change, we need a dummy session to access
+    /// catalog information in frontend and build a replace plan for the table.
+    fn create_dummy_session(
+        &self,
+        database_id: u32,
+        user_id: u32,
+    ) -> Result<Arc<Self::Session>, BoxedError>;
+
     fn connect(
         &self,
         database: &str,
@@ -53,6 +67,11 @@ pub trait SessionManager: Send + Sync + 'static {
     fn cancel_creating_jobs_in_session(&self, session_id: SessionId);
 
     fn end_session(&self, session: &Self::Session);
+
+    /// Run some cleanup tasks before the server shutdown.
+    fn shutdown(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// A psql connection. Each connection binds with a database. Switching database will need to
@@ -74,11 +93,12 @@ pub trait Session: Send + Sync {
         self: Arc<Self>,
         sql: Option<Statement>,
         params_types: Vec<Option<DataType>>,
-    ) -> Result<Self::PreparedStatement, BoxedError>;
+    ) -> impl Future<Output = Result<Self::PreparedStatement, BoxedError>> + Send;
 
-    // TODO: maybe this function should be async and return the notice more timely
-    /// try to take the current notices from the session
-    fn take_notices(self: Arc<Self>) -> Vec<String>;
+    /// Receive the next notice message to send to the client.
+    ///
+    /// This function should be cancellation-safe.
+    fn next_notice(self: &Arc<Self>) -> impl Future<Output = String> + Send;
 
     fn bind(
         self: Arc<Self>,
@@ -107,11 +127,15 @@ pub trait Session: Send + Sync {
 
     fn id(&self) -> SessionId;
 
-    fn set_config(&self, key: &str, value: String) -> Result<(), BoxedError>;
+    fn get_config(&self, key: &str) -> Result<String, BoxedError>;
+
+    fn set_config(&self, key: &str, value: String) -> Result<String, BoxedError>;
 
     fn transaction_status(&self) -> TransactionStatus;
 
     fn init_exec_context(&self, sql: Arc<str>) -> ExecContextGuard;
+
+    fn check_idle_in_transaction_timeout(&self) -> PsqlResult<()>;
 }
 
 /// Each session could run different SQLs multiple times.
@@ -120,15 +144,23 @@ pub struct ExecContext {
     pub running_sql: Arc<str>,
     /// The instant of the running sql
     pub last_instant: Instant,
+    /// A reference used to update when `ExecContext` is dropped
+    pub last_idle_instant: Arc<Mutex<Option<Instant>>>,
 }
 
 /// `ExecContextGuard` holds a `Arc` pointer. Once `ExecContextGuard` is dropped,
 /// the inner `Arc<ExecContext>` should not be referred anymore, so that its `Weak` reference (used in `SessionImpl`) will be the same lifecycle of the running sql execution context.
-pub struct ExecContextGuard(Arc<ExecContext>);
+pub struct ExecContextGuard(#[allow(dead_code)] Arc<ExecContext>);
 
 impl ExecContextGuard {
     pub fn new(exec_context: Arc<ExecContext>) -> Self {
         Self(exec_context)
+    }
+}
+
+impl Drop for ExecContext {
+    fn drop(&mut self) {
+        *self.last_idle_instant.lock() = Some(Instant::now());
     }
 }
 
@@ -143,75 +175,168 @@ pub enum UserAuthenticator {
         encrypted_password: Vec<u8>,
         salt: [u8; 4],
     },
+    OAuth(HashMap<String, String>),
+}
+
+/// A JWK Set is a JSON object that represents a set of JWKs.
+/// The JSON object MUST have a "keys" member, with its value being an array of JWKs.
+/// See <https://www.rfc-editor.org/rfc/rfc7517.html#section-5> for more details.
+#[derive(Debug, Deserialize)]
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+/// A JSON Web Key (JWK) is a JSON object that represents a cryptographic key.
+/// See <https://www.rfc-editor.org/rfc/rfc7517.html#section-4> for more details.
+#[derive(Debug, Deserialize)]
+struct Jwk {
+    kid: String, // Key ID
+    alg: String, // Algorithm
+    n: String,   // Modulus
+    e: String,   // Exponent
+}
+
+async fn validate_jwt(
+    jwt: &str,
+    jwks_url: &str,
+    issuer: &str,
+    metadata: &HashMap<String, String>,
+) -> Result<bool, BoxedError> {
+    let header = decode_header(jwt)?;
+    let jwks: Jwks = reqwest::get(jwks_url).await?.json().await?;
+
+    // 1. Retrieve the kid from the header to find the right JWK in the JWK Set.
+    let kid = header.kid.ok_or("kid not found in jwt header")?;
+    let jwk = jwks
+        .keys
+        .into_iter()
+        .find(|k| k.kid == kid)
+        .ok_or("kid not found in jwks")?;
+
+    // 2. Check if the algorithms are matched.
+    if Algorithm::from_str(&jwk.alg)? != header.alg {
+        return Err("alg in jwt header does not match with alg in jwk".into());
+    }
+
+    // 3. Decode the JWT and validate the claims.
+    let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)?;
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[issuer]);
+    validation.set_required_spec_claims(&["exp", "iss"]);
+    let token_data = decode::<HashMap<String, serde_json::Value>>(jwt, &decoding_key, &validation)?;
+
+    // 4. Check if the metadata in the token matches.
+    if !metadata.iter().all(
+        |(k, v)| matches!(token_data.claims.get(k), Some(serde_json::Value::String(s)) if s == v),
+    ) {
+        return Err("metadata in jwt does not match with metadata declared with user".into());
+    }
+    Ok(true)
 }
 
 impl UserAuthenticator {
-    pub fn authenticate(&self, password: &[u8]) -> bool {
-        match self {
+    pub async fn authenticate(&self, password: &[u8]) -> PsqlResult<()> {
+        let success = match self {
             UserAuthenticator::None => true,
             UserAuthenticator::ClearText(text) => password == text,
             UserAuthenticator::Md5WithSalt {
                 encrypted_password, ..
             } => encrypted_password == password,
+            UserAuthenticator::OAuth(metadata) => {
+                let mut metadata = metadata.clone();
+                let jwks_url = metadata.remove("jwks_url").unwrap();
+                let issuer = metadata.remove("issuer").unwrap();
+                validate_jwt(
+                    &String::from_utf8_lossy(password),
+                    &jwks_url,
+                    &issuer,
+                    &metadata,
+                )
+                .await
+                .map_err(PsqlError::StartupError)?
+            }
+        };
+        if !success {
+            return Err(PsqlError::PasswordError);
         }
+        Ok(())
     }
 }
 
 /// Binds a Tcp or Unix listener at `addr`. Spawn a coroutine to serve every new connection.
+///
+/// Returns when the `shutdown` token is triggered.
 pub async fn pg_serve(
     addr: &str,
+    tcp_keepalive: TcpKeepalive,
     session_mgr: Arc<impl SessionManager>,
-    tls_config: Option<TlsConfig>,
-) -> io::Result<()> {
+    context: ConnectionContext,
+    shutdown: CancellationToken,
+) -> Result<(), BoxedError> {
     let listener = Listener::bind(addr).await?;
     tracing::info!(addr, "server started");
+    register_jvm_builder();
+    let acceptor_runtime = BackgroundShutdownRuntime::from({
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(1);
+        builder
+            .thread_name("rw-acceptor")
+            .enable_all()
+            .build()
+            .unwrap()
+    });
 
-    loop {
-        let conn_ret = listener.accept().await;
-        match conn_ret {
-            Ok((stream, peer_addr)) => {
-                tracing::info!(%peer_addr, "accept connection");
-                tokio::spawn(handle_connection(
-                    stream,
-                    session_mgr.clone(),
-                    tls_config.clone(),
-                    Arc::new(peer_addr),
-                ));
-            }
+    #[cfg(not(madsim))]
+    let worker_runtime = tokio::runtime::Handle::current();
+    #[cfg(madsim)]
+    let worker_runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let session_mgr_clone = session_mgr.clone();
+    let f = async move {
+        loop {
+            let conn_ret = listener.accept(&tcp_keepalive).await;
+            match conn_ret {
+                Ok((stream, peer_addr)) => {
+                    tracing::info!(%peer_addr, "accept connection");
+                    worker_runtime.spawn(handle_connection(
+                        stream,
+                        session_mgr_clone.clone(),
+                        Arc::new(peer_addr),
+                        context.clone(),
+                    ));
+                }
 
-            Err(e) => {
-                tracing::error!(error = %e.as_report(), "failed to accept connection",);
+                Err(e) => {
+                    tracing::error!(error = %e.as_report(), "failed to accept connection",);
+                }
             }
         }
-    }
+    };
+    acceptor_runtime.spawn(f);
+
+    // Wait for the shutdown signal.
+    shutdown.cancelled().await;
+
+    // Stop accepting new connections.
+    drop(acceptor_runtime);
+    // Shutdown session manager, typically close all existing sessions.
+    session_mgr.shutdown().await;
+
+    Ok(())
 }
 
 pub async fn handle_connection<S, SM>(
     stream: S,
     session_mgr: Arc<SM>,
-    tls_config: Option<TlsConfig>,
     peer_addr: AddressRef,
+    context: ConnectionContext,
 ) where
-    S: AsyncWrite + AsyncRead + Unpin,
+    S: PgByteStream,
     SM: SessionManager,
 {
-    let mut pg_proto = PgProtocol::new(stream, session_mgr, tls_config, peer_addr);
-    loop {
-        let msg = match pg_proto.read_message().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!(error = %e.as_report(), "error when reading message");
-                break;
-            }
-        };
-        tracing::trace!("Received message: {:?}", msg);
-        let ret = pg_proto.process(msg).await;
-        if ret {
-            break;
-        }
-    }
+    PgProtocol::new(stream, session_mgr, peer_addr, context)
+        .run()
+        .await;
 }
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -219,18 +344,22 @@ mod tests {
     use std::time::Instant;
 
     use bytes::Bytes;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
     use risingwave_common::types::DataType;
+    use risingwave_common::util::tokio_util::sync::CancellationToken;
     use risingwave_sqlparser::ast::Statement;
     use tokio_postgres::NoTls;
 
+    use crate::error::PsqlResult;
+    use crate::memory_manager::MessageMemoryManager;
     use crate::pg_field_descriptor::PgFieldDescriptor;
     use crate::pg_message::TransactionStatus;
+    use crate::pg_protocol::ConnectionContext;
     use crate::pg_response::{PgResponse, RowSetResult, StatementType};
     use crate::pg_server::{
-        pg_serve, BoxedError, ExecContext, ExecContextGuard, Session, SessionId, SessionManager,
-        UserAuthenticator,
+        BoxedError, ExecContext, ExecContextGuard, Session, SessionId, SessionManager,
+        UserAuthenticator, pg_serve,
     };
     use crate::types;
     use crate::types::Row;
@@ -240,6 +369,14 @@ mod tests {
 
     impl SessionManager for MockSessionManager {
         type Session = MockSession;
+
+        fn create_dummy_session(
+            &self,
+            _database_id: u32,
+            _user_name: u32,
+        ) -> Result<Arc<Self::Session>, BoxedError> {
+            unimplemented!()
+        }
 
         fn connect(
             &self,
@@ -278,14 +415,14 @@ mod tests {
                     vec![
                         // 1043 is the oid of varchar type.
                         // -1 is the type len of varchar type.
-                        PgFieldDescriptor::new("".to_string(), 1043, -1);
+                        PgFieldDescriptor::new("".to_owned(), 1043, -1);
                         1
                     ],
                 )
                 .into())
         }
 
-        fn parse(
+        async fn parse(
             self: Arc<Self>,
             _sql: Option<Statement>,
             _params_types: Vec<Option<DataType>>,
@@ -314,7 +451,7 @@ mod tests {
                     vec![
                     // 1043 is the oid of varchar type.
                     // -1 is the type len of varchar type.
-                    PgFieldDescriptor::new("".to_string(), 1043, -1);
+                    PgFieldDescriptor::new("".to_owned(), 1043, -1);
                     1
                 ],
                 )
@@ -327,7 +464,7 @@ mod tests {
         ) -> Result<(Vec<DataType>, Vec<PgFieldDescriptor>), BoxedError> {
             Ok((
                 vec![],
-                vec![PgFieldDescriptor::new("".to_string(), 1043, -1)],
+                vec![PgFieldDescriptor::new("".to_owned(), 1043, -1)],
             ))
         }
 
@@ -335,7 +472,7 @@ mod tests {
             self: Arc<Self>,
             _portal: String,
         ) -> Result<Vec<PgFieldDescriptor>, BoxedError> {
-            Ok(vec![PgFieldDescriptor::new("".to_string(), 1043, -1)])
+            Ok(vec![PgFieldDescriptor::new("".to_owned(), 1043, -1)])
         }
 
         fn user_authenticator(&self) -> &UserAuthenticator {
@@ -346,12 +483,19 @@ mod tests {
             (0, 0)
         }
 
-        fn set_config(&self, _key: &str, _value: String) -> Result<(), BoxedError> {
-            Ok(())
+        fn get_config(&self, key: &str) -> Result<String, BoxedError> {
+            match key {
+                "timezone" => Ok("UTC".to_owned()),
+                _ => Err(format!("Unknown config key: {key}").into()),
+            }
         }
 
-        fn take_notices(self: Arc<Self>) -> Vec<String> {
-            vec![]
+        fn set_config(&self, _key: &str, _value: String) -> Result<String, BoxedError> {
+            Ok("".to_owned())
+        }
+
+        async fn next_notice(self: &Arc<Self>) -> String {
+            std::future::pending().await
         }
 
         fn transaction_status(&self) -> TransactionStatus {
@@ -362,8 +506,13 @@ mod tests {
             let exec_context = Arc::new(ExecContext {
                 running_sql: sql,
                 last_instant: Instant::now(),
+                last_idle_instant: Default::default(),
             });
             ExecContextGuard::new(exec_context)
+        }
+
+        fn check_idle_in_transaction_timeout(&self) -> PsqlResult<()> {
+            Ok(())
         }
     }
 
@@ -371,8 +520,22 @@ mod tests {
         let bind_addr = bind_addr.into();
         let pg_config = pg_config.into();
 
-        let session_mgr = Arc::new(MockSessionManager {});
-        tokio::spawn(async move { pg_serve(&bind_addr, session_mgr, None).await });
+        let session_mgr = MockSessionManager {};
+        tokio::spawn(async move {
+            pg_serve(
+                &bind_addr,
+                socket2::TcpKeepalive::new(),
+                Arc::new(session_mgr),
+                ConnectionContext {
+                    tls_config: None,
+                    redact_sql_option_keywords: None,
+                    message_memory_manager: MessageMemoryManager::new(u64::MAX, u64::MAX, u64::MAX)
+                        .into(),
+                },
+                CancellationToken::new(), // dummy
+            )
+            .await
+        });
         // wait for server to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

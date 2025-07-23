@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,11 @@ use itertools::Itertools;
 use risingwave_expr::expr::build_non_strict_from_prost;
 use risingwave_pb::stream_plan::ValuesNode;
 use risingwave_storage::StateStore;
-use tokio::sync::mpsc::unbounded_channel;
 
 use super::ExecutorBuilder;
 use crate::error::StreamResult;
-use crate::executor::{BoxedExecutor, ValuesExecutor};
-use crate::task::{ExecutorParams, LocalStreamManagerCore};
+use crate::executor::{Executor, ValuesExecutor};
+use crate::task::ExecutorParams;
 
 /// Build a `ValuesExecutor` for stream. As is a leaf, current workaround registers a `sender` for
 /// this executor. May refractor with `BarrierRecvExecutor` in the near future.
@@ -34,15 +33,12 @@ impl ExecutorBuilder for ValuesExecutorBuilder {
         params: ExecutorParams,
         node: &ValuesNode,
         _store: impl StateStore,
-        stream: &mut LocalStreamManagerCore,
-    ) -> StreamResult<BoxedExecutor> {
-        let (sender, barrier_receiver) = unbounded_channel();
-        stream
-            .context
-            .barrier_manager()
-            .register_sender(params.actor_context.id, sender);
-        let progress = stream
-            .context
+    ) -> StreamResult<Executor> {
+        let barrier_receiver = params
+            .local_barrier_manager
+            .subscribe_barrier(params.actor_context.id);
+        let progress = params
+            .local_barrier_manager
             .register_create_mview_progress(params.actor_context.id);
         let rows = node
             .get_tuples()
@@ -57,12 +53,13 @@ impl ExecutorBuilder for ValuesExecutorBuilder {
                     .collect_vec()
             })
             .collect_vec();
-        Ok(Box::new(ValuesExecutor::new(
+        let exec = ValuesExecutor::new(
             params.actor_context,
-            params.info,
+            params.info.schema.clone(),
             progress,
             rows,
             barrier_receiver,
-        )))
+        );
+        Ok((params.info, exec).into())
     }
 }

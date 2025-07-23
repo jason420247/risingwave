@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ use std::cmp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use risingwave_hummock_sdk::compact_task::ValidationTask;
 use risingwave_hummock_sdk::key::FullKey;
-use risingwave_pb::hummock::ValidationTask;
 
 use crate::hummock::iterator::HummockIterator;
 use crate::hummock::sstable::SstableIteratorReadOptions;
@@ -32,23 +32,30 @@ use crate::monitor::StoreLocalStatistic;
 pub async fn validate_ssts(task: ValidationTask, sstable_store: SstableStoreRef) {
     let mut visited_keys = HashMap::new();
     let mut unused = StoreLocalStatistic::default();
-    for sst in task.sst_infos {
+    for sstable_info in task.sst_infos {
         let mut key_counts = 0;
         let worker_id = *task
             .sst_id_to_worker_id
-            .get(&sst.object_id)
+            .get(&sstable_info.object_id)
             .expect("valid worker_id");
         tracing::debug!(
-            "Validating SST {} from worker {}, epoch {}",
-            sst.get_object_id(),
+            "Validating SST sst_id {} object_id {} from worker {}",
+            sstable_info.sst_id,
+            sstable_info.object_id,
             worker_id,
-            task.epoch
         );
-        let holder = match sstable_store.sstable(&sst, unused.borrow_mut()).await {
+        let holder = match sstable_store
+            .sstable(&sstable_info, unused.borrow_mut())
+            .await
+        {
             Ok(holder) => holder,
             Err(_err) => {
                 // One reasonable cause is the SST has been vacuumed.
-                tracing::info!("Skip sanity check for SST {}.", sst.get_object_id());
+                tracing::info!(
+                    "Skip sanity check for SST sst_id {} object_id {} .",
+                    sstable_info.sst_id,
+                    sstable_info.object_id,
+                );
                 continue;
             }
         };
@@ -64,10 +71,15 @@ pub async fn validate_ssts(task: ValidationTask, sstable_store: SstableStoreRef)
                 max_preload_retry_times: 0,
                 prefetch_for_large_query: false,
             }),
+            &sstable_info,
         );
         let mut previous_key: Option<FullKey<Vec<u8>>> = None;
         if let Err(_err) = iter.rewind().await {
-            tracing::info!("Skip sanity check for SST {}.", sst.get_object_id());
+            tracing::info!(
+                "Skip sanity check for SST sst_id {} object_id {}.",
+                sstable_info.sst_id,
+                sstable_info.object_id
+            );
         }
         while iter.is_valid() {
             key_counts += 1;
@@ -76,24 +88,23 @@ pub async fn validate_ssts(task: ValidationTask, sstable_store: SstableStoreRef)
             if let Some((duplicate_sst_object_id, duplicate_worker_id)) =
                 visited_keys.get(&current_key).cloned()
             {
-                panic!("SST sanity check failed: Duplicate key {:x?} in SST object {} from worker {} and SST object {} from worker {}",
-                       current_key,
-                       sst.get_object_id(),
-                       worker_id,
-                       duplicate_sst_object_id,
-                       duplicate_worker_id)
+                panic!(
+                    "SST sanity check failed: Duplicate key {:x?} in SST object {} from worker {} and SST object {} from worker {}",
+                    current_key,
+                    sstable_info.object_id,
+                    worker_id,
+                    duplicate_sst_object_id,
+                    duplicate_worker_id
+                )
             }
-            visited_keys.insert(current_key.to_owned(), (sst.get_object_id(), worker_id));
+            visited_keys.insert(current_key.to_owned(), (sstable_info.object_id, worker_id));
             // Ordered and Locally unique
             if let Some(previous_key) = previous_key.take() {
                 let cmp = previous_key.cmp(&current_key);
                 if cmp != cmp::Ordering::Less {
                     panic!(
-                        "SST sanity check failed: For SST {}, expect {:x?} < {:x?}, got {:#?}",
-                        sst.get_object_id(),
-                        previous_key,
-                        current_key,
-                        cmp
+                        "SST sanity check failed: For SST sst_id {} object_id {}, expect {:x?} < {:x?}, got {:#?}",
+                        sstable_info.sst_id, sstable_info.object_id, previous_key, current_key, cmp
                     )
                 }
             }
@@ -101,16 +112,16 @@ pub async fn validate_ssts(task: ValidationTask, sstable_store: SstableStoreRef)
             if let Err(_err) = iter.next().await {
                 tracing::info!(
                     "Skip remaining sanity check for SST {}",
-                    sst.get_object_id(),
+                    sstable_info.object_id
                 );
                 break;
             }
         }
         tracing::debug!(
-            "Validated {} keys for SST {},  epoch {}",
+            "Validated {} keys for SST sst_id {} object_id {}",
             key_counts,
-            sst.get_object_id(),
-            task.epoch
+            sstable_info.sst_id,
+            sstable_info.object_id
         );
         iter.collect_local_statistic(&mut unused);
         unused.ignore();

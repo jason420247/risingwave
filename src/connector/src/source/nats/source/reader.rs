@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{anyhow, Result};
 use async_nats::jetstream::consumer;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures_async_stream::try_stream;
+use risingwave_common::bail;
 
 use super::message::NatsMessage;
 use super::{NatsOffset, NatsSplit};
+use crate::error::ConnectorResult as Result;
 use crate::parser::ParserConfig;
-use crate::source::common::{into_chunk_stream, CommonSplitReader};
+use crate::source::common::into_chunk_stream;
 use crate::source::nats::NatsProperties;
 use crate::source::{
-    BoxSourceWithStateStream, Column, SourceContextRef, SourceMessage, SplitId, SplitReader,
+    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SplitId, SplitReader,
 };
 
 pub struct NatsSplitReader {
     consumer: consumer::Consumer<consumer::pull::Config>,
+    #[expect(dead_code)]
     properties: NatsProperties,
     parser_config: ParserConfig,
     source_ctx: SourceContextRef,
+    #[expect(dead_code)]
     start_position: NatsOffset,
     split_id: SplitId,
 }
@@ -48,8 +51,8 @@ impl SplitReader for NatsSplitReader {
         source_ctx: SourceContextRef,
         _columns: Option<Vec<Column>>,
     ) -> Result<Self> {
-        // TODO: to simplify the logic, return 1 split for first version
-        assert!(splits.len() == 1);
+        // We guarantee the split num always align with parallelism
+        assert_eq!(splits.len(), 1);
         let split = splits.into_iter().next().unwrap();
         let split_id = split.split_id;
         let start_position = match &split.start_sequence {
@@ -58,31 +61,40 @@ impl SplitReader for NatsSplitReader {
                 Some(mode) => match mode.as_str() {
                     "latest" => NatsOffset::Latest,
                     "earliest" => NatsOffset::Earliest,
-                    "timestamp_millis" => {
-                        if let Some(time) = &properties.start_time {
-                            NatsOffset::Timestamp(time.parse()?)
+                    "timestamp" | "timestamp_millis" /* backward-compat */ => {
+                        if let Some(ts) = &properties.start_timestamp_millis {
+                            NatsOffset::Timestamp(*ts)
                         } else {
-                            return Err(anyhow!("scan_startup_timestamp_millis is required"));
+                            bail!("scan.startup.timestamp.millis is required");
                         }
                     }
                     _ => {
-                        return Err(anyhow!(
-                            "invalid scan_startup_mode, accept earliest/latest/timestamp_millis"
-                        ))
+                        bail!("invalid scan.startup.mode, accept earliest/latest/timestamp")
                     }
                 },
             },
+            // We have record on this Nats Split, contains the last seen offset (seq id) or reply subject
+            // We do not use the seq id as start position anymore,
+            // but just let the reader load from durable consumer on broker.
             start_position => start_position.to_owned(),
         };
+
+        let mut config = consumer::pull::Config {
+            ..Default::default()
+        };
+        properties.set_config(&mut config);
 
         let consumer = properties
             .common
             .build_consumer(
                 properties.stream.clone(),
+                properties.durable_consumer_name.clone(),
                 split_id.to_string(),
                 start_position.clone(),
+                config,
             )
             .await?;
+
         Ok(Self {
             consumer,
             properties,
@@ -93,15 +105,15 @@ impl SplitReader for NatsSplitReader {
         })
     }
 
-    fn into_stream(self) -> BoxSourceWithStateStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
-        into_chunk_stream(self, parser_config, source_context)
+        into_chunk_stream(self.into_data_stream(), parser_config, source_context)
     }
 }
 
-impl CommonSplitReader for NatsSplitReader {
-    #[try_stream(ok = Vec<SourceMessage>, error = anyhow::Error)]
+impl NatsSplitReader {
+    #[try_stream(ok = Vec<SourceMessage>, error = crate::error::ConnectorError)]
     async fn into_data_stream(self) {
         let capacity = self.source_ctx.source_ctrl_opts.chunk_size;
         let messages = self.consumer.messages().await?;

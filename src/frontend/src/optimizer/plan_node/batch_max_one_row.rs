@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,18 +13,19 @@
 // limitations under the License.
 
 use pretty_xmlish::XmlNode;
-use risingwave_common::error::Result;
-use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::MaxOneRowNode;
+use risingwave_pb::batch_plan::plan_node::NodeBody;
 
 use super::batch::prelude::*;
-use super::generic::{DistillUnit, PhysicalPlanRef};
+use super::generic::DistillUnit;
 use super::utils::Distill;
 use super::{
-    generic, ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch,
+    ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch, generic,
 };
-use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::error::Result;
 use crate::optimizer::plan_node::ToLocalBatch;
+use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::property::{Order, RequiredDist};
 
 /// [`BatchMaxOneRow`] fetches up to one row from the input, returning an error
 /// if the input contains more than one row at runtime.
@@ -66,7 +67,9 @@ impl Distill for BatchMaxOneRow {
 
 impl ToDistributedBatch for BatchMaxOneRow {
     fn to_distributed(&self) -> Result<PlanRef> {
-        Ok(self.clone_with_input(self.input().to_distributed()?).into())
+        let new_input = RequiredDist::single()
+            .enforce_if_not_satisfies(self.input().to_distributed()?, &Order::any())?;
+        Ok(self.clone_with_input(new_input).into())
     }
 }
 
@@ -78,7 +81,9 @@ impl ToBatchPb for BatchMaxOneRow {
 
 impl ToLocalBatch for BatchMaxOneRow {
     fn to_local(&self) -> Result<PlanRef> {
-        Ok(self.clone_with_input(self.input().to_local()?).into())
+        let new_input = RequiredDist::single()
+            .enforce_if_not_satisfies(self.input().to_local()?, &Order::any())?;
+        Ok(self.clone_with_input(new_input).into())
     }
 }
 

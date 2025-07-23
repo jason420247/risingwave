@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,14 +30,18 @@ pub fn find_columns_by_ids(
     table_columns: &[ColumnDesc],
     column_ids: &[ColumnId],
 ) -> (Vec<ColumnDesc>, Vec<usize>) {
-    let mut table_columns = table_columns
+    if column_ids.is_empty() {
+        // shortcut
+        return (vec![], vec![]);
+    }
+    let id_to_columns = table_columns
         .iter()
         .enumerate()
         .map(|(index, c)| (c.column_id, (c.clone(), index)))
         .collect::<HashMap<_, _>>();
     column_ids
         .iter()
-        .map(|id| table_columns.remove(id).unwrap())
+        .map(|id| id_to_columns.get(id).expect("column id not found").clone())
         .unzip()
 }
 
@@ -63,7 +67,7 @@ impl ColumnMapping {
 mod test {
     use std::fmt::Debug;
 
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
     use risingwave_common::types::DataType;
 
     use super::*;
@@ -91,23 +95,27 @@ mod test {
                             data_type: Int64,
                             column_id: #2,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
-                            additional_column_type: Normal,
+                            additional_column: AdditionalColumn {
+                                column_type: None,
+                            },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                         ColumnDesc {
                             data_type: Int16,
                             column_id: #3,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
-                            additional_column_type: Normal,
+                            additional_column: AdditionalColumn {
+                                column_type: None,
+                            },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                     ],
                     [
@@ -133,23 +141,27 @@ mod test {
                             data_type: Int64,
                             column_id: #2,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
-                            additional_column_type: Normal,
+                            additional_column: AdditionalColumn {
+                                column_type: None,
+                            },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                         ColumnDesc {
                             data_type: Varchar,
                             column_id: #1,
                             name: "",
-                            field_descs: [],
-                            type_name: "",
                             generated_or_default_column: None,
                             description: None,
-                            additional_column_type: Normal,
+                            additional_column: AdditionalColumn {
+                                column_type: None,
+                            },
                             version: Pr13707,
+                            system_column: None,
+                            nullable: true,
                         },
                     ],
                     [

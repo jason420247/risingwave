@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,16 +20,19 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut};
 use either::Either;
 use itertools::Itertools;
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::{PbArray, PbArrayType, StructArrayData};
 
 use super::{Array, ArrayBuilder, ArrayBuilderImpl, ArrayImpl, ArrayResult, DataChunk};
 use crate::array::ArrayRef;
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::EstimateSize;
+use crate::bitmap::{Bitmap, BitmapBuilder};
+use crate::error::BoxedError;
+use crate::row::Row;
 use crate::types::{
-    hash_datum, DataType, Datum, DatumRef, DefaultOrd, Scalar, StructType, ToDatumRef, ToText,
+    DataType, Datum, DatumRef, DefaultOrd, Scalar, ScalarImpl, StructType, ToDatumRef, ToText,
+    hash_datum,
 };
-use crate::util::iter_util::ZipEqFast;
+use crate::util::iter_util::{ZipEqDebug, ZipEqFast};
 use crate::util::memcmp_encoding;
 use crate::util::value_encoding::estimate_serialize_datum_size;
 
@@ -256,8 +259,19 @@ impl StructArray {
         self.children.iter()
     }
 
+    /// Get the field array at the given index.
+    ///
+    /// Panics if the index is out of bounds.
     pub fn field_at(&self, index: usize) -> &ArrayRef {
         &self.children[index]
+    }
+
+    /// Get the field array at the given index.
+    ///
+    /// # Safety
+    /// The caller must ensure that the index is within bounds.
+    pub unsafe fn field_at_unchecked(&self, index: usize) -> &ArrayRef {
+        unsafe { self.children.get_unchecked(index) }
     }
 
     #[cfg(test)]
@@ -334,6 +348,41 @@ impl StructValue {
             .try_collect()
             .map(Self::new)
     }
+
+    /// Construct a struct from literal string.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use risingwave_common::types::{StructValue, StructType, DataType, ScalarImpl};
+    ///
+    /// let ty = StructType::unnamed(vec![DataType::Int32, DataType::Float64]);
+    /// let s = StructValue::from_str("(1, 2.0)", &ty).unwrap();
+    /// assert_eq!(s.fields()[0], Some(ScalarImpl::Int32(1)));
+    /// assert_eq!(s.fields()[1], Some(ScalarImpl::Float64(2.0.into())));
+    ///
+    /// let s = StructValue::from_str("(,)", &ty).unwrap();
+    /// assert_eq!(s.fields()[0], None);
+    /// assert_eq!(s.fields()[1], None);
+    /// ```
+    pub fn from_str(s: &str, ty: &StructType) -> Result<Self, BoxedError> {
+        // FIXME(runji): this is a trivial implementation which does not support nested struct.
+        if !s.starts_with('(') {
+            return Err("Missing left parenthesis".into());
+        }
+        if !s.ends_with(')') {
+            return Err("Missing right parenthesis".into());
+        }
+        let mut fields = Vec::with_capacity(s.len());
+        for (s, ty) in s[1..s.len() - 1].split(',').zip_eq_debug(ty.types()) {
+            let datum = match s.trim() {
+                "" => None,
+                s => Some(ScalarImpl::from_text(s, ty)?),
+            };
+            fields.push(datum);
+        }
+        Ok(StructValue::new(fields))
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -348,6 +397,31 @@ impl<'a> StructRef<'a> {
     /// Prefer using the macro `iter_fields_ref!` if possible to avoid the cost of enum dispatching.
     pub fn iter_fields_ref(self) -> impl ExactSizeIterator<Item = DatumRef<'a>> + 'a {
         iter_fields_ref!(self, it, { Either::Left(it) }, { Either::Right(it) })
+    }
+
+    /// Get the field at the given index.
+    ///
+    /// Panics if the index is out of bounds.
+    pub fn field_at(&self, i: usize) -> DatumRef<'a> {
+        match self {
+            StructRef::Indexed { arr, idx } => arr.field_at(i).value_at(*idx),
+            StructRef::ValueRef { val } => val.fields[i].to_datum_ref(),
+        }
+    }
+
+    /// Get the field at the given index.
+    ///
+    /// # Safety
+    /// The caller must ensure that the index is within bounds.
+    pub unsafe fn field_at_unchecked(&self, i: usize) -> DatumRef<'a> {
+        unsafe {
+            match self {
+                StructRef::Indexed { arr, idx } => {
+                    arr.field_at_unchecked(i).value_at_unchecked(*idx)
+                }
+                StructRef::ValueRef { val } => val.fields.get_unchecked(i).to_datum_ref(),
+            }
+        }
     }
 
     pub fn memcmp_serialize(
@@ -454,16 +528,45 @@ impl ToText for StructRef<'_> {
     }
 }
 
+/// A struct value can be treated as a row.
+impl Row for StructRef<'_> {
+    fn datum_at(&self, index: usize) -> DatumRef<'_> {
+        self.field_at(index)
+    }
+
+    unsafe fn datum_at_unchecked(&self, index: usize) -> DatumRef<'_> {
+        unsafe { self.field_at_unchecked(index) }
+    }
+
+    fn len(&self) -> usize {
+        self.iter_fields_ref().len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = DatumRef<'_>> {
+        self.iter_fields_ref()
+    }
+}
+
 /// Double quote a string if it contains any special characters.
-fn quote_if_need(input: &str, writer: &mut impl Write) -> std::fmt::Result {
+pub fn quote_if_need(input: &str, writer: &mut impl Write) -> std::fmt::Result {
+    // Note: for struct here, 'null' as a string is not quoted, but for list it's quoted:
+    // ```sql
+    // select row('a','a b','null'), array['a','a b','null'];
+    // ----
+    // (a,"a b",null) {a,"a b","null"}
+    // ```
     if !input.is_empty() // non-empty
-        && !input.contains([
-            '"', '\\', '(', ')', ',',
-            // PostgreSQL `array_isspace` includes '\x0B' but rust
-            // [`char::is_ascii_whitespace`] does not.
-            ' ', '\t', '\n', '\r', '\x0B', '\x0C',
-        ])
-    {
+    && !input.contains(
+        [
+    '"', '\\', ',',
+    // whilespace:
+    // PostgreSQL `array_isspace` includes '\x0B' but rust
+    // [`char::is_ascii_whitespace`] does not.
+    ' ', '\t', '\n', '\r', '\x0B', '\x0C',
+    // struct-specific:
+    '(',')'
+]
+    ) {
         return writer.write_str(input);
     }
 
@@ -607,19 +710,17 @@ mod tests {
         let fields = [
             DataType::Float32,
             DataType::Varchar,
-            DataType::new_struct(
-                vec![
-                    DataType::Float64,
-                    DataType::Varchar,
-                    DataType::Varchar,
-                    DataType::new_struct(vec![], vec![]),
-                ],
-                vec![],
-            ),
+            StructType::unnamed(vec![
+                DataType::Float64,
+                DataType::Varchar,
+                DataType::Varchar,
+                StructType::unnamed(vec![]).into(),
+            ])
+            .into(),
             DataType::Int64,
             DataType::Varchar,
             DataType::Int16,
-            DataType::new_struct(vec![], vec![]),
+            StructType::unnamed(vec![]).into(),
             DataType::Int32,
         ];
         let struct_ref = StructRef::ValueRef { val: &value };
@@ -691,7 +792,7 @@ mod tests {
                 ]),
                 vec![
                     DataType::Varchar,
-                    DataType::new_struct(vec![DataType::Varchar], vec![]),
+                    StructType::unnamed(vec![DataType::Varchar]).into(),
                 ],
                 Ordering::Greater,
             ),
@@ -706,7 +807,7 @@ mod tests {
                 ]),
                 vec![
                     DataType::Varchar,
-                    DataType::new_struct(vec![DataType::Varchar], vec![]),
+                    StructType::unnamed(vec![DataType::Varchar]).into(),
                 ],
                 Ordering::Equal,
             ),

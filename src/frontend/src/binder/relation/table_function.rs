@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,19 +16,14 @@ use std::str::FromStr;
 
 use itertools::Itertools;
 use risingwave_common::bail_not_implemented;
-use risingwave_common::catalog::{
-    Field, Schema, PG_CATALOG_SCHEMA_NAME, RW_INTERNAL_TABLE_FUNCTION_NAME,
-};
-use risingwave_common::error::ErrorCode;
+use risingwave_common::catalog::{Field, RW_INTERNAL_TABLE_FUNCTION_NAME, Schema};
 use risingwave_common::types::DataType;
-use risingwave_sqlparser::ast::{Function, FunctionArg, ObjectName, TableAlias};
+use risingwave_sqlparser::ast::{Function, FunctionArg, FunctionArgList, ObjectName, TableAlias};
 
 use super::watermark::is_watermark_func;
 use super::{Binder, Relation, Result, WindowTableFunctionKind};
 use crate::binder::bind_context::Clause;
-use crate::catalog::system_catalog::pg_catalog::{
-    PG_GET_KEYWORDS_FUNC_NAME, PG_KEYWORDS_TABLE_NAME,
-};
+use crate::error::ErrorCode;
 use crate::expr::{Expr, ExprImpl};
 
 impl Binder {
@@ -40,9 +35,9 @@ impl Binder {
     /// `with_ordinality` is only supported for the `TableFunction` case now.
     pub(super) fn bind_table_function(
         &mut self,
-        name: ObjectName,
-        alias: Option<TableAlias>,
-        args: Vec<FunctionArg>,
+        name: &ObjectName,
+        alias: Option<&TableAlias>,
+        args: &[FunctionArg],
         with_ordinality: bool,
     ) -> Result<Relation> {
         let func_name = &name.0[0].real_value();
@@ -56,24 +51,6 @@ impl Binder {
                     );
                 }
                 return self.bind_internal_table(args, alias);
-            }
-            if func_name.eq_ignore_ascii_case(PG_GET_KEYWORDS_FUNC_NAME)
-                || name.real_value().eq_ignore_ascii_case(
-                    format!("{}.{}", PG_CATALOG_SCHEMA_NAME, PG_GET_KEYWORDS_FUNC_NAME).as_str(),
-                )
-            {
-                if with_ordinality {
-                    bail_not_implemented!(
-                        "WITH ORDINALITY for internal/system table function {}",
-                        func_name
-                    );
-                }
-                return self.bind_relation_by_name_inner(
-                    Some(PG_CATALOG_SCHEMA_NAME),
-                    PG_KEYWORDS_TABLE_NAME,
-                    alias,
-                    false,
-                );
             }
         }
         // window table functions (tumble/hop)
@@ -93,7 +70,7 @@ impl Binder {
         if is_watermark_func(func_name) {
             if with_ordinality {
                 return Err(ErrorCode::InvalidInputSyntax(
-                    "WITH ORDINALITY for watermark".to_string(),
+                    "WITH ORDINALITY for watermark".to_owned(),
                 )
                 .into());
             }
@@ -105,12 +82,11 @@ impl Binder {
         self.push_context();
         let mut clause = Some(Clause::From);
         std::mem::swap(&mut self.context.clause, &mut clause);
-        let func = self.bind_function(Function {
-            name,
-            args,
+        let func = self.bind_function(&Function {
+            scalar_as_agg: false,
+            name: name.clone(),
+            arg_list: FunctionArgList::args_only(args.to_vec()),
             over: None,
-            distinct: false,
-            order_by: vec![],
             filter: None,
             within_group: None,
         });
@@ -118,18 +94,14 @@ impl Binder {
         self.pop_context()?;
         let func = func?;
 
-        if let ExprImpl::TableFunction(func) = &func {
-            if func
-                .args
-                .iter()
-                .any(|arg| matches!(arg, ExprImpl::Subquery(_)))
-            {
-                // Same error reports as DuckDB.
-                return Err(ErrorCode::InvalidInputSyntax(
-                    format!("Only table-in-out functions can have subquery parameters, {} only accepts constant parameters", func.name()),
+        if let ExprImpl::TableFunction(func) = &func
+            && func.args.iter().any(|arg| arg.has_subquery())
+        {
+            // Same error reports as DuckDB.
+            return Err(ErrorCode::InvalidInputSyntax(
+                    format!("Only table-in-out functions can have subquery parameters. The table function has subquery parameters is {}", func.name()),
                 )
                     .into());
-            }
         }
 
         // bool indicates if the field is hidden
@@ -146,7 +118,7 @@ impl Binder {
             // Note: named return value should take precedence over table alias.
             // But we don't support it yet.
             // e.g.,
-            // ```
+            // ```sql
             // > create function foo(ret out int) language sql as 'select 1';
             // > select t.ret from foo() as t;
             // ```

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,25 +14,22 @@
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_schema::{Field, Fields, Schema, SchemaRef};
-use cfg_or_panic::cfg_or_panic;
-use futures_util::stream;
-use risingwave_common::array::{ArrayError, DataChunk, I32Array};
+use anyhow::Context;
+use risingwave_common::array::I32Array;
+use risingwave_common::array::arrow::arrow_schema_udf::{Fields, Schema, SchemaRef};
+use risingwave_common::array::arrow::{UdfArrowConvert, UdfFromArrow, UdfToArrow};
 use risingwave_common::bail;
-use risingwave_udf::ArrowFlightUdfClient;
-use thiserror_ext::AsReport;
 
 use super::*;
+use crate::sig::{BuildOptions, UdfImpl, UdfKind};
 
 #[derive(Debug)]
 pub struct UserDefinedTableFunction {
     children: Vec<BoxedExpression>,
-    #[allow(dead_code)]
     arg_schema: SchemaRef,
     return_type: DataType,
-    client: Arc<ArrowFlightUdfClient>,
-    identifier: String,
+    runtime: Box<dyn UdfImpl>,
+    arrow_convert: UdfArrowConvert,
     #[allow(dead_code)]
     chunk_size: usize,
 }
@@ -43,13 +40,11 @@ impl TableFunction for UserDefinedTableFunction {
         self.return_type.clone()
     }
 
-    #[cfg_or_panic(not(madsim))]
     async fn eval<'a>(&'a self, input: &'a DataChunk) -> BoxStream<'a, Result<DataChunk>> {
         self.eval_inner(input)
     }
 }
 
-#[cfg(not(madsim))]
 impl UserDefinedTableFunction {
     #[try_stream(boxed, ok = DataChunk, error = ExprError)]
     async fn eval_inner<'a>(&'a self, input: &'a DataChunk) {
@@ -62,18 +57,16 @@ impl UserDefinedTableFunction {
         let direct_input = DataChunk::new(columns, input.visibility().clone());
 
         // compact the input chunk and record the row mapping
-        let visible_rows = direct_input.visibility().iter_ones().collect_vec();
-        let compacted_input = direct_input.compact_cow();
-        let arrow_input = RecordBatch::try_from(compacted_input.as_ref())?;
+        let visible_rows = direct_input.visibility().iter_ones().collect::<Vec<_>>();
+        // this will drop invisible rows
+        let arrow_input = self
+            .arrow_convert
+            .to_record_batch(self.arg_schema.clone(), &direct_input)?;
 
         // call UDTF
         #[for_await]
-        for res in self
-            .client
-            .call_stream(&self.identifier, stream::once(async { arrow_input }))
-            .await?
-        {
-            let output = DataChunk::try_from(&res?)?;
+        for res in self.runtime.call_table_function(&arrow_input).await? {
+            let output = self.arrow_convert.from_record_batch(&res?)?;
             self.check_output(&output)?;
 
             // we send the compacted input to UDF, so we need to map the row indices back to the
@@ -127,35 +120,53 @@ impl UserDefinedTableFunction {
     }
 }
 
-#[cfg_or_panic(not(madsim))]
 pub fn new_user_defined(prost: &PbTableFunction, chunk_size: usize) -> Result<BoxedTableFunction> {
-    let Some(udtf) = &prost.udtf else {
-        bail!("expect UDTF");
-    };
+    let udf = prost.get_udf()?;
 
+    let arg_types = udf.arg_types.iter().map(|t| t.into()).collect::<Vec<_>>();
+    let return_type = DataType::from(prost.get_return_type()?);
+
+    let language = udf.language.as_str();
+    let runtime = udf.runtime.as_deref();
+    let link = udf.link.as_deref();
+
+    let name_in_runtime = udf
+        .name_in_runtime()
+        .expect("SQL UDF won't get here, other UDFs must have `name_in_runtime`");
+
+    let build_fn = crate::sig::find_udf_impl(language, runtime, link)?.build_fn;
+    let runtime = build_fn(BuildOptions {
+        kind: UdfKind::Table,
+        body: udf.body.as_deref(),
+        compressed_binary: udf.compressed_binary.as_deref(),
+        link: udf.link.as_deref(),
+        name_in_runtime,
+        arg_names: &udf.arg_names,
+        arg_types: &arg_types,
+        return_type: &return_type,
+        always_retry_on_network_error: false,
+        language,
+        is_async: None,
+        is_batched: None,
+    })
+    .context("failed to build UDF runtime")?;
+
+    let arrow_convert = UdfArrowConvert {
+        legacy: runtime.is_legacy(),
+    };
     let arg_schema = Arc::new(Schema::new(
-        udtf.arg_types
+        arg_types
             .iter()
-            .map::<Result<_>, _>(|t| {
-                Ok(Field::new(
-                    "",
-                    DataType::from(t).try_into().map_err(|e: ArrayError| {
-                        risingwave_udf::Error::unsupported(e.to_report_string())
-                    })?,
-                    true,
-                ))
-            })
-            .try_collect::<_, Fields, _>()?,
+            .map(|t| arrow_convert.to_arrow_field("", t))
+            .try_collect::<Fields>()?,
     ));
-    // connect to UDF service
-    let client = crate::expr::expr_udf::get_or_create_client(&udtf.link)?;
 
     Ok(UserDefinedTableFunction {
         children: prost.args.iter().map(expr_build_from_prost).try_collect()?,
-        return_type: prost.return_type.as_ref().expect("no return type").into(),
+        return_type,
         arg_schema,
-        client,
-        identifier: udtf.identifier.clone(),
+        runtime,
+        arrow_convert,
         chunk_size,
     }
     .boxed())

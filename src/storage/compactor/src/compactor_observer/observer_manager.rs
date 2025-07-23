@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
+use risingwave_common::license::LicenseManager;
 use risingwave_common::system_param::local_manager::LocalSystemParamsManagerRef;
-use risingwave_common_service::observer_manager::{ObserverState, SubscribeCompactor};
+use risingwave_common_service::ObserverState;
 use risingwave_pb::catalog::Table;
-use risingwave_pb::meta::relation::RelationInfo;
-use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use risingwave_pb::meta::SubscribeResponse;
-use risingwave_storage::filter_key_extractor::{
-    FilterKeyExtractorImpl, FilterKeyExtractorManagerRef,
-};
+use risingwave_pb::meta::object::PbObjectInfo;
+use risingwave_pb::meta::subscribe_response::{Info, Operation};
+use risingwave_storage::compaction_catalog_manager::CompactionCatalogManagerRef;
 
 pub struct CompactorObserverNode {
-    filter_key_extractor_manager: FilterKeyExtractorManagerRef,
+    compaction_catalog_manager: CompactionCatalogManagerRef,
     system_params_manager: LocalSystemParamsManagerRef,
     version: u64,
 }
 
 impl ObserverState for CompactorObserverNode {
-    type SubscribeType = SubscribeCompactor;
+    fn subscribe_type() -> risingwave_pb::meta::SubscribeType {
+        risingwave_pb::meta::SubscribeType::Compactor
+    }
 
     fn handle_notification(&mut self, resp: SubscribeResponse) {
         let Some(info) = resp.info.as_ref() else {
@@ -40,28 +38,29 @@ impl ObserverState for CompactorObserverNode {
         };
 
         match info.to_owned() {
-            Info::RelationGroup(relation_group) => {
-                for relation in relation_group.relations {
-                    match relation.relation_info.unwrap() {
-                        RelationInfo::Table(table_catalog) => {
-                            assert!(
-                                resp.version > self.version,
-                                "resp version={:?}, current version={:?}",
-                                resp.version,
-                                self.version
-                            );
-
+            Info::ObjectGroup(object_group) => {
+                for object in object_group.objects {
+                    match object.object_info.unwrap() {
+                        PbObjectInfo::Table(table_catalog) => {
                             self.handle_catalog_notification(resp.operation(), table_catalog);
-
-                            self.version = resp.version;
                         }
                         _ => panic!("error type notification"),
                     };
                 }
+                assert!(
+                    resp.version > self.version,
+                    "resp version={:?}, current version={:?}",
+                    resp.version,
+                    self.version
+                );
+                self.version = resp.version;
             }
             Info::HummockVersionDeltas(_) => {}
             Info::SystemParams(p) => {
                 self.system_params_manager.try_set_params(p);
+            }
+            Info::ComputeNodeTotalCpuCount(count) => {
+                LicenseManager::get().update_cpu_core_count(count as _);
             }
             _ => {
                 panic!("error type notification");
@@ -76,41 +75,36 @@ impl ObserverState for CompactorObserverNode {
         self.handle_catalog_snapshot(snapshot.tables);
         let snapshot_version = snapshot.version.unwrap();
         self.version = snapshot_version.catalog_version;
+        LicenseManager::get().update_cpu_core_count(snapshot.compute_node_total_cpu_count as _);
     }
 }
 
 impl CompactorObserverNode {
     pub fn new(
-        filter_key_extractor_manager: FilterKeyExtractorManagerRef,
+        compaction_catalog_manager: CompactionCatalogManagerRef,
         system_params_manager: LocalSystemParamsManagerRef,
     ) -> Self {
         Self {
-            filter_key_extractor_manager,
+            compaction_catalog_manager,
             system_params_manager,
             version: 0,
         }
     }
 
     fn handle_catalog_snapshot(&mut self, tables: Vec<Table>) {
-        let all_filter_key_extractors: HashMap<u32, Arc<FilterKeyExtractorImpl>> = tables
-            .iter()
-            .map(|t| (t.id, Arc::new(FilterKeyExtractorImpl::from_table(t))))
-            .collect();
-        self.filter_key_extractor_manager
-            .sync(all_filter_key_extractors);
+        self.compaction_catalog_manager
+            .sync(tables.into_iter().map(|t| (t.id, t)).collect());
     }
 
     fn handle_catalog_notification(&mut self, operation: Operation, table_catalog: Table) {
         match operation {
             Operation::Add | Operation::Update => {
-                self.filter_key_extractor_manager.update(
-                    table_catalog.id,
-                    Arc::new(FilterKeyExtractorImpl::from_table(&table_catalog)),
-                );
+                self.compaction_catalog_manager
+                    .update(table_catalog.id, table_catalog);
             }
 
             Operation::Delete => {
-                self.filter_key_extractor_manager.remove(table_catalog.id);
+                self.compaction_catalog_manager.remove(table_catalog.id);
             }
 
             _ => panic!("receive an unsupported notify {:?}", operation),

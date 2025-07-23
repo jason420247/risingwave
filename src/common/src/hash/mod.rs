@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,15 @@ mod consistent_hash; // TODO: move this to a separate module
 mod dispatcher;
 mod key;
 mod key_v2;
+pub mod table_distribution;
 
 pub use consistent_hash::bitmap::*;
 pub use consistent_hash::mapping::*;
 pub use consistent_hash::vnode::*;
-pub use dispatcher::{calc_hash_key_kind, HashKeyDispatcher};
+pub use consistent_hash::vnode_count::*;
+pub use dispatcher::{HashKeyDispatcher, calc_hash_key_kind};
 pub use key::{
-    Crc32HashCode, HashCode, HashKeyDe, HashKeySer, HeapNullBitmap, NullBitmap,
-    PrecomputedBuildHasher, PrecomputedHasher, StackNullBitmap, XxHash64HashCode,
-    MAX_GROUP_KEYS_ON_STACK,
+    Crc32HashCode, HashCode, HashKeyDe, HashKeySer, HeapNullBitmap, MAX_GROUP_KEYS_ON_STACK,
+    NullBitmap, PrecomputedBuildHasher, PrecomputedHasher, StackNullBitmap, XxHash64HashCode,
 };
 pub use key_v2::*; // TODO: reconstruct codes

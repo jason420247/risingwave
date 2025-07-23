@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! This module contains imports that are used in the generated code for the `#[function]` macro.
+
 pub use async_trait::async_trait;
-pub use ctor::ctor;
 pub use futures_async_stream::try_stream;
 pub use futures_util::stream::BoxStream;
-pub use itertools::multizip;
+pub use linkme;
+pub use thiserror_ext::AsReport;

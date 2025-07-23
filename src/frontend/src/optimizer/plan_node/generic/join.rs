@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,13 +19,13 @@ use risingwave_common::util::sort_util::OrderType;
 use risingwave_pb::plan_common::JoinType;
 
 use super::{EqJoinPredicate, GenericPlanNode, GenericPlanRef};
+use crate::TableCatalog;
 use crate::expr::{ExprRewriter, ExprVisitor};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::stream;
 use crate::optimizer::plan_node::utils::TableCatalogBuilder;
 use crate::optimizer::property::FunctionalDependencySet;
 use crate::utils::{ColIndexMapping, ColIndexMappingRewriteExt, Condition};
-use crate::TableCatalog;
 
 /// [`Join`] combines two relations according to some condition.
 ///
@@ -46,13 +46,20 @@ pub(crate) fn has_repeated_element(slice: &[usize]) -> bool {
     (1..slice.len()).any(|i| slice[i..].contains(&slice[i - 1]))
 }
 
-impl<PlanRef> Join<PlanRef> {
+impl<PlanRef: GenericPlanRef> Join<PlanRef> {
     pub(crate) fn rewrite_exprs(&mut self, r: &mut dyn ExprRewriter) {
         self.on = self.on.clone().rewrite_expr(r);
     }
 
     pub(crate) fn visit_exprs(&self, v: &mut dyn ExprVisitor) {
         self.on.visit_expr(v);
+    }
+
+    pub fn eq_indexes(&self) -> Vec<(usize, usize)> {
+        let left_len = self.left.schema().len();
+        let right_len = self.right.schema().len();
+        let eq_predicate = EqJoinPredicate::create(left_len, right_len, self.on.clone());
+        eq_predicate.eq_indexes()
     }
 
     pub fn new(
@@ -107,8 +114,7 @@ impl<I: stream::StreamPlanRef> Join<I> {
         pk_indices.extend(deduped_input_pk_indices.clone());
 
         // Build internal table
-        let mut internal_table_catalog_builder =
-            TableCatalogBuilder::new(input.ctx().with_options().internal_table_subset());
+        let mut internal_table_catalog_builder = TableCatalogBuilder::default();
         let internal_columns_fields = schema.fields().to_vec();
 
         internal_columns_fields.iter().for_each(|field| {
@@ -119,8 +125,7 @@ impl<I: stream::StreamPlanRef> Join<I> {
         });
 
         // Build degree table.
-        let mut degree_table_catalog_builder =
-            TableCatalogBuilder::new(input.ctx().with_options().internal_table_subset());
+        let mut degree_table_catalog_builder = TableCatalogBuilder::default();
 
         let degree_column_field = Field::with_name(DataType::Int64, "_degree");
 
@@ -169,10 +174,7 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Join<PlanRef> {
     }
 
     fn stream_key(&self) -> Option<Vec<usize>> {
-        let left_len = self.left.schema().len();
-        let right_len = self.right.schema().len();
-        let eq_predicate = EqJoinPredicate::create(left_len, right_len, self.on.clone());
-
+        let eq_indexes = self.eq_indexes();
         let left_pk = self.left.stream_key()?;
         let right_pk = self.right.stream_key()?;
         let l2i = self.l2i_col_mapping();
@@ -197,7 +199,7 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Join<PlanRef> {
 
         let either_or_both = self.add_which_join_key_to_pk();
 
-        for (lk, rk) in eq_predicate.eq_indexes() {
+        for (lk, rk) in eq_indexes {
             match either_or_both {
                 EitherOrBoth::Left(_) => {
                     // Remove right-side join-key column it from pk_indices.
@@ -205,10 +207,10 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Join<PlanRef> {
                     // e.g. select a, b where a.bid = b.id
                     // Here the pk_indices should be [a.id, a.bid] instead of [a.id, b.id, a.bid],
                     // because b.id = a.bid, so either of them would be enough.
-                    if let Some(rk) = r2i.try_map(rk) {
-                        if let Some(out_k) = i2o.try_map(rk) {
-                            pk_indices.retain(|&x| x != out_k);
-                        }
+                    if let Some(rk) = r2i.try_map(rk)
+                        && let Some(out_k) = i2o.try_map(rk)
+                    {
+                        pk_indices.retain(|&x| x != out_k);
                     }
                     // Add left-side join-key column in pk_indices
                     if let Some(lk) = l2i.try_map(lk) {
@@ -221,10 +223,10 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Join<PlanRef> {
                 EitherOrBoth::Right(_) => {
                     // Remove left-side join-key column it from pk_indices
                     // See the example above
-                    if let Some(lk) = l2i.try_map(lk) {
-                        if let Some(out_k) = i2o.try_map(lk) {
-                            pk_indices.retain(|&x| x != out_k);
-                        }
+                    if let Some(lk) = l2i.try_map(lk)
+                        && let Some(out_k) = i2o.try_map(lk)
+                    {
+                        pk_indices.retain(|&x| x != out_k);
                     }
                     // Add right-side join-key column in pk_indices
                     if let Some(rk) = r2i.try_map(rk) {
@@ -275,7 +277,7 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Join<PlanRef> {
                 .rewrite_functional_dependency_set(right_fd_set)
         };
         let fd_set: FunctionalDependencySet = match self.join_type {
-            JoinType::Inner => {
+            JoinType::Inner | JoinType::AsofInner => {
                 let mut fd_set = FunctionalDependencySet::new(full_out_col_num);
                 for i in &self.on.conjunctions {
                     if let Some((col, _)) = i.as_eq_const() {
@@ -298,7 +300,7 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Join<PlanRef> {
                     .for_each(|fd| fd_set.add_functional_dependency(fd));
                 fd_set
             }
-            JoinType::LeftOuter => get_new_left_fd_set(left_fd_set),
+            JoinType::LeftOuter | JoinType::AsofLeftOuter => get_new_left_fd_set(left_fd_set),
             JoinType::RightOuter => get_new_right_fd_set(right_fd_set),
             JoinType::FullOuter => FunctionalDependencySet::new(full_out_col_num),
             JoinType::LeftSemi | JoinType::LeftAnti => left_fd_set,
@@ -323,9 +325,12 @@ impl<PlanRef> Join<PlanRef> {
 
     pub fn full_out_col_num(left_len: usize, right_len: usize, join_type: JoinType) -> usize {
         match join_type {
-            JoinType::Inner | JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter => {
-                left_len + right_len
-            }
+            JoinType::Inner
+            | JoinType::LeftOuter
+            | JoinType::RightOuter
+            | JoinType::FullOuter
+            | JoinType::AsofInner
+            | JoinType::AsofLeftOuter => left_len + right_len,
             JoinType::LeftSemi | JoinType::LeftAnti => left_len,
             JoinType::RightSemi | JoinType::RightAnti => right_len,
             JoinType::Unspecified => unreachable!(),
@@ -369,7 +374,12 @@ impl<PlanRef: GenericPlanRef> Join<PlanRef> {
         let right_len = self.right.schema().len();
 
         match self.join_type {
-            JoinType::Inner | JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter => {
+            JoinType::Inner
+            | JoinType::LeftOuter
+            | JoinType::RightOuter
+            | JoinType::FullOuter
+            | JoinType::AsofInner
+            | JoinType::AsofLeftOuter => {
                 ColIndexMapping::identity_or_none(left_len + right_len, left_len)
             }
 
@@ -387,7 +397,12 @@ impl<PlanRef: GenericPlanRef> Join<PlanRef> {
         let right_len = self.right.schema().len();
 
         match self.join_type {
-            JoinType::Inner | JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter => {
+            JoinType::Inner
+            | JoinType::LeftOuter
+            | JoinType::RightOuter
+            | JoinType::FullOuter
+            | JoinType::AsofInner
+            | JoinType::AsofLeftOuter => {
                 ColIndexMapping::with_shift_offset(left_len + right_len, -(left_len as isize))
             }
             JoinType::LeftSemi | JoinType::LeftAnti => ColIndexMapping::empty(left_len, right_len),
@@ -443,13 +458,16 @@ impl<PlanRef: GenericPlanRef> Join<PlanRef> {
 
     pub fn add_which_join_key_to_pk(&self) -> EitherOrBoth<(), ()> {
         match self.join_type {
-            JoinType::Inner => {
+            JoinType::Inner | JoinType::AsofInner => {
                 // Theoretically adding either side is ok, but the distribution key of the inner
                 // join derived based on the left side by default, so we choose the left side here
                 // to ensure the pk comprises the distribution key.
                 EitherOrBoth::Left(())
             }
-            JoinType::LeftOuter | JoinType::LeftSemi | JoinType::LeftAnti => EitherOrBoth::Left(()),
+            JoinType::LeftOuter
+            | JoinType::LeftSemi
+            | JoinType::LeftAnti
+            | JoinType::AsofLeftOuter => EitherOrBoth::Left(()),
             JoinType::RightSemi | JoinType::RightAnti | JoinType::RightOuter => {
                 EitherOrBoth::Right(())
             }
@@ -474,7 +492,6 @@ impl<PlanRef: GenericPlanRef> Join<PlanRef> {
 /// predicate.
 ///
 /// `InputRef`s in the right pushed condition are indexed by the right child's output schema.
-
 pub fn push_down_into_join(
     predicate: &mut Condition,
     left_col_num: usize,
@@ -500,7 +517,7 @@ pub fn push_down_into_join(
             // Do not push now on to the on, it will be pulled up into a filter instead.
             let on = Condition {
                 conjunctions: conjunctions
-                    .extract_if(|expr| expr.count_nows() == 0)
+                    .extract_if(.., |expr| expr.count_nows() == 0)
                     .collect(),
             };
             predicate.conjunctions = conjunctions;
@@ -516,7 +533,6 @@ pub fn push_down_into_join(
 /// pushed part will be removed from the original join predicate.
 ///
 /// `InputRef`s in the right pushed condition are indexed by the right child's output schema.
-
 pub fn push_down_join_condition(
     on_condition: &mut Condition,
     left_col_num: usize,
@@ -551,7 +567,7 @@ fn push_down_to_inputs(
         Condition { conjunctions }.split(left_col_num, right_col_num)
     } else {
         let temporal_filter_cons = conjunctions
-            .extract_if(|e| e.count_nows() != 0)
+            .extract_if(.., |e| e.count_nows() != 0)
             .collect_vec();
         let (left, right, mut others) =
             Condition { conjunctions }.split(left_col_num, right_col_num);
@@ -584,14 +600,23 @@ fn push_down_to_inputs(
 pub fn can_push_left_from_filter(ty: JoinType) -> bool {
     matches!(
         ty,
-        JoinType::Inner | JoinType::LeftOuter | JoinType::LeftSemi | JoinType::LeftAnti
+        JoinType::Inner
+            | JoinType::LeftOuter
+            | JoinType::LeftSemi
+            | JoinType::LeftAnti
+            | JoinType::AsofInner
+            | JoinType::AsofLeftOuter
     )
 }
 
 pub fn can_push_right_from_filter(ty: JoinType) -> bool {
     matches!(
         ty,
-        JoinType::Inner | JoinType::RightOuter | JoinType::RightSemi | JoinType::RightAnti
+        JoinType::Inner
+            | JoinType::RightOuter
+            | JoinType::RightSemi
+            | JoinType::RightAnti
+            | JoinType::AsofInner
     )
 }
 
@@ -605,13 +630,21 @@ pub fn can_push_on_from_filter(ty: JoinType) -> bool {
 pub fn can_push_left_from_on(ty: JoinType) -> bool {
     matches!(
         ty,
-        JoinType::Inner | JoinType::RightOuter | JoinType::LeftSemi
+        JoinType::Inner
+            | JoinType::RightOuter
+            | JoinType::LeftSemi
+            | JoinType::AsofInner
+            | JoinType::AsofLeftOuter
     )
 }
 
 pub fn can_push_right_from_on(ty: JoinType) -> bool {
     matches!(
         ty,
-        JoinType::Inner | JoinType::LeftOuter | JoinType::RightSemi
+        JoinType::Inner
+            | JoinType::LeftOuter
+            | JoinType::RightSemi
+            | JoinType::AsofInner
+            | JoinType::AsofLeftOuter
     )
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,6 @@ use crate::types::{Timestamp, Timestamptz};
 type Result<T> = std::result::Result<T, String>;
 
 pub const PARSE_ERROR_STR_TO_BYTEA: &str = "Invalid Bytea syntax";
-
-const ERROR_INT_TO_TIMESTAMP: &str = "Can't cast negative integer to timestamp";
 
 /// Parse a string into a bool.
 ///
@@ -60,15 +58,14 @@ pub fn str_to_bool(input: &str) -> Result<bool> {
 /// This would cause no problem for timestamp in [1973-03-03 09:46:40, 5138-11-16 09:46:40).
 #[inline]
 pub fn i64_to_timestamptz(t: i64) -> Result<Timestamptz> {
-    const E11: i64 = 100_000_000_000;
-    const E14: i64 = 100_000_000_000_000;
-    const E17: i64 = 100_000_000_000_000_000;
-    match t {
+    const E11: u64 = 100_000_000_000;
+    const E14: u64 = 100_000_000_000_000;
+    const E17: u64 = 100_000_000_000_000_000;
+    match t.abs_diff(0) {
         0..E11 => Ok(Timestamptz::from_secs(t).unwrap()), // s
         E11..E14 => Ok(Timestamptz::from_millis(t).unwrap()), // ms
         E14..E17 => Ok(Timestamptz::from_micros(t)),      // us
         E17.. => Ok(Timestamptz::from_micros(t / 1000)),  // ns
-        _ => Err(ERROR_INT_TO_TIMESTAMP.to_string()),
     }
 }
 
@@ -151,7 +148,7 @@ pub fn parse_bytes_hex(s: &str) -> Result<Vec<u8>> {
                 let v2 = get_hex(c)?;
                 res.push((v1 << 4) | v2);
             }
-            None => return Err("invalid hexadecimal data: odd number of digits".to_string()),
+            None => return Err("invalid hexadecimal data: odd number of digits".to_owned()),
         }
     }
 
@@ -177,12 +174,12 @@ pub fn parse_bytes_traditional(s: &str) -> Result<Vec<u8>> {
                     }
                     _ => {
                         // one backslash, not followed by another or ### valid octal
-                        return Err("invalid input syntax for type bytea".to_string());
+                        return Err("invalid input syntax for type bytea".to_owned());
                     }
                 },
                 _ => {
                     // one backslash, not followed by another or ### valid octal
-                    return Err("invalid input syntax for type bytea".to_string());
+                    return Err("invalid input syntax for type bytea".to_owned());
                 }
             }
         }
@@ -193,7 +190,18 @@ pub fn parse_bytes_traditional(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
+
     use super::*;
+
+    #[test]
+    fn test_negative_int_to_timestamptz() {
+        let x = i64_to_timestamptz(-2208988800000000000)
+            .unwrap()
+            .to_datetime_utc();
+        let ans: DateTime<Utc> = "1900-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(x, ans);
+    }
 
     #[test]
     fn test_bytea() {

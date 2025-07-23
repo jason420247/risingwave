@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,32 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::{pin_mut, StreamExt};
-use futures_async_stream::try_stream;
 use itertools::Itertools;
-use risingwave_common::array::RowRef;
-use risingwave_common::catalog::{ColumnDesc, Schema};
-use risingwave_common::estimate_size::VecWithKvSize;
-use risingwave_common::row::{OwnedRow, Row, RowExt};
+use risingwave_common::catalog::ColumnDesc;
+use risingwave_common::row::RowExt;
 use risingwave_common::util::epoch::EpochPair;
 use risingwave_common::util::iter_util::ZipEqDebug;
 use risingwave_common::util::sort_util::ColumnOrder;
+use risingwave_common_estimate_size::collections::EstimatedVec;
 use risingwave_hummock_sdk::HummockReadEpoch;
 use risingwave_storage::store::PrefetchOptions;
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
 use risingwave_storage::table::TableIter;
-use risingwave_storage::StateStore;
+use risingwave_storage::table::batch_table::BatchTable;
 
 use super::sides::{stream_lookup_arrange_prev_epoch, stream_lookup_arrange_this_epoch};
 use crate::cache::cache_may_stale;
 use crate::common::metrics::MetricsInfo;
-use crate::common::JoinStreamChunkBuilder;
-use crate::executor::error::{StreamExecutorError, StreamExecutorResult};
+use crate::executor::join::builder::JoinStreamChunkBuilder;
+use crate::executor::lookup::LookupExecutor;
 use crate::executor::lookup::cache::LookupCache;
 use crate::executor::lookup::sides::{ArrangeJoinSide, ArrangeMessage, StreamJoinSide};
-use crate::executor::lookup::LookupExecutor;
-use crate::executor::{ActorContextRef, Barrier, Executor, ExecutorInfo, Message};
-use crate::task::AtomicU64Ref;
+use crate::executor::monitor::LookupExecutorMetrics;
+use crate::executor::prelude::*;
 
 /// Parameters for [`LookupExecutor`].
 pub struct LookupExecutorParams<S: StateStore> {
@@ -46,11 +41,11 @@ pub struct LookupExecutorParams<S: StateStore> {
 
     /// The side for arrangement. Currently, it should be a
     /// `MaterializeExecutor`.
-    pub arrangement: Box<dyn Executor>,
+    pub arrangement: Executor,
 
     /// The side for stream. It can be any stream, but it will generally be a
     /// `MaterializeExecutor`.
-    pub stream: Box<dyn Executor>,
+    pub stream: Executor,
 
     /// Should be the same as [`ColumnDesc`] in the arrangement.
     ///
@@ -94,7 +89,7 @@ pub struct LookupExecutorParams<S: StateStore> {
     /// The join keys on the arrangement side.
     pub arrange_join_key_indices: Vec<usize>,
 
-    pub storage_table: StorageTable<S>,
+    pub batch_table: BatchTable<S>,
 
     pub watermark_epoch: AtomicU64Ref,
 
@@ -114,7 +109,7 @@ impl<S: StateStore> LookupExecutor<S> {
             stream_join_key_indices,
             arrange_join_key_indices,
             column_mapping,
-            storage_table,
+            batch_table: storage_table,
             watermark_epoch,
             chunk_size,
         } = params;
@@ -198,7 +193,6 @@ impl<S: StateStore> LookupExecutor<S> {
 
         Self {
             ctx,
-            info,
             chunk_data_types,
             last_barrier: None,
             stream_executor: Some(stream),
@@ -215,7 +209,7 @@ impl<S: StateStore> LookupExecutor<S> {
                 order_rules: arrangement_order_rules,
                 key_indices: arrange_join_key_indices,
                 use_current_epoch,
-                storage_table,
+                batch_table: storage_table,
             },
             column_mapping,
             key_indices_mapping,
@@ -244,6 +238,12 @@ impl<S: StateStore> LookupExecutor<S> {
             )
             .boxed()
         };
+
+        let metrics = self.ctx.streaming_metrics.new_lookup_executor_metrics(
+            self.arrangement.batch_table.table_id(),
+            self.ctx.id,
+            self.ctx.fragment_id,
+        );
 
         let (stream_to_output, arrange_to_output) = JoinStreamChunkBuilder::get_i2o_mapping(
             &self.column_mapping,
@@ -300,7 +300,11 @@ impl<S: StateStore> LookupExecutor<S> {
 
                     for (op, row) in ops.iter().zip_eq_debug(chunk.rows()) {
                         for matched_row in self
-                            .lookup_one_row(&row, self.last_barrier.as_ref().unwrap().epoch)
+                            .lookup_one_row(
+                                &row,
+                                self.last_barrier.as_ref().unwrap().epoch,
+                                &metrics,
+                            )
                             .await?
                         {
                             tracing::debug!(target: "events::stream::lookup::put", "{:?} {:?}", row, matched_row);
@@ -325,7 +329,7 @@ impl<S: StateStore> LookupExecutor<S> {
         if let Some(vnode_bitmap) = barrier.as_update_vnode_bitmap(self.ctx.id) {
             let previous_vnode_bitmap = self
                 .arrangement
-                .storage_table
+                .batch_table
                 .update_vnode_bitmap(vnode_bitmap.clone());
 
             // Manipulate the cache if necessary.
@@ -335,7 +339,6 @@ impl<S: StateStore> LookupExecutor<S> {
         }
 
         // Use the new stream barrier epoch as new cache epoch
-        self.lookup_cache.update_epoch(barrier.epoch.curr);
         self.last_barrier = Some(barrier.clone());
     }
 
@@ -344,40 +347,31 @@ impl<S: StateStore> LookupExecutor<S> {
         &mut self,
         stream_row: &RowRef<'_>,
         epoch_pair: EpochPair,
+        metrics: &LookupExecutorMetrics,
     ) -> StreamExecutorResult<Vec<OwnedRow>> {
         // stream_row is the row from stream side, we need to transform into the correct order of
         // the arrangement side.
         let lookup_row = stream_row
             .project(&self.key_indices_mapping)
             .into_owned_row();
-        let table_id_str = self.arrangement.storage_table.table_id().to_string();
-        let actor_id_str = self.ctx.id.to_string();
-        let fragment_id_str = self.ctx.fragment_id.to_string();
-        self.ctx
-            .streaming_metrics
-            .lookup_total_query_cache_count
-            .with_label_values(&[&table_id_str, &actor_id_str, &fragment_id_str])
-            .inc();
+
+        metrics.lookup_total_query_cache_count.inc();
         if let Some(result) = self.lookup_cache.lookup(&lookup_row) {
             return Ok(result.iter().cloned().collect_vec());
         }
 
         // cache miss
-        self.ctx
-            .streaming_metrics
-            .lookup_cache_miss_count
-            .with_label_values(&[&table_id_str, &actor_id_str, &fragment_id_str])
-            .inc();
+        metrics.lookup_cache_miss_count.inc();
 
         tracing::debug!(target: "events::stream::lookup::lookup_row", "{:?}", lookup_row);
 
-        let mut all_rows = VecWithKvSize::new();
+        let mut all_rows = EstimatedVec::new();
         // Drop the stream.
         {
             let all_data_iter = match self.arrangement.use_current_epoch {
                 true => {
                     self.arrangement
-                        .storage_table
+                        .batch_table
                         .batch_iter_with_pk_bounds(
                             HummockReadEpoch::NoWait(epoch_pair.curr),
                             &lookup_row,
@@ -389,7 +383,7 @@ impl<S: StateStore> LookupExecutor<S> {
                 }
                 false => {
                     self.arrangement
-                        .storage_table
+                        .batch_table
                         .batch_iter_with_pk_bounds(
                             HummockReadEpoch::NoWait(epoch_pair.prev),
                             &lookup_row,
@@ -412,10 +406,8 @@ impl<S: StateStore> LookupExecutor<S> {
 
         self.lookup_cache.batch_update(lookup_row, all_rows.clone());
 
-        self.ctx
-            .streaming_metrics
+        metrics
             .lookup_cached_entry_count
-            .with_label_values(&[&table_id_str, &actor_id_str, &fragment_id_str])
             .set(self.lookup_cache.len() as i64);
 
         Ok(all_rows.into_inner())

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ mod worker;
 
 use std::ops::Bound;
 
-use futures::stream::BoxStream;
 use futures::Stream;
+use futures::stream::BoxStream;
 #[cfg(test)]
 use futures_async_stream::try_stream;
 #[cfg(test)]
@@ -28,12 +28,12 @@ use risingwave_pb::meta::subscribe_response::{Info, Operation as RespOperation};
 pub use runner::*;
 pub(crate) use worker::*;
 
-use crate::error::Result;
 #[cfg(test)]
 use crate::TraceError;
+use crate::error::Result;
 use crate::{
     LocalStorageId, Record, TracedBytes, TracedInitOptions, TracedNewLocalOptions,
-    TracedReadOptions, TracedSealCurrentEpochOptions,
+    TracedReadOptions, TracedSealCurrentEpochOptions, TracedTryWaitEpochOptions,
 };
 
 pub type ReplayItem = (TracedBytes, TracedBytes);
@@ -61,12 +61,8 @@ pub(crate) enum WorkerId {
 pub trait LocalReplay: LocalReplayRead + ReplayWrite + Send + Sync {
     async fn init(&mut self, options: TracedInitOptions) -> Result<()>;
     fn seal_current_epoch(&mut self, next_epoch: u64, opts: TracedSealCurrentEpochOptions);
-    fn is_dirty(&self) -> bool;
-    fn epoch(&self) -> u64;
-    async fn flush(
-        &mut self,
-        delete_ranges: Vec<(Bound<TracedBytes>, Bound<TracedBytes>)>,
-    ) -> Result<usize>;
+    async fn try_flush(&mut self) -> Result<()>;
+    async fn flush(&mut self) -> Result<usize>;
 }
 pub trait GlobalReplay: ReplayRead + ReplayStateStore + Send + Sync {}
 
@@ -117,13 +113,14 @@ pub trait ReplayWrite {
 #[cfg_attr(test, automock)]
 #[async_trait::async_trait]
 pub trait ReplayStateStore {
-    async fn sync(&self, id: u64) -> Result<usize>;
-    fn seal_epoch(&self, epoch_id: u64, is_checkpoint: bool);
+    async fn sync(&self, sync_table_epochs: Vec<(u64, Vec<u32>)>) -> Result<usize>;
     async fn notify_hummock(&self, info: Info, op: RespOperation, version: u64) -> Result<u64>;
     async fn new_local(&self, opts: TracedNewLocalOptions) -> Box<dyn LocalReplay>;
-    async fn try_wait_epoch(&self, epoch: HummockReadEpoch) -> Result<()>;
-    async fn clear_shared_buffer(&self) -> Result<()>;
-    fn validate_read_epoch(&self, epoch: HummockReadEpoch) -> Result<()>;
+    async fn try_wait_epoch(
+        &self,
+        epoch: HummockReadEpoch,
+        options: TracedTryWaitEpochOptions,
+    ) -> Result<()>;
 }
 
 // define mock trait for replay interfaces
@@ -148,14 +145,11 @@ mock! {
     }
     #[async_trait::async_trait]
     impl ReplayStateStore for GlobalReplayInterface{
-        async fn sync(&self, id: u64) -> Result<usize>;
-        fn seal_epoch(&self, epoch_id: u64, is_checkpoint: bool);
+        async fn sync(&self, sync_table_epochs: Vec<(u64, Vec<u32>)>) -> Result<usize>;
         async fn notify_hummock(&self, info: Info, op: RespOperation, version: u64,
         ) -> Result<u64>;
         async fn new_local(&self, opts: TracedNewLocalOptions) -> Box<dyn LocalReplay>;
-        async fn try_wait_epoch(&self, epoch: HummockReadEpoch) -> Result<()>;
-        async fn clear_shared_buffer(&self) -> Result<()>;
-        fn validate_read_epoch(&self, epoch: HummockReadEpoch) -> Result<()>;
+        async fn try_wait_epoch(&self, epoch: HummockReadEpoch,options: TracedTryWaitEpochOptions) -> Result<()>;
     }
     impl GlobalReplay for GlobalReplayInterface{}
 }
@@ -186,9 +180,8 @@ mock! {
     impl LocalReplay for LocalReplayInterface{
         async fn init(&mut self, options: TracedInitOptions) -> Result<()>;
         fn seal_current_epoch(&mut self, next_epoch: u64, opts: TracedSealCurrentEpochOptions);
-        fn is_dirty(&self) -> bool;
-        fn epoch(&self) -> u64;
-        async fn flush(&mut self, delete_ranges: Vec<(Bound<TracedBytes>, Bound<TracedBytes>)>) -> Result<usize>;
+        async fn flush(&mut self) -> Result<usize>;
+        async fn try_flush(&mut self) -> Result<()>;
     }
 }
 

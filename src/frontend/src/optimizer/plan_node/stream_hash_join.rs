@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,28 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
-use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_common::session_config::join_encoding_type::JoinEncodingType;
+use risingwave_common::util::functional::SameOrElseExt;
 use risingwave_pb::plan_common::JoinType;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_pb::stream_plan::{DeltaExpression, HashJoinNode, PbInequalityPair};
 
-use super::generic::{GenericPlanRef, Join};
+use super::generic::{GenericPlanNode, Join};
 use super::stream::prelude::*;
-use super::stream::StreamPlanRef;
-use super::utils::{childless_record, plan_node_name, watermark_pretty, Distill};
+use super::stream_join_common::StreamJoinCommon;
+use super::utils::{Distill, childless_record, plan_node_name, watermark_pretty};
 use super::{
-    generic, ExprRewritable, PlanBase, PlanRef, PlanTreeNodeBinary, StreamDeltaJoin, StreamNode,
+    ExprRewritable, PlanBase, PlanRef, PlanTreeNodeBinary, StreamDeltaJoin, StreamNode, generic,
 };
 use crate::expr::{Expr, ExprDisplay, ExprRewriter, ExprVisitor, InequalityInputPair};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::utils::IndicesDisplay;
 use crate::optimizer::plan_node::{EqJoinPredicate, EqJoinPredicateDisplay};
-use crate::optimizer::property::Distribution;
+use crate::optimizer::property::{MonotonicityMap, WatermarkColumns};
 use crate::stream_fragmenter::BuildFragmentGraphState;
-use crate::utils::ColIndexMappingRewriteExt;
 
 /// [`StreamHashJoin`] implements [`super::LogicalJoin`] with hash table. It builds a hash table
 /// from inner (right-side) relation and probes with data from outer (left-side) relation to
@@ -63,17 +62,26 @@ pub struct StreamHashJoin {
     /// `HashJoinExecutor`. If any equal condition is able to clean state table, this field
     /// will always be `None`.
     clean_right_state_conjunction_idx: Option<usize>,
+
+    /// Determine which encoding will be used to encode join rows in operator cache.
+    join_encoding_type: JoinEncodingType,
 }
 
 impl StreamHashJoin {
     pub fn new(core: generic::Join<PlanRef>, eq_join_predicate: EqJoinPredicate) -> Self {
+        let ctx = core.ctx();
+
         // Inner join won't change the append-only behavior of the stream. The rest might.
         let append_only = match core.join_type {
             JoinType::Inner => core.left.append_only() && core.right.append_only(),
             _ => false,
         };
 
-        let dist = Self::derive_dist(core.left.distribution(), core.right.distribution(), &core);
+        let dist = StreamJoinCommon::derive_dist(
+            core.left.distribution(),
+            core.right.distribution(),
+            &core,
+        );
 
         let mut inequality_pairs = vec![];
         let mut clean_left_state_conjunction_idx = None;
@@ -95,17 +103,25 @@ impl StreamHashJoin {
             let r2i = core.r2i_col_mapping();
 
             let mut equal_condition_clean_state = false;
-            let mut watermark_columns = FixedBitSet::with_capacity(core.internal_column_num());
+            let mut watermark_columns = WatermarkColumns::new();
             for (left_key, right_key) in eq_join_predicate.eq_indexes() {
-                if core.left.watermark_columns().contains(left_key)
-                    && core.right.watermark_columns().contains(right_key)
+                if let Some(l_wtmk_group) = core.left.watermark_columns().get_group(left_key)
+                    && let Some(r_wtmk_group) = core.right.watermark_columns().get_group(right_key)
                 {
                     equal_condition_clean_state = true;
                     if let Some(internal) = l2i.try_map(left_key) {
-                        watermark_columns.insert(internal);
+                        watermark_columns.insert(
+                            internal,
+                            l_wtmk_group
+                                .same_or_else(r_wtmk_group, || ctx.next_watermark_group_id()),
+                        );
                     }
                     if let Some(internal) = r2i.try_map(right_key) {
-                        watermark_columns.insert(internal);
+                        watermark_columns.insert(
+                            internal,
+                            l_wtmk_group
+                                .same_or_else(r_wtmk_group, || ctx.next_watermark_group_id()),
+                        );
                     }
                 }
             }
@@ -168,13 +184,13 @@ impl StreamHashJoin {
                 if let Some(internal) = internal_col1
                     && !watermark_columns.contains(internal)
                 {
-                    watermark_columns.insert(internal);
+                    watermark_columns.insert(internal, ctx.next_watermark_group_id());
                     is_valuable_inequality = true;
                 }
                 if let Some(internal) = internal_col2
                     && !watermark_columns.contains(internal)
                 {
-                    watermark_columns.insert(internal);
+                    watermark_columns.insert(internal, ctx.next_watermark_group_id());
                 }
                 if is_valuable_inequality {
                     inequality_pairs.push((
@@ -187,7 +203,7 @@ impl StreamHashJoin {
                     ));
                 }
             }
-            core.i2o_col_mapping().rewrite_bitset(&watermark_columns)
+            watermark_columns.map_clone(&core.i2o_col_mapping())
         };
 
         // TODO: derive from input
@@ -197,6 +213,7 @@ impl StreamHashJoin {
             append_only,
             false, // TODO(rc): derive EOWC property from input
             watermark_columns,
+            MonotonicityMap::new(), // TODO: derive monotonicity
         );
 
         Self {
@@ -207,6 +224,7 @@ impl StreamHashJoin {
             is_append_only: append_only,
             clean_left_state_conjunction_idx,
             clean_right_state_conjunction_idx,
+            join_encoding_type: ctx.session_ctx().config().streaming_join_encoding(),
         }
     }
 
@@ -215,46 +233,9 @@ impl StreamHashJoin {
         self.core.join_type
     }
 
-    /// Get a reference to the batch hash join's eq join predicate.
+    /// Get a reference to the hash join's eq join predicate.
     pub fn eq_join_predicate(&self) -> &EqJoinPredicate {
         &self.eq_join_predicate
-    }
-
-    pub(super) fn derive_dist(
-        left: &Distribution,
-        right: &Distribution,
-        logical: &generic::Join<PlanRef>,
-    ) -> Distribution {
-        match (left, right) {
-            (Distribution::Single, Distribution::Single) => Distribution::Single,
-            (Distribution::HashShard(_), Distribution::HashShard(_)) => {
-                // we can not derive the hash distribution from the side where outer join can
-                // generate a NULL row
-                match logical.join_type {
-                    JoinType::Unspecified => unreachable!(),
-                    JoinType::FullOuter => Distribution::SomeShard,
-                    JoinType::Inner
-                    | JoinType::LeftOuter
-                    | JoinType::LeftSemi
-                    | JoinType::LeftAnti => {
-                        let l2o = logical
-                            .l2i_col_mapping()
-                            .composite(&logical.i2o_col_mapping());
-                        l2o.rewrite_provided_distribution(left)
-                    }
-                    JoinType::RightSemi | JoinType::RightAnti | JoinType::RightOuter => {
-                        let r2o = logical
-                            .r2i_col_mapping()
-                            .composite(&logical.i2o_col_mapping());
-                        r2o.rewrite_provided_distribution(right)
-                    }
-                }
-            }
-            (_, _) => unreachable!(
-                "suspicious distribution: left: {:?}, right: {:?}",
-                left, right
-            ),
-        }
     }
 
     /// Convert this hash join to a delta join plan
@@ -265,24 +246,12 @@ impl StreamHashJoin {
     pub fn derive_dist_key_in_join_key(&self) -> Vec<usize> {
         let left_dk_indices = self.left().distribution().dist_column_indices().to_vec();
         let right_dk_indices = self.right().distribution().dist_column_indices().to_vec();
-        let left_jk_indices = self.eq_join_predicate.left_eq_indexes();
-        let right_jk_indices = self.eq_join_predicate.right_eq_indexes();
 
-        assert_eq!(left_jk_indices.len(), right_jk_indices.len());
-
-        let mut dk_indices_in_jk = vec![];
-
-        for (l_dk_idx, r_dk_idx) in left_dk_indices.iter().zip_eq_fast(right_dk_indices.iter()) {
-            for dk_idx_in_jk in left_jk_indices.iter().positions(|idx| idx == l_dk_idx) {
-                if right_jk_indices[dk_idx_in_jk] == *r_dk_idx {
-                    dk_indices_in_jk.push(dk_idx_in_jk);
-                    break;
-                }
-            }
-        }
-
-        assert_eq!(dk_indices_in_jk.len(), left_dk_indices.len());
-        dk_indices_in_jk
+        StreamJoinCommon::get_dist_key_in_join_key(
+            &left_dk_indices,
+            &right_dk_indices,
+            self.eq_join_predicate(),
+        )
     }
 
     pub fn inequality_pairs(&self) -> &Vec<(bool, InequalityInputPair)> {
@@ -404,7 +373,7 @@ impl StreamNode for StreamHashJoin {
 
         let null_safe_prost = self.eq_join_predicate.null_safes().into_iter().collect();
 
-        NodeBody::HashJoin(HashJoinNode {
+        NodeBody::HashJoin(Box::new(HashJoinNode {
             join_type: self.core.join_type as i32,
             left_key: left_jk_indices_prost,
             right_key: right_jk_indices_prost,
@@ -448,7 +417,8 @@ impl StreamNode for StreamHashJoin {
             right_deduped_input_pk_indices,
             output_indices: self.core.output_indices.iter().map(|&x| x as u32).collect(),
             is_append_only: self.is_append_only,
-        })
+            join_encoding_type: self.join_encoding_type as i32,
+        }))
     }
 }
 

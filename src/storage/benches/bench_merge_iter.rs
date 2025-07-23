@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,19 +14,21 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::executor::block_on;
 use risingwave_hummock_sdk::key::TableKey;
+use risingwave_storage::compaction_catalog_manager::CompactionCatalogAgent;
 use risingwave_storage::hummock::iterator::{
-    Forward, HummockIterator, HummockIteratorUnion, OrderedMergeIteratorInner,
-    SkipWatermarkIterator, UnorderedMergeIteratorInner,
+    Forward, HummockIterator, HummockIteratorUnion, MergeIterator,
+    NonPkPrefixSkipWatermarkIterator, NonPkPrefixSkipWatermarkState, PkPrefixSkipWatermarkIterator,
+    PkPrefixSkipWatermarkState,
 };
 use risingwave_storage::hummock::shared_buffer::shared_buffer_batch::{
-    SharedBufferBatch, SharedBufferBatchIterator,
+    SharedBufferBatch, SharedBufferBatchIterator, SharedBufferValue,
 };
-use risingwave_storage::hummock::value::HummockValue;
 
 fn gen_interleave_shared_buffer_batch_iter(
     batch_size: usize,
@@ -40,7 +42,7 @@ fn gen_interleave_shared_buffer_batch_iter(
                 TableKey(Bytes::copy_from_slice(
                     format!("test_key_{:08}", j * batch_count + i).as_bytes(),
                 )),
-                HummockValue::put(Bytes::copy_from_slice("value".as_bytes())),
+                SharedBufferValue::Insert(Bytes::copy_from_slice("value".as_bytes())),
             ));
         }
         let batch = SharedBufferBatch::for_test(batch_data, 2333, Default::default());
@@ -70,7 +72,7 @@ fn gen_interleave_shared_buffer_batch_enum_iter(
                 TableKey(Bytes::copy_from_slice(
                     format!("test_key_{:08}", j * batch_count + i).as_bytes(),
                 )),
-                HummockValue::put(Bytes::copy_from_slice("value".as_bytes())),
+                SharedBufferValue::Insert(Bytes::copy_from_slice("value".as_bytes())),
             ));
         }
         let batch = SharedBufferBatch::for_test(batch_data, 2333, Default::default());
@@ -97,23 +99,9 @@ fn run_iter<I: HummockIterator<Direction = Forward>>(iter_ref: &RefCell<I>, tota
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let ordered_merge_iter = RefCell::new(OrderedMergeIteratorInner::new(
-        gen_interleave_shared_buffer_batch_iter(10000, 100),
-    ));
-
-    c.bench_with_input(
-        BenchmarkId::new("bench-merge-iter", "ordered"),
-        &ordered_merge_iter,
-        |b, iter_ref| {
-            b.iter(|| {
-                run_iter(iter_ref, 100 * 10000);
-            });
-        },
-    );
-
-    let merge_iter = RefCell::new(UnorderedMergeIteratorInner::new(
-        gen_interleave_shared_buffer_batch_iter(10000, 100),
-    ));
+    let merge_iter = RefCell::new(MergeIterator::new(gen_interleave_shared_buffer_batch_iter(
+        10000, 100,
+    )));
     c.bench_with_input(
         BenchmarkId::new("bench-merge-iter", "unordered"),
         &merge_iter,
@@ -124,10 +112,22 @@ fn criterion_benchmark(c: &mut Criterion) {
         },
     );
 
-    let merge_iter = RefCell::new(SkipWatermarkIterator::new(
-        UnorderedMergeIteratorInner::new(gen_interleave_shared_buffer_batch_iter(10000, 100)),
-        BTreeMap::new(),
-    ));
+    let combine_iter = {
+        let iter = PkPrefixSkipWatermarkIterator::new(
+            MergeIterator::new(gen_interleave_shared_buffer_batch_iter(10000, 100)),
+            PkPrefixSkipWatermarkState::new(BTreeMap::new()),
+        );
+
+        NonPkPrefixSkipWatermarkIterator::new(
+            iter,
+            NonPkPrefixSkipWatermarkState::new(
+                BTreeMap::new(),
+                Arc::new(CompactionCatalogAgent::dummy()),
+            ),
+        )
+    };
+
+    let merge_iter = RefCell::new(combine_iter);
     c.bench_with_input(
         BenchmarkId::new("bench-merge-iter-skip-empty-watermark", "unordered"),
         &merge_iter,
@@ -138,26 +138,12 @@ fn criterion_benchmark(c: &mut Criterion) {
         },
     );
 
-    let merge_iter = RefCell::new(UnorderedMergeIteratorInner::new(
+    let merge_iter = RefCell::new(MergeIterator::new(
         gen_interleave_shared_buffer_batch_enum_iter(10000, 100),
     ));
     c.bench_with_input(
         BenchmarkId::new("bench-enum-merge-iter", "unordered"),
         &merge_iter,
-        |b, iter_ref| {
-            b.iter(|| {
-                run_iter(iter_ref, 100 * 10000);
-            });
-        },
-    );
-
-    let ordered_merge_iter = RefCell::new(OrderedMergeIteratorInner::new(
-        gen_interleave_shared_buffer_batch_enum_iter(10000, 100),
-    ));
-
-    c.bench_with_input(
-        BenchmarkId::new("bench-enum-merge-iter", "ordered"),
-        &ordered_merge_iter,
         |b, iter_ref| {
             b.iter(|| {
                 run_iter(iter_ref, 100 * 10000);

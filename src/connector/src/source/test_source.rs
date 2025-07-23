@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::anyhow;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use risingwave_common::bail;
 use risingwave_common::types::JsonbVal;
 use serde_derive::{Deserialize, Serialize};
 use with_options::WithOptions;
 
+use crate::enforce_secret::EnforceSecret;
+use crate::error::ConnectorResult;
 use crate::parser::ParserConfig;
 use crate::source::{
-    BoxSourceWithStateStream, Column, SourceContextRef, SourceEnumeratorContextRef,
-    SourceProperties, SplitEnumerator, SplitId, SplitMetaData, SplitReader, TryFromHashmap,
+    BoxSourceChunkStream, Column, SourceContextRef, SourceEnumeratorContextRef, SourceProperties,
+    SplitEnumerator, SplitId, SplitMetaData, SplitReader, TryFromBTreeMap,
 };
 
 pub type BoxListSplits = Box<
     dyn FnMut(
             TestSourceProperties,
             SourceEnumeratorContextRef,
-        ) -> anyhow::Result<Vec<TestSourceSplit>>
+        ) -> ConnectorResult<Vec<TestSourceSplit>>
         + Send
         + 'static,
 >;
@@ -44,7 +46,7 @@ pub type BoxIntoSourceStream = Box<
             ParserConfig,
             SourceContextRef,
             Option<Vec<Column>>,
-        ) -> BoxSourceWithStateStream
+        ) -> BoxSourceChunkStream
         + Send
         + 'static,
 >;
@@ -57,20 +59,20 @@ pub struct BoxSource {
 impl BoxSource {
     pub fn new(
         list_splits: impl FnMut(
-                TestSourceProperties,
-                SourceEnumeratorContextRef,
-            ) -> anyhow::Result<Vec<TestSourceSplit>>
-            + Send
-            + 'static,
+            TestSourceProperties,
+            SourceEnumeratorContextRef,
+        ) -> ConnectorResult<Vec<TestSourceSplit>>
+        + Send
+        + 'static,
         into_source_stream: impl FnMut(
-                TestSourceProperties,
-                Vec<TestSourceSplit>,
-                ParserConfig,
-                SourceContextRef,
-                Option<Vec<Column>>,
-            ) -> BoxSourceWithStateStream
-            + Send
-            + 'static,
+            TestSourceProperties,
+            Vec<TestSourceSplit>,
+            ParserConfig,
+            SourceContextRef,
+            Option<Vec<Column>>,
+        ) -> BoxSourceChunkStream
+        + Send
+        + 'static,
     ) -> BoxSource {
         BoxSource {
             list_split: Box::new(list_splits),
@@ -104,12 +106,14 @@ impl Drop for TestSourceRegistryGuard {
     }
 }
 
-pub fn registry_test_source(box_source: BoxSource) -> TestSourceRegistryGuard {
-    assert!(get_registry()
-        .box_source
-        .lock()
-        .replace(box_source)
-        .is_none());
+pub fn register_test_source(box_source: BoxSource) -> TestSourceRegistryGuard {
+    assert!(
+        get_registry()
+            .box_source
+            .lock()
+            .replace(box_source)
+            .is_none()
+    );
     TestSourceRegistryGuard
 }
 
@@ -117,18 +121,20 @@ pub const TEST_CONNECTOR: &str = "test";
 
 #[derive(Clone, Debug, Default, WithOptions)]
 pub struct TestSourceProperties {
-    properties: HashMap<String, String>,
+    properties: BTreeMap<String, String>,
 }
 
-impl TryFromHashmap for TestSourceProperties {
-    fn try_from_hashmap(
-        props: HashMap<String, String>,
+impl EnforceSecret for TestSourceProperties {}
+
+impl TryFromBTreeMap for TestSourceProperties {
+    fn try_from_btreemap(
+        props: BTreeMap<String, String>,
         _deny_unknown_fields: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> ConnectorResult<Self> {
         if cfg!(any(madsim, test)) {
             Ok(TestSourceProperties { properties: props })
         } else {
-            Err(anyhow!("test source only available at test"))
+            bail!("test source only available at test")
         }
     }
 }
@@ -149,12 +155,12 @@ impl SplitMetaData for TestSourceSplit {
         serde_json::to_value(self.clone()).unwrap().into()
     }
 
-    fn restore_from_json(value: JsonbVal) -> anyhow::Result<Self> {
-        serde_json::from_value(value.take()).map_err(|e| anyhow!(e))
+    fn restore_from_json(value: JsonbVal) -> ConnectorResult<Self> {
+        serde_json::from_value(value.take()).map_err(Into::into)
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> anyhow::Result<()> {
-        self.offset = start_offset;
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        self.offset = last_seen_offset;
         Ok(())
     }
 }
@@ -172,14 +178,14 @@ impl SplitEnumerator for TestSourceSplitEnumerator {
     async fn new(
         properties: Self::Properties,
         context: SourceEnumeratorContextRef,
-    ) -> anyhow::Result<Self> {
+    ) -> ConnectorResult<Self> {
         Ok(Self {
             properties,
             context,
         })
     }
 
-    async fn list_splits(&mut self) -> anyhow::Result<Vec<Self::Split>> {
+    async fn list_splits(&mut self) -> ConnectorResult<Vec<Self::Split>> {
         (get_registry()
             .box_source
             .lock()
@@ -208,7 +214,7 @@ impl SplitReader for TestSourceSplitReader {
         parser_config: ParserConfig,
         source_ctx: SourceContextRef,
         columns: Option<Vec<Column>>,
-    ) -> anyhow::Result<Self> {
+    ) -> ConnectorResult<Self> {
         Ok(Self {
             properties,
             state,
@@ -218,7 +224,7 @@ impl SplitReader for TestSourceSplitReader {
         })
     }
 
-    fn into_stream(self) -> BoxSourceWithStateStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         (get_registry()
             .box_source
             .lock()

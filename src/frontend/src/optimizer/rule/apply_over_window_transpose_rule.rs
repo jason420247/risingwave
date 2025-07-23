@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ use risingwave_pb::plan_common::JoinType;
 
 use super::{BoxedRule, Rule};
 use crate::expr::InputRef;
-use crate::optimizer::plan_node::{LogicalApply, LogicalFilter, LogicalOverWindow};
 use crate::optimizer::PlanRef;
+use crate::optimizer::plan_node::{LogicalApply, LogicalFilter, LogicalOverWindow};
 use crate::utils::Condition;
 
 /// Transpose `LogicalApply` and `LogicalOverWindow`.
@@ -58,7 +58,7 @@ impl Rule for ApplyOverWindowTransposeRule {
         let apply_left_len = left.schema().len();
         let apply_left_schema = left.schema().clone();
 
-        let new_apply = LogicalApply::new(
+        let new_apply = LogicalApply::create(
             left,
             window_input,
             JoinType::Inner,
@@ -66,8 +66,7 @@ impl Rule for ApplyOverWindowTransposeRule {
             correlated_id,
             correlated_indices,
             false,
-        )
-        .into();
+        );
 
         let new_over_window = {
             // Shift index of window functions' `InputRef` with `apply_left_len`.

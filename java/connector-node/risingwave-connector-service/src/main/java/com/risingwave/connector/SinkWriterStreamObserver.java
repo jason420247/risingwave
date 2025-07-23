@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -187,7 +187,7 @@ public class SinkWriterStreamObserver
 
     @Override
     public void onCompleted() {
-        LOG.info("sink writer completed");
+        LOG.debug("sink writer completed");
         cleanup();
         responseObserver.onCompleted();
     }
@@ -206,19 +206,7 @@ public class SinkWriterStreamObserver
         String connectorName = getConnectorName(sinkParam);
         SinkFactory sinkFactory = SinkUtils.getSinkFactory(connectorName);
         sink = sinkFactory.createWriter(tableSchema, sinkParam.getPropertiesMap());
-        switch (startSink.getFormat()) {
-            case FORMAT_UNSPECIFIED:
-            case UNRECOGNIZED:
-                throw INVALID_ARGUMENT
-                        .withDescription("should specify payload format in request")
-                        .asRuntimeException();
-            case JSON:
-                deserializer = new JsonDeserializer(tableSchema);
-                break;
-            case STREAM_CHUNK:
-                deserializer = new StreamChunkDeserializer(tableSchema);
-                break;
-        }
+        deserializer = new StreamChunkDeserializer(tableSchema);
         this.connectorName = connectorName.toUpperCase();
         ConnectorNodeMetrics.incActiveSinkConnections(connectorName, "node1");
     }

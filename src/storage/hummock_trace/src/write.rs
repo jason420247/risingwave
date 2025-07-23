@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ use bincode::{config, encode_into_std_write};
 use mockall::{automock, mock};
 
 use super::record::Record;
-use crate::error::Result;
 use crate::TraceError;
+use crate::error::Result;
 
 pub(crate) type MagicBytes = u32;
 pub(crate) static MAGIC_BYTES: MagicBytes = 0x484D5452; // HMTR
@@ -30,13 +30,6 @@ pub(crate) static MAGIC_BYTES: MagicBytes = 0x484D5452; // HMTR
 pub(crate) trait TraceWriter {
     fn write(&mut self, record: Record) -> Result<usize>;
     fn flush(&mut self) -> Result<()>;
-    fn write_all(&mut self, records: Vec<Record>) -> Result<usize> {
-        let mut total_size = 0;
-        for r in records {
-            total_size += self.write(r)?
-        }
-        Ok(total_size)
-    }
 }
 
 /// Serializer serializes a record to std write.
@@ -110,7 +103,7 @@ impl<W: Write, S: Serializer<W>> Drop for TraceWriterImpl<W, S> {
 mod test {
     use std::io::Cursor;
 
-    use bincode::{config, decode_from_slice, encode_to_vec};
+    use bincode::{decode_from_slice, encode_to_vec};
     use byteorder::{BigEndian, ReadBytesExt};
     use bytes::Bytes;
 

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,18 +13,19 @@
 // limitations under the License.
 
 use std::cmp;
+use std::fmt::Debug;
 use std::ops::Range;
 
 use itertools::Itertools;
-use risingwave_hummock_sdk::key_range::KeyRangeCommon;
 use risingwave_hummock_sdk::KeyComparator;
-use risingwave_pb::hummock::{KeyRange, SstableInfo};
+use risingwave_hummock_sdk::key_range::{KeyRange, KeyRangeCommon};
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 
-pub trait OverlapInfo {
+pub trait OverlapInfo: Debug {
     fn check_overlap(&self, a: &SstableInfo) -> bool;
     fn check_multiple_overlap(&self, others: &[SstableInfo]) -> Range<usize>;
     fn check_multiple_include(&self, others: &[SstableInfo]) -> Range<usize>;
-    fn update(&mut self, table: &SstableInfo);
+    fn update(&mut self, range: &KeyRange);
 }
 
 pub trait OverlapStrategy: Send + Sync {
@@ -36,7 +37,7 @@ pub trait OverlapStrategy: Send + Sync {
     ) -> Vec<SstableInfo> {
         let mut info = self.create_overlap_info();
         for table in tables {
-            info.update(table);
+            info.update(&table.key_range);
         }
         let range = info.check_multiple_overlap(others);
         if range.is_empty() {
@@ -45,18 +46,16 @@ pub trait OverlapStrategy: Send + Sync {
             others[range].to_vec()
         }
     }
-    fn check_overlap_with_tables(
+    fn check_overlap_with_range(
         &self,
-        tables: &[SstableInfo],
+        range: &KeyRange,
         others: &[SstableInfo],
     ) -> Vec<SstableInfo> {
-        if tables.is_empty() || others.is_empty() {
+        if others.is_empty() {
             return vec![];
         }
         let mut info = self.create_overlap_info();
-        for table in tables {
-            info.update(table);
-        }
+        info.update(range);
         others
             .iter()
             .filter(|table| info.check_overlap(table))
@@ -67,7 +66,7 @@ pub trait OverlapStrategy: Send + Sync {
     fn create_overlap_info(&self) -> Box<dyn OverlapInfo>;
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct RangeOverlapInfo {
     target_range: Option<KeyRange>,
 }
@@ -84,25 +83,16 @@ impl OverlapInfo for RangeOverlapInfo {
         match self.target_range.as_ref() {
             Some(key_range) => {
                 let overlap_begin = others.partition_point(|table_status| {
-                    table_status
-                        .key_range
-                        .as_ref()
-                        .unwrap()
-                        .compare_right_with(&key_range.left)
+                    table_status.key_range.compare_right_with(&key_range.left)
                         == cmp::Ordering::Less
                 });
                 if overlap_begin >= others.len() {
                     return overlap_begin..overlap_begin;
                 }
-                let mut overlap_end = overlap_begin;
-                for table in &others[overlap_begin..] {
-                    if key_range.compare_right_with(&table.key_range.as_ref().unwrap().left)
-                        == cmp::Ordering::Less
-                    {
-                        break;
-                    }
-                    overlap_end += 1;
-                }
+                let overlap_end = others.partition_point(|table_status| {
+                    key_range.compare_right_with(&table_status.key_range.left)
+                        != cmp::Ordering::Less
+                });
                 overlap_begin..overlap_end
             }
             None => others.len()..others.len(),
@@ -114,7 +104,7 @@ impl OverlapInfo for RangeOverlapInfo {
             Some(key_range) => {
                 let overlap_begin = others.partition_point(|table_status| {
                     KeyComparator::compare_encoded_full_key(
-                        &table_status.key_range.as_ref().unwrap().left,
+                        &table_status.key_range.left,
                         &key_range.left,
                     ) == cmp::Ordering::Less
                 });
@@ -123,9 +113,7 @@ impl OverlapInfo for RangeOverlapInfo {
                 }
                 let mut overlap_end = overlap_begin;
                 for table in &others[overlap_begin..] {
-                    if key_range.compare_right_with(&table.key_range.as_ref().unwrap().right)
-                        == cmp::Ordering::Less
-                    {
+                    if key_range.compare_right_with(&table.key_range.right) == cmp::Ordering::Less {
                         break;
                     }
                     overlap_end += 1;
@@ -136,8 +124,8 @@ impl OverlapInfo for RangeOverlapInfo {
         }
     }
 
-    fn update(&mut self, table: &SstableInfo) {
-        let other = table.key_range.as_ref().unwrap();
+    fn update(&mut self, range: &KeyRange) {
+        let other = range;
         if let Some(range) = self.target_range.as_mut() {
             range.full_key_extend(other);
             return;
@@ -151,8 +139,7 @@ pub struct RangeOverlapStrategy {}
 
 impl OverlapStrategy for RangeOverlapStrategy {
     fn check_overlap(&self, a: &SstableInfo, b: &SstableInfo) -> bool {
-        let key_range = a.key_range.as_ref().unwrap();
-        check_table_overlap(key_range, b)
+        check_table_overlap(&a.key_range, b)
     }
 
     fn create_overlap_info(&self) -> Box<dyn OverlapInfo> {
@@ -161,6 +148,5 @@ impl OverlapStrategy for RangeOverlapStrategy {
 }
 
 fn check_table_overlap(key_range: &KeyRange, table: &SstableInfo) -> bool {
-    let other = table.key_range.as_ref().unwrap();
-    key_range.sstable_overlap(other)
+    key_range.sstable_overlap(&table.key_range)
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 
 pub(crate) mod bushy_tree_join_ordering_rule;
 pub(crate) mod filter_with_now_to_join_rule;
+pub(crate) mod generate_series_with_now_rule;
+pub(crate) mod separate_consecutive_join;
 pub(crate) mod split_now_and_rule;
 pub(crate) mod split_now_or_rule;
 pub(crate) mod stream_project_merge_rule;

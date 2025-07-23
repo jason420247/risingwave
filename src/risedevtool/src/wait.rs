@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context as _, Result, anyhow};
 use console::style;
 
 pub fn wait(
@@ -46,16 +46,16 @@ pub fn wait(
             }
         }
 
-        if let Some(ref timeout) = timeout {
-            if std::time::Instant::now() - start_time >= *timeout {
-                let context = "timeout when trying to connect";
+        if let Some(ref timeout) = timeout
+            && std::time::Instant::now() - start_time >= *timeout
+        {
+            let context = "timeout when trying to connect";
 
-                return Err(if let Some(last_error) = last_error {
-                    last_error.context(context)
-                } else {
-                    anyhow!(context)
-                });
-            }
+            return Err(if let Some(last_error) = last_error {
+                last_error.context(context)
+            } else {
+                anyhow!(context)
+            });
         }
 
         if detect_failure && p.exists() {
@@ -75,7 +75,7 @@ pub fn wait(
             });
         }
 
-        sleep(Duration::from_millis(30));
+        sleep(Duration::from_millis(100));
     }
 }
 
@@ -84,7 +84,10 @@ pub fn wait_tcp_available(
     timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<()> {
     let server = server.as_ref();
-    let addr = server.parse()?;
+    let addr = server
+        .to_socket_addrs()?
+        .next()
+        .with_context(|| format!("failed to resolve {}", server))?;
     let start_time = std::time::Instant::now();
 
     loop {
@@ -95,12 +98,15 @@ pub fn wait_tcp_available(
             }
         }
 
-        if let Some(ref timeout) = timeout {
-            if std::time::Instant::now() - start_time >= *timeout {
-                return Err(anyhow!("failed to wait for closing"));
-            }
+        if let Some(ref timeout) = timeout
+            && std::time::Instant::now() - start_time >= *timeout
+        {
+            return Err(anyhow!(
+                "Failed to wait for port closing on {}. The port may still be in use by another process or application. Please ensure the port is not being used elsewhere and try again.",
+                server
+            ));
         }
 
-        sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(100));
     }
 }

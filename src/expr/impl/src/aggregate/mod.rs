@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,14 @@
 // limitations under the License.
 
 mod approx_count_distinct;
+mod approx_percentile;
 mod array_agg;
 mod bit_and;
 mod bit_or;
 mod bit_xor;
 mod bool_and;
 mod bool_or;
+mod first_last_value;
 mod general;
 mod jsonb_agg;
 mod mode;

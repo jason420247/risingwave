@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::time::Duration;
 
@@ -23,20 +23,20 @@ use pulsar::{Producer, ProducerOptions, Pulsar, TokioExecutor};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::catalog::Schema;
 use serde::Deserialize;
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::{DisplayFromStr, serde_as};
 use with_options::WithOptions;
 
 use super::catalog::{SinkFormat, SinkFormatDesc};
 use super::{Sink, SinkError, SinkParam, SinkWriterParam};
-use crate::common::{AwsAuthProps, PulsarCommon, PulsarOauthCommon};
-use crate::sink::catalog::desc::SinkDesc;
+use crate::connector_common::{AwsAuthProps, PulsarCommon, PulsarOauthCommon};
+use crate::enforce_secret::EnforceSecret;
+use crate::sink::Result;
 use crate::sink::encoder::SerTo;
 use crate::sink::formatter::{SinkFormatter, SinkFormatterImpl};
 use crate::sink::log_store::DeliveryFutureManagerAddFuture;
 use crate::sink::writer::{
     AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter, AsyncTruncateSinkWriterExt, FormattedSink,
 };
-use crate::sink::{DummySinkCommitCoordinator, Result};
 use crate::{deserialize_duration_from_string, dispatch_sink_formatter_str_key_impl};
 
 pub const PULSAR_SINK: &str = "pulsar";
@@ -125,8 +125,15 @@ pub struct PulsarConfig {
     pub producer_properties: PulsarPropertiesProducer,
 }
 
+impl EnforceSecret for PulsarConfig {
+    fn enforce_one(prop: &str) -> crate::error::ConnectorResult<()> {
+        PulsarCommon::enforce_one(prop)?;
+        AwsAuthProps::enforce_one(prop)?;
+        Ok(())
+    }
+}
 impl PulsarConfig {
-    pub fn from_hashmap(values: HashMap<String, String>) -> Result<Self> {
+    pub fn from_btreemap(values: BTreeMap<String, String>) -> Result<Self> {
         let config = serde_json::from_value::<PulsarConfig>(serde_json::to_value(values).unwrap())
             .map_err(|e| SinkError::Config(anyhow!(e)))?;
 
@@ -144,12 +151,23 @@ pub struct PulsarSink {
     sink_from_name: String,
 }
 
+impl EnforceSecret for PulsarSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            PulsarConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
+
 impl TryFrom<SinkParam> for PulsarSink {
     type Error = SinkError;
 
     fn try_from(param: SinkParam) -> std::result::Result<Self, Self::Error> {
         let schema = param.schema();
-        let config = PulsarConfig::from_hashmap(param.properties)?;
+        let config = PulsarConfig::from_btreemap(param.properties)?;
         Ok(Self {
             config,
             schema,
@@ -164,14 +182,9 @@ impl TryFrom<SinkParam> for PulsarSink {
 }
 
 impl Sink for PulsarSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = AsyncTruncateLogSinkerOf<PulsarSinkWriter>;
 
     const SINK_NAME: &'static str = PULSAR_SINK;
-
-    fn default_sink_decouple(desc: &SinkDesc) -> bool {
-        desc.sink_type.is_append_only()
-    }
 
     async fn new_log_sinker(&self, _writer_param: SinkWriterParam) -> Result<Self::LogSinker> {
         Ok(PulsarSinkWriter::new(
@@ -219,6 +232,7 @@ impl Sink for PulsarSink {
 
 pub struct PulsarSinkWriter {
     formatter: SinkFormatterImpl,
+    #[expect(dead_code)]
     pulsar: Pulsar<TokioExecutor>,
     producer: Producer<TokioExecutor>,
     config: PulsarConfig,
@@ -230,15 +244,21 @@ struct PulsarPayloadWriter<'w> {
     add_future: DeliveryFutureManagerAddFuture<'w, PulsarDeliveryFuture>,
 }
 
-pub type PulsarDeliveryFuture = impl TryFuture<Ok = (), Error = SinkError> + Unpin + 'static;
+mod opaque_type {
+    use super::*;
+    pub type PulsarDeliveryFuture = impl TryFuture<Ok = (), Error = SinkError> + Unpin + 'static;
 
-fn may_delivery_future(future: SendFuture) -> PulsarDeliveryFuture {
-    future.map(|result| {
-        result
-            .map(|_| ())
-            .map_err(|e: pulsar::Error| SinkError::Pulsar(anyhow!(e)))
-    })
+    #[define_opaque(PulsarDeliveryFuture)]
+    pub(super) fn may_delivery_future(future: SendFuture) -> PulsarDeliveryFuture {
+        future.map(|result| {
+            result
+                .map(|_| ())
+                .map_err(|e: pulsar::Error| SinkError::Pulsar(anyhow!(e)))
+        })
+    }
 }
+pub use opaque_type::PulsarDeliveryFuture;
+use opaque_type::may_delivery_future;
 
 impl PulsarSinkWriter {
     pub async fn new(
@@ -272,7 +292,7 @@ impl PulsarSinkWriter {
     }
 }
 
-impl<'w> PulsarPayloadWriter<'w> {
+impl PulsarPayloadWriter<'_> {
     async fn send_message(&mut self, message: Message) -> Result<()> {
         let mut success_flag = false;
         let mut connection_err = None;
@@ -281,7 +301,7 @@ impl<'w> PulsarPayloadWriter<'w> {
             if retry_num > 0 {
                 tracing::warn!("Failed to send message, at retry no. {retry_num}");
             }
-            match self.producer.send(message.clone()).await {
+            match self.producer.send_non_blocking(message.clone()).await {
                 // If the message is sent successfully,
                 // a SendFuture holding the message receipt
                 // or error after sending is returned
@@ -329,7 +349,7 @@ impl<'w> PulsarPayloadWriter<'w> {
     }
 }
 
-impl<'w> FormattedSink for PulsarPayloadWriter<'w> {
+impl FormattedSink for PulsarPayloadWriter<'_> {
     type K = String;
     type V = Vec<u8>;
 

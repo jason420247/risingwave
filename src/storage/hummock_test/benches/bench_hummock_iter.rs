@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,22 +16,22 @@ use std::ops::Bound::Unbounded;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion};
-use futures::{pin_mut, TryStreamExt};
-use risingwave_common::cache::CachePriority;
-use risingwave_hummock_sdk::key::TableKey;
+use criterion::{Criterion, criterion_group, criterion_main};
+use foyer::Hint;
+use futures::pin_mut;
+use risingwave_common::util::epoch::test_epoch;
 use risingwave_hummock_sdk::HummockEpoch;
+use risingwave_hummock_sdk::key::TableKey;
 use risingwave_hummock_test::get_notification_client_for_test;
 use risingwave_hummock_test::local_state_store_test_utils::LocalStateStoreTestExt;
 use risingwave_hummock_test::test_utils::TestIngestBatch;
-use risingwave_meta::hummock::test_utils::setup_compute_env;
 use risingwave_meta::hummock::MockHummockMetaClient;
+use risingwave_meta::hummock::test_utils::setup_compute_env;
 use risingwave_storage::hummock::iterator::test_utils::mock_sstable_store;
-use risingwave_storage::hummock::test_utils::default_opts_for_test;
+use risingwave_storage::hummock::test_utils::{ReadOptions, *};
 use risingwave_storage::hummock::{CachePolicy, HummockStorage};
 use risingwave_storage::storage_value::StorageValue;
 use risingwave_storage::store::*;
-use risingwave_storage::StateStore;
 
 fn gen_interleave_shared_buffer_batch_iter(
     batch_size: usize,
@@ -56,21 +56,22 @@ fn gen_interleave_shared_buffer_batch_iter(
 fn criterion_benchmark(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let batches = gen_interleave_shared_buffer_batch_iter(10000, 100);
-    let sstable_store = mock_sstable_store();
     let hummock_options = Arc::new(default_opts_for_test());
-    let (env, hummock_manager_ref, _cluster_manager_ref, worker_node) =
+    let (env, hummock_manager_ref, cluster_ctl_ref, worker_id) =
         runtime.block_on(setup_compute_env(8080));
     let meta_client = Arc::new(MockHummockMetaClient::new(
         hummock_manager_ref.clone(),
-        worker_node.id,
+        worker_id as _,
     ));
 
     let global_hummock_storage = runtime.block_on(async {
+        let sstable_store = mock_sstable_store().await;
         HummockStorage::for_test(
             hummock_options,
             sstable_store,
             meta_client.clone(),
-            get_notification_client_for_test(env, hummock_manager_ref, worker_node),
+            get_notification_client_for_test(env, hummock_manager_ref, cluster_ctl_ref, worker_id)
+                .await,
         )
         .await
         .unwrap()
@@ -82,21 +83,14 @@ fn criterion_benchmark(c: &mut Criterion) {
             .await
     });
 
-    let epoch = 100;
+    let epoch = test_epoch(100);
     runtime
         .block_on(hummock_storage.init_for_test(epoch))
         .unwrap();
 
     for batch in batches {
         runtime
-            .block_on(hummock_storage.ingest_batch(
-                batch,
-                vec![],
-                WriteOptions {
-                    epoch,
-                    table_id: Default::default(),
-                },
-            ))
+            .block_on(hummock_storage.ingest_batch(batch))
             .unwrap();
     }
     hummock_storage.seal_current_epoch(HummockEpoch::MAX, SealCurrentEpochOptions::for_test());
@@ -108,9 +102,8 @@ fn criterion_benchmark(c: &mut Criterion) {
                     (Unbounded, Unbounded),
                     epoch,
                     ReadOptions {
-                        ignore_range_tombstone: true,
                         prefetch_options: PrefetchOptions::default(),
-                        cache_policy: CachePolicy::Fill(CachePriority::High),
+                        cache_policy: CachePolicy::Fill(Hint::Normal),
                         ..Default::default()
                     },
                 ))

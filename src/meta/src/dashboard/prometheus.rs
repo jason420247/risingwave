@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ use std::time::SystemTime;
 
 use anyhow::anyhow;
 use axum::{Extension, Json};
-use prometheus_http_query::response::{RangeVector, Sample};
+use prometheus_http_query::response::{InstantVector, RangeVector, Sample};
 use serde::Serialize;
 
-use super::handlers::{err, DashboardError};
 use super::Service;
+use super::handlers::{DashboardError, err};
 
 #[derive(Serialize, Debug)]
 pub struct PrometheusSample {
@@ -41,6 +41,7 @@ impl From<&Sample> for PrometheusSample {
 #[derive(Serialize, Debug)]
 pub struct PrometheusVector {
     metric: HashMap<String, String>,
+    // Multiple samples from `RangeVector` or single sample from `InstantVector`.
     sample: Vec<PrometheusSample>,
 }
 
@@ -48,7 +49,18 @@ impl From<&RangeVector> for PrometheusVector {
     fn from(value: &RangeVector) -> Self {
         PrometheusVector {
             metric: value.metric().clone(),
-            sample: value.samples().iter().map(PrometheusSample::from).collect(),
+            sample: value.samples().iter().map(Into::into).collect(),
+        }
+    }
+}
+
+// Note(eric): For backward compatibility, we store the `InstantVector` as a single sample,
+// instead of defining a new struct.
+impl From<&InstantVector> for PrometheusVector {
+    fn from(value: &InstantVector) -> Self {
+        PrometheusVector {
+            metric: value.metric().clone(),
+            sample: vec![value.sample().into()],
         }
     }
 }
@@ -68,8 +80,10 @@ pub async fn list_prometheus_cluster(
     if let Some(ref client) = srv.prometheus_client {
         // assume job_name is one of compute, meta, frontend
         let now = SystemTime::now();
-        let cpu_query =
-            format!("sum(rate(process_cpu_seconds_total{{job=~\"compute|meta|frontend\",{}}}[60s])) by (job,instance)", srv.prometheus_selector);
+        let cpu_query = format!(
+            "sum(rate(process_cpu_seconds_total{{job=~\"standalone|compute|meta|frontend\", {}}}[60s]) or label_replace(rate(process_cpu_seconds_total{{component=~\"standalone|compute|meta|frontend\", {}}}[60s]), \"job\", \"$1\", \"component\", \"(.*)\")) by (job,instance)",
+            srv.prometheus_selector, srv.prometheus_selector
+        );
         let result = client
             .query_range(
                 cpu_query,
@@ -92,8 +106,10 @@ pub async fn list_prometheus_cluster(
             .iter()
             .map(PrometheusVector::from)
             .collect();
-        let memory_query =
-            format!("avg(process_resident_memory_bytes{{job=~\"compute|meta|frontend\",{}}}) by (job,instance)", srv.prometheus_selector);
+        let memory_query = format!(
+            "avg(process_resident_memory_bytes{{job=~\"standalone|compute|meta|frontend\", {}}} or label_replace(process_resident_memory_bytes{{component=~\"standalone|compute|meta|frontend\", {}}}, \"job\", \"$1\", \"component\", \"(.*)\")) by (job,instance)",
+            srv.prometheus_selector, srv.prometheus_selector
+        );
         let result = client
             .query_range(
                 memory_query,
@@ -119,48 +135,6 @@ pub async fn list_prometheus_cluster(
         Ok(Json(ClusterMetrics {
             cpu_data,
             memory_data,
-        }))
-    } else {
-        Err(err(anyhow!("Prometheus endpoint is not set")))
-    }
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ActorBackPressure {
-    output_buffer_blocking_duration: Vec<PrometheusVector>,
-}
-pub async fn list_prometheus_actor_back_pressure(
-    Extension(srv): Extension<Service>,
-) -> Result<Json<ActorBackPressure>> {
-    if let Some(ref client) = srv.prometheus_client {
-        let now = SystemTime::now();
-        let back_pressure_query =
-            format!("avg(rate(stream_actor_output_buffer_blocking_duration_ns{{{}}}[60s])) by (fragment_id, downstream_fragment_id) / 1000000000", srv.prometheus_selector);
-        let result = client
-            .query_range(
-                back_pressure_query,
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64
-                    - 1800,
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64,
-                15.0,
-            )
-            .get()
-            .await
-            .map_err(err)?;
-        let back_pressure_data = result
-            .data()
-            .as_matrix()
-            .unwrap()
-            .iter()
-            .map(PrometheusVector::from)
-            .collect();
-        Ok(Json(ActorBackPressure {
-            output_buffer_blocking_duration: back_pressure_data,
         }))
     } else {
         Err(err(anyhow!("Prometheus endpoint is not set")))

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use fixedbitset::FixedBitSet;
-use risingwave_common::error::Result;
 
 use crate::binder::BoundInsert;
-use crate::optimizer::plan_node::{generic, LogicalInsert, LogicalProject, PlanRef};
+use crate::error::Result;
+use crate::optimizer::plan_node::{LogicalInsert, LogicalProject, PlanRef, generic};
 use crate::optimizer::property::{Order, RequiredDist};
-use crate::optimizer::PlanRoot;
+use crate::optimizer::{LogicalPlanRoot, PlanRoot};
 use crate::planner::Planner;
 
 impl Planner {
-    pub(super) fn plan_insert(&mut self, insert: BoundInsert) -> Result<PlanRoot> {
-        let mut input = self.plan_query(insert.source)?.into_subplan();
+    pub(super) fn plan_insert(&mut self, insert: BoundInsert) -> Result<LogicalPlanRoot> {
+        let mut input = self.plan_query(insert.source)?.into_unordered_subplan();
         if !insert.cast_exprs.is_empty() {
             input = LogicalProject::create(input, insert.cast_exprs);
         }
@@ -53,7 +53,7 @@ impl Planner {
         } else {
             plan.schema().names()
         };
-        let root = PlanRoot::new(plan, dist, Order::any(), out_fields, out_names);
+        let root = PlanRoot::new_with_logical_plan(plan, dist, Order::any(), out_fields, out_names);
         Ok(root)
     }
 }

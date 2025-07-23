@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,9 +30,11 @@ import org.postgresql.util.PGobject;
 public class PostgresDialect implements JdbcDialect {
 
     private final int[] columnSqlTypes;
+    private final int[] pkIndices;
 
-    public PostgresDialect(int[] columnSqlTypes) {
-        this.columnSqlTypes = columnSqlTypes;
+    public PostgresDialect(List<Integer> columnSqlTypes, List<Integer> pkIndices) {
+        this.columnSqlTypes = columnSqlTypes.stream().mapToInt(i -> i).toArray();
+        this.pkIndices = pkIndices.stream().mapToInt(i -> i).toArray();
     }
 
     private static final HashMap<TypeName, String> RW_TYPE_TO_JDBC_TYPE_NAME;
@@ -57,18 +59,18 @@ public class PostgresDialect implements JdbcDialect {
 
     @Override
     public SchemaTableName createSchemaTableName(String schemaName, String tableName) {
-        if (schemaName == null || schemaName.isBlank()) {
-            schemaName = "public";
-        }
         return new SchemaTableName(schemaName, tableName);
     }
 
     @Override
     public String getNormalizedTableName(SchemaTableName schemaTableName) {
-        assert schemaTableName.getSchemaName() != null;
-        return quoteIdentifier(schemaTableName.getSchemaName())
-                + '.'
-                + quoteIdentifier(schemaTableName.getTableName());
+        if (schemaTableName.schemaName == null || schemaTableName.schemaName.isBlank()) {
+            return quoteIdentifier(schemaTableName.getTableName());
+        } else {
+            return quoteIdentifier(schemaTableName.getSchemaName())
+                    + '.'
+                    + quoteIdentifier(schemaTableName.getTableName());
+        }
     }
 
     @Override
@@ -152,6 +154,17 @@ public class PostgresDialect implements JdbcDialect {
                     stmt.setObject(placeholderIdx++, row.get(columnIdx));
                     break;
             }
+        }
+    }
+
+    @Override
+    public void bindDeleteStatement(PreparedStatement stmt, TableSchema tableSchema, SinkRow row)
+            throws SQLException {
+        // set the values of primary key fields
+        int placeholderIdx = 1;
+        for (int pkIdx : pkIndices) {
+            Object pkField = row.get(pkIdx);
+            stmt.setObject(placeholderIdx++, pkField, columnSqlTypes[pkIdx]);
         }
     }
 }

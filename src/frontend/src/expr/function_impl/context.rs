@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,9 @@ use crate::session::AuthContext;
 // Only for local mode.
 define_context! {
     pub(super) CATALOG_READER: crate::catalog::CatalogReader,
+    pub(super) USER_INFO_READER: crate::user::user_service::UserInfoReader,
     pub(super) AUTH_CONTEXT: Arc<AuthContext>,
     pub(super) DB_NAME: String,
     pub(super) SEARCH_PATH: SearchPath,
+    pub(super) META_CLIENT: Arc<dyn crate::meta_client::FrontendMetaClient>,
 }

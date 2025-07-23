@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,22 +40,25 @@ impl<KE: RowEncoder, VE: RowEncoder> SinkFormatter for UpsertFormatter<KE, VE> {
         &self,
         chunk: &StreamChunk,
     ) -> impl Iterator<Item = Result<(Option<Self::K>, Option<Self::V>)>> {
-        std::iter::from_coroutine(|| {
-            for (op, row) in chunk.rows() {
-                let event_key_object = Some(tri!(self.key_encoder.encode(row)));
+        std::iter::from_coroutine(
+            #[coroutine]
+            || {
+                for (op, row) in chunk.rows() {
+                    let event_key_object = Some(tri!(self.key_encoder.encode(row)));
 
-                let event_object = match op {
-                    Op::Insert | Op::UpdateInsert => Some(tri!(self.val_encoder.encode(row))),
-                    // Empty value with a key
-                    Op::Delete => None,
-                    Op::UpdateDelete => {
-                        // upsert semantic does not require update delete event
-                        continue;
-                    }
-                };
+                    let event_object = match op {
+                        Op::Insert | Op::UpdateInsert => Some(tri!(self.val_encoder.encode(row))),
+                        // Empty value with a key
+                        Op::Delete => None,
+                        Op::UpdateDelete => {
+                            // upsert semantic does not require update delete event
+                            continue;
+                        }
+                    };
 
-                yield Ok((event_key_object, event_object))
-            }
-        })
+                    yield Ok((event_key_object, event_object))
+                }
+            },
+        )
     }
 }

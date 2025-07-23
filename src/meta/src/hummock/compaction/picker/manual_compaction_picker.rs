@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use risingwave_hummock_sdk::compaction_group::hummock_version_ext::HummockLevelsExt;
-use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::{InputLevel, Level, LevelType, OverlappingLevel, SstableInfo};
+use risingwave_hummock_sdk::HummockSstableId;
+use risingwave_hummock_sdk::level::{InputLevel, Level, Levels, OverlappingLevel};
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
+use risingwave_pb::hummock::LevelType;
 
 use super::{CompactionInput, CompactionPicker, LocalPickerStatistic};
 use crate::hummock::compaction::overlap_strategy::{
@@ -114,7 +115,7 @@ impl ManualCompactionPicker {
         for l in 1..self.target_level {
             assert!(levels.levels[l - 1].table_infos.is_empty());
         }
-        let l0 = levels.l0.as_ref().unwrap();
+        let l0 = &levels.l0;
         let mut input_levels = vec![];
         let mut max_sub_level_idx = usize::MAX;
         let mut info = self.overlap_strategy.create_overlap_info();
@@ -136,7 +137,7 @@ impl ManualCompactionPicker {
         // Construct input.
         for idx in 0..=max_sub_level_idx {
             for table in &l0.sub_levels[idx].table_infos {
-                info.update(table);
+                info.update(&table.key_range);
             }
             input_levels.push(InputLevel {
                 level_idx: 0,
@@ -163,7 +164,7 @@ impl ManualCompactionPicker {
         input_levels.reverse();
         input_levels.push(InputLevel {
             level_idx: self.target_level as u32,
-            level_type: LevelType::Nonoverlapping as i32,
+            level_type: LevelType::Nonoverlapping,
             table_infos: target_input_ssts,
         });
 
@@ -178,15 +179,11 @@ impl ManualCompactionPicker {
     /// Returns false if the given `sst` is rejected by filter defined by `option`.
     /// Otherwise returns true.
     fn filter_level_by_option(&self, level: &Level) -> bool {
-        let mut hint_sst_ids: HashSet<u64> = HashSet::new();
+        let mut hint_sst_ids: HashSet<HummockSstableId> = HashSet::new();
         hint_sst_ids.extend(self.option.sst_ids.iter());
-        let tmp_sst_info = SstableInfo {
-            key_range: Some(self.option.key_range.clone()),
-            ..Default::default()
-        };
         if self
             .overlap_strategy
-            .check_overlap_with_tables(&[tmp_sst_info], &level.table_infos)
+            .check_overlap_with_range(&self.option.key_range, &level.table_infos)
             .is_empty()
         {
             return false;
@@ -222,19 +219,17 @@ impl CompactionPicker for ManualCompactionPicker {
     ) -> Option<CompactionInput> {
         if self.option.level == 0 {
             if !self.option.sst_ids.is_empty() {
-                return self.pick_l0_to_sub_level(levels.l0.as_ref().unwrap(), level_handlers);
+                return self.pick_l0_to_sub_level(&levels.l0, level_handlers);
             } else if self.target_level > 0 {
                 return self.pick_l0_to_base_level(levels, level_handlers);
             } else {
                 return None;
             }
         }
-        let mut hint_sst_ids: HashSet<u64> = HashSet::new();
+        let mut hint_sst_ids: HashSet<HummockSstableId> = HashSet::new();
         hint_sst_ids.extend(self.option.sst_ids.iter());
-        let mut tmp_sst_info = SstableInfo::default();
         let mut range_overlap_info = RangeOverlapInfo::default();
-        tmp_sst_info.key_range = Some(self.option.key_range.clone());
-        range_overlap_info.update(&tmp_sst_info);
+        range_overlap_info.update(&self.option.key_range);
         let level = self.option.level;
         let target_level = self.target_level;
         assert!(
@@ -271,15 +266,13 @@ impl CompactionPicker for ManualCompactionPicker {
                 .get_level(level)
                 .table_infos
                 .iter()
-                .find_position(|p| {
-                    p.get_sst_id() == select_input_ssts.first().unwrap().get_sst_id()
-                })
+                .find_position(|p| p.sst_id == select_input_ssts.first().unwrap().sst_id)
                 .unwrap();
             let (right, _) = levels
                 .get_level(level)
                 .table_infos
                 .iter()
-                .find_position(|p| p.get_sst_id() == select_input_ssts.last().unwrap().get_sst_id())
+                .find_position(|p| p.sst_id == select_input_ssts.last().unwrap().sst_id)
                 .unwrap();
             select_input_ssts = levels.get_level(level).table_infos[left..=right].to_vec();
             vec![]
@@ -303,8 +296,8 @@ impl CompactionPicker for ManualCompactionPicker {
         }
 
         Some(CompactionInput {
-            select_input_size: select_input_ssts.iter().map(|sst| sst.file_size).sum(),
-            target_input_size: target_input_ssts.iter().map(|sst| sst.file_size).sum(),
+            select_input_size: select_input_ssts.iter().map(|sst| sst.sst_size).sum(),
+            target_input_size: target_input_ssts.iter().map(|sst| sst.sst_size).sum(),
             total_file_count: (select_input_ssts.len() + target_input_ssts.len()) as u64,
             input_levels: vec![
                 InputLevel {
@@ -326,10 +319,12 @@ impl CompactionPicker for ManualCompactionPicker {
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap};
 
+    use bytes::Bytes;
+    use risingwave_hummock_sdk::key_range::KeyRange;
+    use risingwave_hummock_sdk::version::HummockVersionStateTableInfo;
     use risingwave_pb::hummock::compact_task;
-    pub use risingwave_pb::hummock::{KeyRange, Level, LevelType};
 
     use super::*;
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
@@ -339,9 +334,9 @@ pub mod tests {
         generate_l0_overlapping_sublevels, generate_level, generate_table,
     };
     use crate::hummock::compaction::selector::{CompactionSelector, ManualCompactionSelector};
-    use crate::hummock::compaction::LocalSelectorStatistic;
+    use crate::hummock::compaction::{CompactionDeveloperConfig, LocalSelectorStatistic};
     use crate::hummock::model::CompactionGroup;
-    use crate::hummock::test_utils::iterator_test_key_of_epoch;
+    use crate::hummock::test_utils::{compaction_selector_context, iterator_test_key_of_epoch};
 
     fn clean_task_state(level_handler: &mut LevelHandler) {
         for pending_task_id in &level_handler.pending_tasks_ids() {
@@ -378,19 +373,17 @@ pub mod tests {
         let levels = vec![
             Level {
                 level_idx: 1,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(0, 1, 0, 100, 1),
                     generate_table(1, 1, 101, 200, 1),
                     generate_table(2, 1, 222, 300, 1),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
             Level {
                 level_idx: 2,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(4, 1, 0, 100, 1),
                     generate_table(5, 1, 101, 150, 1),
@@ -398,14 +391,12 @@ pub mod tests {
                     generate_table(7, 1, 501, 800, 1),
                     generate_table(8, 2, 301, 400, 1),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
         ];
         let mut levels = Levels {
             levels,
-            l0: Some(generate_l0_nonoverlapping_sublevels(vec![])),
+            l0: generate_l0_nonoverlapping_sublevels(vec![]),
             ..Default::default()
         };
         let mut levels_handler = vec![
@@ -420,8 +411,8 @@ pub mod tests {
             let option = ManualCompactionOption {
                 level: 1,
                 key_range: KeyRange {
-                    left: iterator_test_key_of_epoch(1, 0, 1),
-                    right: iterator_test_key_of_epoch(1, 201, 1),
+                    left: Bytes::from(iterator_test_key_of_epoch(1, 0, 1)),
+                    right: Bytes::from(iterator_test_key_of_epoch(1, 201, 1)),
                     right_exclusive: false,
                 },
                 ..Default::default()
@@ -469,9 +460,11 @@ pub mod tests {
 
             let level_table_info = &mut levels.levels[0].table_infos;
             let table_info_1 = &mut level_table_info[1];
-            table_info_1.table_ids.resize(2, 0);
-            table_info_1.table_ids[0] = 1;
-            table_info_1.table_ids[1] = 2;
+            let mut t_inner = table_info_1.get_inner();
+            t_inner.table_ids.resize(2, 0);
+            t_inner.table_ids[0] = 1;
+            t_inner.table_ids[1] = 2;
+            *table_info_1 = t_inner.into();
 
             // test internal_table_id
             let option = ManualCompactionOption {
@@ -503,9 +496,11 @@ pub mod tests {
             // include all table_info
             let level_table_info = &mut levels.levels[0].table_infos;
             for table_info in level_table_info {
-                table_info.table_ids.resize(2, 0);
-                table_info.table_ids[0] = 1;
-                table_info.table_ids[1] = 2;
+                let mut t_inner = table_info.get_inner();
+                t_inner.table_ids.resize(2, 0);
+                t_inner.table_ids[0] = 1;
+                t_inner.table_ids[1] = 2;
+                *table_info = t_inner.into();
             }
 
             // test key range filter first
@@ -513,8 +508,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: 1,
                 key_range: KeyRange {
-                    left: iterator_test_key_of_epoch(1, 101, 1),
-                    right: iterator_test_key_of_epoch(1, 199, 1),
+                    left: Bytes::from(iterator_test_key_of_epoch(1, 101, 1)),
+                    right: Bytes::from(iterator_test_key_of_epoch(1, 199, 1)),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::from([2]),
@@ -557,25 +552,21 @@ pub mod tests {
         let mut levels = vec![
             Level {
                 level_idx: 1,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(3, 1, 0, 100, 1),
                     generate_table(4, 2, 2000, 3000, 1),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
             Level {
                 level_idx: 2,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(1, 1, 0, 100, 1),
                     generate_table(2, 2, 2000, 3000, 1),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
         ];
         // Set internal_table_ids.
@@ -583,18 +574,20 @@ pub mod tests {
         for iter in [l0.sub_levels.iter_mut(), levels.iter_mut()] {
             for (idx, l) in iter.enumerate() {
                 for t in &mut l.table_infos {
-                    t.table_ids.clear();
+                    let mut t_inner = t.get_inner();
+                    t_inner.table_ids.clear();
                     if idx == 0 {
-                        t.table_ids.push(((t.get_sst_id() % 2) + 1) as _);
+                        t_inner.table_ids.push(((t.sst_id.inner() % 2) + 1) as _);
                     } else {
-                        t.table_ids.push(3);
+                        t_inner.table_ids.push(3);
                     }
+                    *t = t_inner.into();
                 }
             }
         }
         let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
 
@@ -610,20 +603,18 @@ pub mod tests {
         let l0 = generate_l0_overlapping_sublevels(vec![]);
         let levels = vec![Level {
             level_idx: 1,
-            level_type: LevelType::Nonoverlapping as i32,
+            level_type: LevelType::Nonoverlapping,
             table_infos: vec![
                 generate_table(1, 1, 0, 100, 1),
                 generate_table(2, 2, 100, 200, 1),
                 generate_table(3, 2, 200, 300, 1),
                 generate_table(4, 2, 300, 400, 1),
             ],
-            total_file_size: 0,
-            sub_level_id: 0,
-            uncompressed_file_size: 0,
+            ..Default::default()
         }];
         let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
 
@@ -636,37 +627,40 @@ pub mod tests {
         let l0 = generate_l0_nonoverlapping_sublevels(vec![]);
         let levels = vec![Level {
             level_idx: 1,
-            level_type: LevelType::Nonoverlapping as i32,
+            level_type: LevelType::Nonoverlapping,
             table_infos: vec![],
             total_file_size: 0,
             sub_level_id: 0,
             uncompressed_file_size: 0,
+            ..Default::default()
         }];
         let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
         let levels_handler = vec![LevelHandler::new(0), LevelHandler::new(1)];
         let option = ManualCompactionOption {
-            sst_ids: vec![1],
+            sst_ids: vec![1.into()],
             level: 0,
             key_range: KeyRange {
-                left: vec![],
-                right: vec![],
+                left: Bytes::default(),
+                right: Bytes::default(),
                 right_exclusive: false,
             },
             internal_table_id: HashSet::default(),
         };
         let mut picker =
             ManualCompactionPicker::new(Arc::new(RangeOverlapStrategy::default()), option, 0);
-        assert!(picker
-            .pick_compaction(
-                &levels,
-                &levels_handler,
-                &mut LocalPickerStatistic::default()
-            )
-            .is_none());
+        assert!(
+            picker
+                .pick_compaction(
+                    &levels,
+                    &levels_handler,
+                    &mut LocalPickerStatistic::default()
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -678,8 +672,8 @@ pub mod tests {
             sst_ids: vec![],
             level: 0,
             key_range: KeyRange {
-                left: vec![],
-                right: vec![],
+                left: Bytes::default(),
+                right: Bytes::default(),
                 right_exclusive: false,
             },
             internal_table_id: HashSet::default(),
@@ -690,14 +684,16 @@ pub mod tests {
             0,
         );
         let mut local_stats = LocalPickerStatistic::default();
-        assert!(picker
-            .pick_compaction(&levels, &levels_handler, &mut local_stats)
-            .is_none());
+        assert!(
+            picker
+                .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                .is_none()
+        );
 
         // pick_l0_to_base_level
         let mut picker =
             ManualCompactionPicker::new(Arc::new(RangeOverlapStrategy::default()), option, 1);
-        let mut expected = vec![vec![5, 6], vec![7, 8], vec![9, 10]];
+        let mut expected = [vec![5, 6], vec![7, 8], vec![9, 10]];
         expected.reverse();
         let result = picker
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
@@ -710,7 +706,7 @@ pub mod tests {
                 result.input_levels[l]
                     .table_infos
                     .iter()
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 *e
             );
@@ -725,15 +721,15 @@ pub mod tests {
             sst_ids: vec![],
             level: 0,
             key_range: KeyRange {
-                left: iterator_test_key_of_epoch(1, 0, 2),
-                right: iterator_test_key_of_epoch(1, 200, 2),
+                left: Bytes::from(iterator_test_key_of_epoch(1, 0, 2)),
+                right: Bytes::from(iterator_test_key_of_epoch(1, 200, 2)),
                 right_exclusive: false,
             },
             internal_table_id: HashSet::default(),
         };
         let mut picker =
             ManualCompactionPicker::new(Arc::new(RangeOverlapStrategy::default()), option, 1);
-        let mut expected = vec![vec![5, 6], vec![7, 8]];
+        let mut expected = [vec![5, 6], vec![7, 8]];
         expected.reverse();
         let result = picker
             .pick_compaction(&levels, &levels_handler, &mut local_stats)
@@ -746,7 +742,7 @@ pub mod tests {
                 result.input_levels[l]
                     .table_infos
                     .iter()
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 *e
             );
@@ -773,11 +769,11 @@ pub mod tests {
         for (input_level, sst_id_filter, expected) in &sst_id_filters {
             let expected = expected.iter().rev().cloned().collect_vec();
             let option = ManualCompactionOption {
-                sst_ids: sst_id_filter.clone(),
+                sst_ids: sst_id_filter.iter().cloned().map(Into::into).collect(),
                 level: *input_level as _,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -798,7 +794,7 @@ pub mod tests {
                     result.input_levels[i]
                         .table_infos
                         .iter()
-                        .map(|s| s.get_sst_id())
+                        .map(|s| s.sst_id)
                         .collect_vec(),
                     *e
                 );
@@ -817,8 +813,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // No matching internal table id.
@@ -829,9 +825,11 @@ pub mod tests {
                 option,
                 target_level,
             );
-            assert!(picker
-                .pick_compaction(&levels, &levels_handler, &mut local_stats)
-                .is_none())
+            assert!(
+                picker
+                    .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                    .is_none()
+            )
         }
 
         {
@@ -839,8 +837,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // Include all sub level's table ids
@@ -864,7 +862,7 @@ pub mod tests {
                     .iter()
                     .take(3)
                     .flat_map(|s| s.table_infos.clone())
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 vec![9, 10, 7, 8, 5, 6]
             );
@@ -872,7 +870,7 @@ pub mod tests {
                 result.input_levels[3]
                     .table_infos
                     .iter()
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 vec![3]
             );
@@ -883,8 +881,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // Only include bottom sub level's table id
@@ -906,7 +904,7 @@ pub mod tests {
                     .iter()
                     .take(3)
                     .flat_map(|s| s.table_infos.clone())
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 vec![9, 10, 7, 8, 5, 6]
             );
@@ -914,7 +912,7 @@ pub mod tests {
                 result.input_levels[3]
                     .table_infos
                     .iter()
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 vec![3]
             );
@@ -926,8 +924,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // Only include partial top sub level's table id, but the whole top sub level is
@@ -952,7 +950,7 @@ pub mod tests {
                     .iter()
                     .take(1)
                     .flat_map(|s| s.table_infos.clone())
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 vec![5, 6]
             );
@@ -960,7 +958,7 @@ pub mod tests {
                 result.input_levels[1]
                     .table_infos
                     .iter()
-                    .map(|s| s.get_sst_id())
+                    .map(|s| s.sst_id)
                     .collect_vec(),
                 vec![3]
             );
@@ -970,8 +968,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // Only include bottom sub level's table id
@@ -983,9 +981,11 @@ pub mod tests {
                 target_level,
             );
             // Because top sub-level is pending.
-            assert!(picker
-                .pick_compaction(&levels, &levels_handler, &mut local_stats)
-                .is_none());
+            assert!(
+                picker
+                    .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                    .is_none()
+            );
 
             clean_task_state(&mut levels_handler[0]);
             clean_task_state(&mut levels_handler[1]);
@@ -1003,8 +1003,8 @@ pub mod tests {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // No matching internal table id.
@@ -1015,19 +1015,21 @@ pub mod tests {
                 option,
                 target_level,
             );
-            assert!(picker
-                .pick_compaction(&levels, &levels_handler, &mut local_stats)
-                .is_none())
+            assert!(
+                picker
+                    .pick_compaction(&levels, &levels_handler, &mut local_stats)
+                    .is_none()
+            )
         }
 
         {
-            let expected_input_level_sst_ids = vec![vec![4], vec![2]];
+            let expected_input_level_sst_ids = [vec![4], vec![2]];
             let option = ManualCompactionOption {
                 sst_ids: vec![],
                 level: input_level,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 // Only include partial input level's table id
@@ -1055,7 +1057,7 @@ pub mod tests {
                     result.input_levels[l]
                         .table_infos
                         .iter()
-                        .map(|s| s.get_sst_id())
+                        .map(|s| s.sst_id)
                         .collect_vec(),
                     *e
                 );
@@ -1075,11 +1077,11 @@ pub mod tests {
         let mut local_stats = LocalPickerStatistic::default();
         for (input_level, sst_id_filter, expected) in &sst_id_filters {
             let option = ManualCompactionOption {
-                sst_ids: sst_id_filter.clone(),
+                sst_ids: sst_id_filter.iter().cloned().map(Into::into).collect(),
                 level: *input_level as _,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -1098,7 +1100,7 @@ pub mod tests {
                     result.input_levels[i]
                         .table_infos
                         .iter()
-                        .map(|s| s.get_sst_id())
+                        .map(|s| s.sst_id)
                         .collect_vec(),
                     *e
                 );
@@ -1121,11 +1123,11 @@ pub mod tests {
         ];
         for (input_level, sst_id_filter, expected) in &sst_id_filters {
             let option = ManualCompactionOption {
-                sst_ids: sst_id_filter.clone(),
+                sst_ids: sst_id_filter.iter().cloned().map(Into::into).collect(),
                 level: *input_level as _,
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -1148,7 +1150,7 @@ pub mod tests {
                     result.input_levels[i]
                         .table_infos
                         .iter()
-                        .map(|s| s.get_sst_id())
+                        .map(|s| s.sst_id)
                         .collect_vec(),
                     *e
                 );
@@ -1171,21 +1173,19 @@ pub mod tests {
             generate_level(3, vec![]),
             Level {
                 level_idx: 4,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(2, 1, 0, 100, 1),
                     generate_table(3, 1, 101, 200, 1),
                     generate_table(4, 1, 222, 300, 1),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
         ];
         assert_eq!(levels.len(), 4);
         let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
         let mut levels_handler = (0..5).map(LevelHandler::new).collect_vec();
@@ -1194,10 +1194,10 @@ pub mod tests {
         // pick_l0_to_sub_level
         {
             let option = ManualCompactionOption {
-                sst_ids: vec![0, 1],
+                sst_ids: [0, 1].iter().cloned().map(Into::into).collect(),
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -1207,11 +1207,17 @@ pub mod tests {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -1232,8 +1238,8 @@ pub mod tests {
             let option = ManualCompactionOption {
                 sst_ids: vec![],
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -1243,11 +1249,17 @@ pub mod tests {
             let task = selector
                 .pick_compaction(
                     2,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -1278,7 +1290,7 @@ pub mod tests {
             ),
             Level {
                 level_idx: 4,
-                level_type: LevelType::Nonoverlapping as i32,
+                level_type: LevelType::Nonoverlapping,
                 table_infos: vec![
                     generate_table(2, 1, 0, 100, 1),
                     generate_table(3, 1, 101, 200, 1),
@@ -1287,15 +1299,13 @@ pub mod tests {
                     generate_table(6, 1, 444, 500, 1),
                     generate_table(7, 1, 555, 600, 1),
                 ],
-                total_file_size: 0,
-                sub_level_id: 0,
-                uncompressed_file_size: 0,
+                ..Default::default()
             },
         ];
         assert_eq!(levels.len(), 4);
         let levels = Levels {
             levels,
-            l0: Some(l0),
+            l0,
             ..Default::default()
         };
         let mut levels_handler = (0..5).map(LevelHandler::new).collect_vec();
@@ -1304,10 +1314,10 @@ pub mod tests {
         // pick l3 -> l4
         {
             let option = ManualCompactionOption {
-                sst_ids: vec![0, 1],
+                sst_ids: [0, 1].iter().cloned().map(Into::into).collect(),
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -1317,11 +1327,17 @@ pub mod tests {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);
@@ -1344,8 +1360,8 @@ pub mod tests {
             let option = ManualCompactionOption {
                 sst_ids: vec![],
                 key_range: KeyRange {
-                    left: vec![],
-                    right: vec![],
+                    left: Bytes::default(),
+                    right: Bytes::default(),
                     right_exclusive: false,
                 },
                 internal_table_id: HashSet::default(),
@@ -1355,11 +1371,17 @@ pub mod tests {
             let task = selector
                 .pick_compaction(
                     1,
-                    &group_config,
-                    &levels,
-                    &mut levels_handler,
-                    &mut local_stats,
-                    HashMap::default(),
+                    compaction_selector_context(
+                        &group_config,
+                        &levels,
+                        &BTreeSet::new(),
+                        &mut levels_handler,
+                        &mut local_stats,
+                        &HashMap::default(),
+                        Arc::new(CompactionDeveloperConfig::default()),
+                        &Default::default(),
+                        &HummockVersionStateTableInfo::empty(),
+                    ),
                 )
                 .unwrap();
             assert_compaction_task(&task, &levels_handler);

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -83,6 +83,17 @@ impl WindowStates {
         debug_assert!(self.are_aligned());
         for state in &mut self.0 {
             state.slide_no_output()?;
+        }
+        Ok(())
+    }
+
+    /// Slide all windows forward, until the current key is `curr_key`, ignoring the output and evict hints.
+    /// After this method, `self.curr_key() == Some(curr_key)`.
+    /// `curr_key` must exist in the `WindowStates`.
+    pub fn just_slide_to(&mut self, curr_key: &StateKey) -> Result<()> {
+        // TODO(rc): with the knowledge of the old output, we can "jump" to the `curr_key` directly for some window function kind
+        while self.curr_key() != Some(curr_key) {
+            self.just_slide()?;
         }
         Ok(())
     }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,17 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::sync::LazyLock;
 
 use itertools::Itertools as _;
 use parse_display::Display;
-use risingwave_common::error::ErrorCode;
 use risingwave_common::types::{DataType, DataTypeName};
-use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_common::util::iter_util::{ZipEqDebug, ZipEqFast};
+use thiserror::Error;
+use thiserror_ext::{Box, Macro};
 
+use crate::error::ErrorCode;
 use crate::expr::{Expr as _, ExprImpl, InputRef, Literal};
 
 /// Find the least restrictive type. Used by `VALUES`, `CASE`, `UNION`, etc.
@@ -29,7 +32,10 @@ use crate::expr::{Expr as _, ExprImpl, InputRef, Literal};
 ///
 /// If you also need to cast them to this type, and there are more than 2 exprs, check out
 /// [`align_types`].
-pub fn least_restrictive(lhs: DataType, rhs: DataType) -> std::result::Result<DataType, ErrorCode> {
+///
+/// Note: be careful that literal strings are considered untyped.
+/// e.g., `align_types(1, '1')` will be `Int32`, but `least_restrictive(Int32, Varchar)` will return error.
+fn least_restrictive(lhs: DataType, rhs: DataType) -> std::result::Result<DataType, ErrorCode> {
     if lhs == rhs {
         Ok(lhs)
     } else if cast_ok(&lhs, &rhs, CastContext::Implicit) {
@@ -64,7 +70,7 @@ pub fn align_types<'a>(
     let ret_type = ret_type.unwrap_or(DataType::Varchar);
     for e in exprs {
         // unwrap: cast to least_restrictive type always succeeds
-        e.cast_implicit_mut(ret_type.clone()).unwrap();
+        e.cast_implicit_mut(&ret_type).unwrap();
     }
     Ok(ret_type)
 }
@@ -81,6 +87,7 @@ pub fn align_array_and_element(
     element_indices: &[usize],
     inputs: &mut [ExprImpl],
 ) -> std::result::Result<DataType, ErrorCode> {
+    tracing::trace!(?inputs, "align_array_and_element begin");
     let mut dummy_element = match inputs[array_idx].is_untyped() {
         // when array is unknown type, make an unknown typed value (e.g. null)
         true => ExprImpl::from(Literal::new_untyped(None)),
@@ -105,67 +112,150 @@ pub fn align_array_and_element(
     let array_type = DataType::List(Box::new(common_element_type));
 
     // elements are already casted by `align_types`, we cast the array argument here
-    inputs[array_idx].cast_implicit_mut(array_type.clone())?;
-
+    inputs[array_idx].cast_implicit_mut(&array_type)?;
+    tracing::trace!(?inputs, "align_array_and_element done");
     Ok(array_type)
 }
 
+/// A stack of error messages for the cast operation.
+#[derive(Error, Debug, Box, Macro)]
+#[thiserror_ext(newtype(name = CastError), macro(path = "crate::expr"))]
+#[error("{message}")]
+pub struct CastErrorInner {
+    pub source: Option<CastError>,
+    pub message: Box<str>,
+}
+
+pub type CastResult<T = ()> = Result<T, CastError>;
+
+/// Returns `Ok` if `ok` is true, otherwise returns a placeholder [`CastError`] to be further
+/// wrapped with a more informative context in [`cast`].
+fn canbo(ok: bool) -> CastResult {
+    if ok { Ok(()) } else { bail_cast_error!() }
+}
+/// Equivalent to `canbo(false)`.
+fn cannot() -> CastResult {
+    canbo(false)
+}
+
 /// Checks whether casting from `source` to `target` is ok in `allows` context.
+/// Returns an error if the cast is not possible.
+pub fn cast(source: &DataType, target: &DataType, allows: CastContext) -> Result<(), CastError> {
+    macro_rules! any {
+        ($f:ident) => {
+            source.$f() || target.$f()
+        };
+    }
+
+    if any!(is_struct) {
+        cast_struct(source, target, allows)
+    } else if any!(is_array) {
+        cast_array(source, target, allows)
+    } else if any!(is_map) {
+        cast_map(source, target, allows)
+    } else {
+        canbo(cast_ok_base(source, target, allows))
+    }
+    .map_err(|inner| {
+        // Only show "in .. context" once in the error source chain.
+        let in_context = if inner.source().is_none() {
+            &format!(" in {:?} context", allows)
+        } else {
+            ""
+        };
+        cast_error!(
+            source = inner,
+            "cannot cast type \"{}\" to \"{}\"{}",
+            source,
+            target,
+            in_context,
+        )
+    })
+}
+
+/// Checks whether casting from `source` to `target` is ok in `allows` context.
+///
+/// Equivalent to `cast(..).is_ok()`, but [`cast`] may be preferred for its error messages.
 pub fn cast_ok(source: &DataType, target: &DataType, allows: CastContext) -> bool {
-    cast_ok_struct(source, target, allows)
-        || cast_ok_array(source, target, allows)
-        || cast_ok_base(source, target, allows)
+    cast(source, target, allows).is_ok()
 }
 
 /// Checks whether casting from `source` to `target` is ok in `allows` context.
 /// Both `source` and `target` must be base types, i.e. not struct or array.
 pub fn cast_ok_base(source: &DataType, target: &DataType, allows: CastContext) -> bool {
-    matches!(CAST_MAP.get(&(source.into(), target.into())), Some(context) if *context <= allows)
+    matches!(CAST_TABLE.get(&(source.into(), target.into())), Some(context) if *context <= allows)
+    // TODO(VECTOR_PLACEHOLDER): not in CAST_TABLE because
+    // * `DataType::try_from(DataTypeName::Vector).unwrap().to_oid()` panics
+    // * `DataTypeName::Vector.to_oid()` is better but `to_oid` does not work for `DataTypeName::List`
+    || matches!((source, target), (DataType::Varchar, DataType::Vector(_)) if CastContext::Explicit <= allows)
+    || matches!((source, target), (DataType::Vector(_), DataType::Varchar) if CastContext::Assign <= allows)
 }
 
-fn cast_ok_struct(source: &DataType, target: &DataType, allows: CastContext) -> bool {
+fn cast_struct(source: &DataType, target: &DataType, allows: CastContext) -> CastResult {
     match (source, target) {
         (DataType::Struct(lty), DataType::Struct(rty)) => {
             if lty.is_empty() || rty.is_empty() {
                 unreachable!("record type should be already processed at this point");
             }
             if lty.len() != rty.len() {
-                // only cast structs of the same length
-                return false;
+                bail_cast_error!("cannot cast structs of different lengths");
             }
             // ... and all fields are castable
-            lty.types()
-                .zip_eq_fast(rty.types())
-                .all(|(src, dst)| src == dst || cast_ok(src, dst, allows))
+            lty.iter().zip_eq_debug(rty.iter()).try_for_each(
+                |((src_name, src_ty), (dst_name, dst_ty))| {
+                    if src_ty == dst_ty {
+                        Ok(())
+                    } else {
+                        cast(src_ty, dst_ty, allows).map_err(|inner| {
+                            cast_error!(
+                                source = inner,
+                                "cannot cast struct field \"{}\" to struct field \"{}\"",
+                                src_name,
+                                dst_name
+                            )
+                        })
+                    }
+                },
+            )
         }
         // The automatic casts to string types are treated as assignment casts, while the automatic
         // casts from string types are explicit-only.
         // https://www.postgresql.org/docs/14/sql-createcast.html#id-1.9.3.58.7.4
-        (DataType::Varchar, DataType::Struct(_)) => CastContext::Explicit <= allows,
-        (DataType::Struct(_), DataType::Varchar) => CastContext::Assign <= allows,
-        _ => false,
+        (DataType::Varchar, DataType::Struct(_)) => canbo(CastContext::Explicit <= allows),
+        (DataType::Struct(_), DataType::Varchar) => canbo(CastContext::Assign <= allows),
+        _ => cannot(),
     }
 }
 
-fn cast_ok_array(source: &DataType, target: &DataType, allows: CastContext) -> bool {
+fn cast_array(source: &DataType, target: &DataType, allows: CastContext) -> CastResult {
     match (source, target) {
         (DataType::List(source_elem), DataType::List(target_elem)) => {
-            cast_ok(source_elem, target_elem, allows)
+            cast(source_elem, target_elem, allows)
         }
         // The automatic casts to string types are treated as assignment casts, while the automatic
         // casts from string types are explicit-only.
         // https://www.postgresql.org/docs/14/sql-createcast.html#id-1.9.3.58.7.4
-        (DataType::Varchar, DataType::List(_)) => CastContext::Explicit <= allows,
-        (DataType::List(_), DataType::Varchar) => CastContext::Assign <= allows,
-        _ => false,
+        (DataType::Varchar, DataType::List(_)) => canbo(CastContext::Explicit <= allows),
+        (DataType::List(_), DataType::Varchar) => canbo(CastContext::Assign <= allows),
+        _ => cannot(),
     }
 }
 
-pub fn cast_map_array() -> Vec<(DataTypeName, DataTypeName, CastContext)> {
-    CAST_MAP
-        .iter()
-        .map(|((src, target), ctx)| (*src, *target, *ctx))
-        .collect_vec()
+fn cast_map(source: &DataType, target: &DataType, allows: CastContext) -> CastResult {
+    match (source, target) {
+        (DataType::Map(source_elem), DataType::Map(target_elem)) => {
+            if source_elem.key() != target_elem.key() {
+                cast(source_elem.key(), target_elem.key(), allows)
+                    .map_err(|inner| cast_error!(source = inner, "cannot cast map key"))?;
+            }
+            if source_elem.value() != target_elem.value() {
+                cast(source_elem.value(), target_elem.value(), allows)
+                    .map_err(|inner| cast_error!(source = inner, "cannot cast map value"))?;
+            }
+            Ok(())
+        }
+        _ => cannot(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,10 +278,10 @@ pub enum CastContext {
     Explicit,
 }
 
-pub type CastMap = BTreeMap<(DataTypeName, DataTypeName), CastContext>;
+pub type CastTable = BTreeMap<(DataTypeName, DataTypeName), CastContext>;
 
 pub fn cast_sigs() -> impl Iterator<Item = CastSig> {
-    CAST_MAP
+    CAST_TABLE
         .iter()
         .map(|((from_type, to_type), context)| CastSig {
             from_type: *from_type,
@@ -200,7 +290,7 @@ pub fn cast_sigs() -> impl Iterator<Item = CastSig> {
         })
 }
 
-pub static CAST_MAP: LazyLock<CastMap> = LazyLock::new(|| {
+pub static CAST_TABLE: LazyLock<CastTable> = LazyLock::new(|| {
     // cast rules:
     // 1. implicit cast operations in PG are organized in 3 sequences,
     //    with the reverse direction being assign cast operations.
@@ -216,22 +306,23 @@ pub static CAST_MAP: LazyLock<CastMap> = LazyLock::new(|| {
     use DataTypeName::*;
     const CAST_TABLE: &[(&str, DataTypeName)] = &[
         // 123456789ABCDEF
-        (". e            a", Boolean),     // 0
-        (" .iiiiii       a", Int16),       // 1
-        ("ea.iiiii       a", Int32),       // 2
-        (" aa.iiii       a", Int64),       // 3
-        (" aaa.ii        a", Decimal),     // 4
-        (" aaaa.i        a", Float32),     // 5
-        (" aaaaa.        a", Float64),     // 6
-        ("      e.       a", Int256),      // 7
-        ("        .ii    a", Date),        // 8
-        ("        a.ia   a", Timestamp),   // 9
-        ("        aa.a   a", Timestamptz), // A
-        ("           .i  a", Time),        // B
-        ("           a.  a", Interval),    // C
-        ("eeeeeee      . a", Jsonb),       // D
-        ("              .a", Bytea),       // E
-        ("eeeeeeeeeeeeeee.", Varchar),     // F
+        (". e            a ", Boolean),     // 0
+        (" .iiiiii       a ", Int16),       // 1
+        ("ea.iiiii       a ", Int32),       // 2
+        (" aa.iiii       ae", Int64),       // 3
+        (" aaa.ii        a ", Decimal),     // 4
+        (" aaaa.i        a ", Float32),     // 5
+        (" aaaaa.        a ", Float64),     // 6
+        ("      e.       a ", Int256),      // 7
+        ("        .ii    a ", Date),        // 8
+        ("        a.ia   a ", Timestamp),   // 9
+        ("        aa.a   a ", Timestamptz), // A
+        ("           .i  a ", Time),        // B
+        ("           a.  a ", Interval),    // C
+        ("eeeeeee      . a ", Jsonb),       // D
+        ("              .a ", Bytea),       // E
+        ("eeeeeeeeeeeeeee. ", Varchar),     // F
+        ("   e            .", Serial),
     ];
     let mut map = BTreeMap::new();
     for (row, source) in CAST_TABLE {
@@ -254,8 +345,8 @@ mod tests {
     use super::*;
 
     fn gen_cast_table(allows: CastContext) -> Vec<String> {
-        use itertools::Itertools as _;
         use DataType as T;
+        use itertools::Itertools as _;
         let all_types = &[
             T::Boolean,
             T::Int16,
@@ -289,7 +380,7 @@ mod tests {
     fn test_cast_ok() {
         // With the help of a script we can obtain the 3 expected cast tables from PG. They are
         // slightly modified on same-type cast and from-string cast for reasons explained above in
-        // `build_cast_map`.
+        // `build_cast_table`.
 
         let actual = gen_cast_table(CastContext::Implicit);
         assert_eq!(

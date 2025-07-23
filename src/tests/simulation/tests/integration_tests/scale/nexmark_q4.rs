@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use risingwave_simulation::cluster::Configuration;
-use risingwave_simulation::ctl_ext::predicate::{
-    identity_contains, upstream_fragment_count, BoxedPredicate,
-};
+use itertools::Itertools;
+use risingwave_common::hash::WorkerSlotId;
+use risingwave_simulation::cluster::{Configuration, KillOpts};
+use risingwave_simulation::ctl_ext::predicate::{BoxedPredicate, identity_contains};
 use risingwave_simulation::nexmark::queries::q4::*;
 use risingwave_simulation::nexmark::{NexmarkCluster, THROUGHPUT};
 use risingwave_simulation::utils::AssertResult;
@@ -65,11 +65,14 @@ async fn nexmark_q4_ref() -> Result<()> {
     Ok(())
 }
 
-async fn nexmark_q4_common(predicates: impl IntoIterator<Item = BoxedPredicate>) -> Result<()> {
+async fn nexmark_q4_common(
+    predicates: impl IntoIterator<Item = BoxedPredicate>,
+    recovery: bool,
+) -> Result<()> {
     let mut cluster = init().await?;
 
     let fragment = cluster.locate_one_fragment(predicates).await?;
-    let id = fragment.id();
+    let workers = fragment.all_worker_count().into_keys().collect_vec();
 
     // 0s
     wait_initial_data(&mut cluster)
@@ -77,15 +80,41 @@ async fn nexmark_q4_common(predicates: impl IntoIterator<Item = BoxedPredicate>)
         .assert_result_ne(RESULT);
 
     // 0~10s
-    cluster.reschedule(format!("{id}-[0,1]")).await?;
+    cluster
+        .reschedule(fragment.reschedule(
+            [
+                WorkerSlotId::new(workers[0], 0),
+                WorkerSlotId::new(workers[0], 1),
+            ],
+            [],
+        ))
+        .await?;
 
     sleep(Duration::from_secs(5)).await;
 
     // 5~15s
     cluster.run(SELECT).await?.assert_result_ne(RESULT);
-    cluster.reschedule(format!("{id}-[2,3]+[0,1]")).await?;
+    cluster
+        .reschedule(fragment.reschedule(
+            [
+                WorkerSlotId::new(workers[1], 0),
+                WorkerSlotId::new(workers[1], 1),
+            ],
+            [
+                WorkerSlotId::new(workers[0], 0),
+                WorkerSlotId::new(workers[0], 1),
+            ],
+        ))
+        .await?;
 
     sleep(Duration::from_secs(20)).await;
+
+    if recovery {
+        // Trigger recovery
+        cluster.kill_node(&KillOpts::ALL).await;
+
+        sleep(Duration::from_secs(5)).await;
+    }
 
     // 25~35s
     cluster.run(SELECT).await?.assert_result_eq(RESULT);
@@ -95,25 +124,43 @@ async fn nexmark_q4_common(predicates: impl IntoIterator<Item = BoxedPredicate>)
 
 #[tokio::test]
 async fn nexmark_q4_materialize_agg() -> Result<()> {
-    nexmark_q4_common([
-        identity_contains("materialize"),
-        identity_contains("hashagg"),
-    ])
+    nexmark_q4_common(
+        [
+            identity_contains("materialize"),
+            identity_contains("hashagg"),
+        ],
+        false,
+    )
+    .await
+}
+#[tokio::test]
+async fn nexmark_q4_materialize_agg_with_recovery() -> Result<()> {
+    nexmark_q4_common(
+        [
+            identity_contains("materialize"),
+            identity_contains("hashagg"),
+        ],
+        true,
+    )
     .await
 }
 
 #[tokio::test]
 async fn nexmark_q4_source() -> Result<()> {
-    nexmark_q4_common([identity_contains("source: bid")]).await
+    nexmark_q4_common([identity_contains("source: bid")], false).await
+}
+
+#[tokio::test]
+async fn nexmark_q4_source_with_recovery() -> Result<()> {
+    nexmark_q4_common([identity_contains("source: bid")], true).await
 }
 
 #[tokio::test]
 async fn nexmark_q4_agg_join() -> Result<()> {
-    nexmark_q4_common([
-        identity_contains("hashagg"),
-        identity_contains("hashjoin"),
-        upstream_fragment_count(2),
-    ])
+    nexmark_q4_common(
+        [identity_contains("hashagg"), identity_contains("hashjoin")],
+        false,
+    )
     .await
 }
 
@@ -130,13 +177,12 @@ async fn nexmark_q4_cascade() -> Result<()> {
     let id_1 = fragment_1.id();
 
     let fragment_2 = cluster
-        .locate_one_fragment([
-            identity_contains("hashagg"),
-            identity_contains("hashjoin"),
-            upstream_fragment_count(2),
-        ])
+        .locate_one_fragment([identity_contains("hashagg"), identity_contains("hashjoin")])
         .await?;
     let id_2 = fragment_2.id();
+
+    // todo, fragment_1's worker
+    let workers = fragment_1.all_worker_count().into_keys().collect_vec();
 
     // 0s
     wait_initial_data(&mut cluster)
@@ -145,7 +191,13 @@ async fn nexmark_q4_cascade() -> Result<()> {
 
     // 0~10s
     cluster
-        .reschedule(format!("{id_1}-[0,1]; {id_2}-[0,2,4]"))
+        .reschedule(format!(
+            "{}:[{}];{}:[{}]",
+            fragment_1.id(),
+            format_args!("{}:-2", workers[0]),
+            fragment_2.id(),
+            format_args!("{}:-1,{}:-1,{}:-1", workers[0], workers[1], workers[2]),
+        ))
         .await?;
 
     sleep(Duration::from_secs(5)).await;
@@ -153,7 +205,15 @@ async fn nexmark_q4_cascade() -> Result<()> {
     // 5~15s
     cluster.run(SELECT).await?.assert_result_ne(RESULT);
     cluster
-        .reschedule(format!("{id_1}-[2,4]+[0,1]; {id_2}-[3]+[0,4]"))
+        .reschedule(format!(
+            "{}:[{},{}];{}:[{},{}]",
+            id_1,
+            format_args!("{}:-1,{}:-1", workers[1], workers[2]),
+            format_args!("{}:2", workers[0]),
+            id_2,
+            format_args!("{}:-1", workers[1]),
+            format_args!("{}:1,{}:1", workers[0], workers[2]),
+        ))
         .await?;
 
     sleep(Duration::from_secs(20)).await;
@@ -176,14 +236,27 @@ async fn nexmark_q4_materialize_agg_cache_invalidation() -> Result<()> {
         ])
         .await?;
     let id = fragment.id();
+    let workers = fragment.all_worker_count().into_keys().collect_vec();
 
-    // Let parallel unit 0 handle all groups.
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
+    // Let worker slot 0 handle all groups.
+    cluster
+        .reschedule(format!(
+            "{}:[{}]",
+            id,
+            format_args!("{}:-1,{}:-2,{}:-2", workers[0], workers[1], workers[2]),
+        ))
+        .await?;
     sleep(Duration::from_secs(7)).await;
     let result_1 = cluster.run(SELECT).await?.assert_result_ne(RESULT);
 
     // Scale out.
-    cluster.reschedule(format!("{id}+[1,2,3,4,5]")).await?;
+    cluster
+        .reschedule(format!(
+            "{}:[{}]",
+            id,
+            format_args!("{}:1,{}:2,{}:2", workers[0], workers[1], workers[2]),
+        ))
+        .await?;
     sleep(Duration::from_secs(7)).await;
     cluster
         .run(SELECT)
@@ -191,10 +264,16 @@ async fn nexmark_q4_materialize_agg_cache_invalidation() -> Result<()> {
         .assert_result_ne(result_1)
         .assert_result_ne(RESULT);
 
-    // Let parallel unit 0 handle all groups again.
-    // Note that there're only 5 groups, so if the parallel unit 0 doesn't invalidate the cache
+    // Let worker slot 0 handle all groups again.
+    // Note that there're only 5 groups, so if the worker slot 0 doesn't invalidate the cache
     // correctly, it will yield the wrong result.
-    cluster.reschedule(format!("{id}-[1,2,3,4,5]")).await?;
+    cluster
+        .reschedule(format!(
+            "{}:[{}]",
+            id,
+            format_args!("{}:-1,{}:-2,{}:-2", workers[0], workers[1], workers[2]),
+        ))
+        .await?;
     sleep(Duration::from_secs(20)).await;
 
     cluster.run(SELECT).await?.assert_result_eq(RESULT);

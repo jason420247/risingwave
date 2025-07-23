@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,9 +51,6 @@ pub enum TraceError {
     #[error("{0}")]
     Other(&'static str),
 
-    #[error("failed to validate epoch")]
-    ValidateReadEpochFailed,
-
     #[error("failed to try wait epoch")]
     TryWaitEpochFailed,
 
@@ -62,4 +59,7 @@ pub enum TraceError {
 
     #[error("failed to flush")]
     FlushFailed,
+
+    #[error("failed to try_flush")]
+    TryFlushFailed,
 }

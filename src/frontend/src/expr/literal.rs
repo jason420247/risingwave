@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::types::{literal_type_match, DataType, Datum, ToText};
+use risingwave_common::types::{DataType, Datum, ToText, literal_type_match};
 use risingwave_common::util::value_encoding::{DatumFromProtoExt, DatumToProtoExt};
 use risingwave_pb::expr::expr_node::RexNode;
 
@@ -54,7 +54,9 @@ impl std::fmt::Debug for Literal {
                     | DataType::Interval
                     | DataType::Jsonb
                     | DataType::Int256
-                    | DataType::Struct(_) => write!(
+                    | DataType::Struct(_)
+                    | DataType::Map(_)
+                    | DataType::Vector(_) => write!(
                         f,
                         "'{}'",
                         v.as_scalar_ref_impl().to_text_with_type(&data_type)
@@ -69,7 +71,12 @@ impl std::fmt::Debug for Literal {
 
 impl Literal {
     pub fn new(data: Datum, data_type: DataType) -> Self {
-        assert!(literal_type_match(&data_type, data.as_ref()));
+        assert!(
+            literal_type_match(&data_type, data.as_ref()),
+            "data_type: {:?}, data: {:?}",
+            data_type,
+            data
+        );
         Literal {
             data,
             data_type: Some(data_type),
@@ -87,13 +94,17 @@ impl Literal {
         &self.data
     }
 
+    pub fn get_data_type(&self) -> &Option<DataType> {
+        &self.data_type
+    }
+
     pub fn is_untyped(&self) -> bool {
         self.data_type.is_none()
     }
 
     pub(super) fn from_expr_proto(
         proto: &risingwave_pb::expr::ExprNode,
-    ) -> risingwave_common::error::Result<Self> {
+    ) -> crate::error::Result<Self> {
         let data_type = proto.get_return_type()?;
         Ok(Self {
             data: value_encoding_to_literal(&proto.rex_node, &data_type.into())?,
@@ -126,7 +137,7 @@ pub fn literal_to_value_encoding(d: &Datum) -> RexNode {
 fn value_encoding_to_literal(
     proto: &Option<RexNode>,
     ty: &DataType,
-) -> risingwave_common::error::Result<Datum> {
+) -> crate::error::Result<Datum> {
     if let Some(rex_node) = proto {
         if let RexNode::Constant(prost_datum) = rex_node {
             let datum = Datum::from_protobuf(prost_datum, ty)?;
@@ -142,7 +153,7 @@ fn value_encoding_to_literal(
 #[cfg(test)]
 mod tests {
     use risingwave_common::array::{ListValue, StructValue};
-    use risingwave_common::types::{DataType, Datum, ScalarImpl};
+    use risingwave_common::types::{DataType, Datum, ScalarImpl, StructType};
     use risingwave_common::util::value_encoding::DatumFromProtoExt;
     use risingwave_pb::expr::expr_node::RexNode;
 
@@ -160,10 +171,8 @@ mod tests {
         if let RexNode::Constant(prost) = node {
             let data2 = Datum::from_protobuf(
                 &prost,
-                &DataType::new_struct(
-                    vec![DataType::Varchar, DataType::Int32, DataType::Int32],
-                    vec![],
-                ),
+                &StructType::unnamed(vec![DataType::Varchar, DataType::Int32, DataType::Int32])
+                    .into(),
             )
             .unwrap()
             .unwrap();

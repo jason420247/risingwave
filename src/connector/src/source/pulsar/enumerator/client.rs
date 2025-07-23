@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{anyhow, bail, Result};
+use std::fmt::Debug;
+
+use anyhow::anyhow;
 use async_trait::async_trait;
 use itertools::Itertools;
 use pulsar::{Pulsar, TokioExecutor};
+use risingwave_common::bail;
 use serde::{Deserialize, Serialize};
 
-use crate::source::pulsar::split::PulsarSplit;
-use crate::source::pulsar::topic::{parse_topic, Topic};
+use crate::error::ConnectorResult;
 use crate::source::pulsar::PulsarProperties;
+use crate::source::pulsar::split::PulsarSplit;
+use crate::source::pulsar::topic::{PERSISTENT_DOMAIN, Topic, check_topic_exists, parse_topic};
 use crate::source::{SourceEnumeratorContextRef, SplitEnumerator};
 
 pub struct PulsarSplitEnumerator {
@@ -45,7 +49,7 @@ impl SplitEnumerator for PulsarSplitEnumerator {
     async fn new(
         properties: PulsarProperties,
         _context: SourceEnumeratorContextRef,
-    ) -> Result<PulsarSplitEnumerator> {
+    ) -> ConnectorResult<PulsarSplitEnumerator> {
         let pulsar = properties
             .common
             .build_client(&properties.oauth, &properties.aws_auth_props)
@@ -63,7 +67,7 @@ impl SplitEnumerator for PulsarSplitEnumerator {
             None => PulsarEnumeratorOffset::Earliest,
             _ => {
                 bail!(
-                    "properties `startup_mode` only support earliest and latest or leave it empty"
+                    "properties `startup_mode` only supports earliest and latest or leaving it empty"
                 );
             }
         };
@@ -80,7 +84,7 @@ impl SplitEnumerator for PulsarSplitEnumerator {
         })
     }
 
-    async fn list_splits(&mut self) -> anyhow::Result<Vec<PulsarSplit>> {
+    async fn list_splits(&mut self) -> ConnectorResult<Vec<PulsarSplit>> {
         let offset = self.start_offset.clone();
         // MessageId is only used when recovering from a State
         assert!(!matches!(offset, PulsarEnumeratorOffset::MessageId(_)));
@@ -93,6 +97,7 @@ impl SplitEnumerator for PulsarSplitEnumerator {
 
         let splits = if topic_partitions > 0 {
             // partitioned topic
+            // if we can know the number of partitions, the topic must exist
             (0..topic_partitions as i32)
                 .map(|p| PulsarSplit {
                     topic: self.topic.sub_topic(p).unwrap(),
@@ -100,6 +105,14 @@ impl SplitEnumerator for PulsarSplitEnumerator {
                 })
                 .collect_vec()
         } else {
+            // only do existence check for persistent non-partitioned topic
+            //
+            // for non-persistent topic, all metadata is in broker memory
+            // unless there's a live producer/consumer, the broker may not be aware of the non-persistent topic.
+            if self.topic.domain == PERSISTENT_DOMAIN {
+                // if the topic is non-partitioned, we need to check if the topic exists on the broker
+                check_topic_exists(&self.client, &self.topic).await?;
+            }
             // non partitioned topic
             vec![PulsarSplit {
                 topic: self.topic.clone(),

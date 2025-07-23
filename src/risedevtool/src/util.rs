@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Display;
 use std::process::Command;
+use std::sync::LazyLock;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
@@ -20,7 +22,7 @@ use itertools::Itertools;
 pub fn get_program_name(cmd: &Command) -> String {
     let program_path = cmd.get_program().to_string_lossy();
     match program_path.rsplit_once('/') {
-        Some((_, rest)) => rest.to_string(),
+        Some((_, rest)) => rest.to_owned(),
         None => program_path.to_string(),
     }
 }
@@ -45,10 +47,18 @@ pub fn new_spinner() -> ProgressBar {
     let pb = ProgressBar::new(0);
     pb.set_style(
         ProgressStyle::default_spinner()
-            .template("{spinner} {prefix}: {msg}")
+            .template("🟡 {prefix}: {msg}")
             .unwrap(),
     );
     pb
+}
+
+pub fn begin_spin(pb: &ProgressBar) {
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner} {prefix}: {msg}")
+            .unwrap(),
+    );
 }
 
 pub fn complete_spin(pb: &ProgressBar) {
@@ -71,11 +81,33 @@ pub fn is_env_set(var: &str) -> bool {
     if let Ok(val) = std::env::var(var) {
         if let Ok(true) = val.parse() {
             return true;
-        } else if let Ok(x) = val.parse::<usize>() {
-            if x != 0 {
-                return true;
-            }
+        } else if let Ok(x) = val.parse::<usize>()
+            && x != 0
+        {
+            return true;
         }
     }
     false
+}
+
+pub fn is_enable_backtrace() -> bool {
+    !is_env_set("DISABLE_BACKTRACE")
+}
+
+pub fn risedev_cmd() -> &'static str {
+    static RISEDEV_CMD: LazyLock<String> = LazyLock::new(|| {
+        if let Ok(val) = std::env::var("RISEDEV_CMD") {
+            val
+        } else {
+            "./risedev".to_owned()
+        }
+    });
+
+    RISEDEV_CMD.as_str()
+}
+
+pub fn stylized_risedev_subcmd(subcmd: &str) -> impl Display + use<> {
+    console::style(format!("{} {}", risedev_cmd(), subcmd))
+        .blue()
+        .bold()
 }

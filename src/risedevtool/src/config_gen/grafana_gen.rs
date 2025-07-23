@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::GrafanaConfig;
 pub struct GrafanaGen;
@@ -29,6 +29,8 @@ impl GrafanaGen {
 [server]
 http_addr = {grafana_host}
 http_port = {grafana_port}
+grpc-max-recv-msg-size-bytes = 104857600 # 100 Mb
+grpc-max-send-msg-size-bytes = 104857600 # 100 Mb
 
 [users]
 default_theme = light
@@ -48,7 +50,7 @@ org_role = Admin
         let provide_prometheus = config.provide_prometheus.as_ref().unwrap();
         if provide_prometheus.len() != 1 {
             return Err(anyhow!(
-                "expect 1 prometheus nodes, found {}",
+                "expect 1 prometheus node, found {}",
                 provide_prometheus.len()
             ));
         }
@@ -82,7 +84,7 @@ datasources:
         let provide_tempo = config.provide_tempo.as_ref().unwrap();
         if provide_tempo.len() != 1 {
             return Err(anyhow!(
-                "expect 1 tempo nodes, found {}",
+                "expect 1 tempo node, found {}",
                 provide_tempo.len()
             ));
         }
@@ -118,7 +120,7 @@ datasources:
         let provide_prometheus = config.provide_prometheus.as_ref().unwrap();
         if provide_prometheus.len() != 1 {
             return Err(anyhow!(
-                "expect 1 prometheus nodes, found {}",
+                "expect 1 prometheus node, found {}",
                 provide_prometheus.len()
             ));
         };
@@ -168,7 +170,7 @@ providers:
         let provide_prometheus = config.provide_prometheus.as_ref().unwrap();
         if provide_prometheus.len() != 1 {
             return Err(anyhow!(
-                "expect 1 prometheus nodes, found {}",
+                "expect 1 prometheus node, found {}",
                 provide_prometheus.len()
             ));
         };

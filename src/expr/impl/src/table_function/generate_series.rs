@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,39 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use chrono_tz::Tz;
 use num_traits::One;
-use risingwave_common::types::{CheckedAdd, Decimal, IsNegative};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_common::types::{CheckedAdd, Decimal, Interval, IsNegative, Timestamptz};
+use risingwave_expr::expr_context::TIME_ZONE;
+use risingwave_expr::{ExprError, Result, capture_context, function};
 
 #[function("generate_series(int4, int4) -> setof int4")]
 #[function("generate_series(int8, int8) -> setof int8")]
-fn generate_series<T>(start: T, stop: T) -> Result<impl Iterator<Item = Result<T>>>
+fn generate_series<T>(start: T, stop: T) -> Result<impl Iterator<Item = T>>
 where
     T: CheckedAdd<Output = T> + PartialOrd + Copy + One + IsNegative,
 {
-    range_generic::<_, _, true>(start, stop, T::one())
+    range_generic::<_, _, _, true>(start, stop, T::one(), ())
 }
 
 #[function("generate_series(decimal, decimal) -> setof decimal")]
-fn generate_series_decimal(
-    start: Decimal,
-    stop: Decimal,
-) -> Result<impl Iterator<Item = Result<Decimal>>>
+fn generate_series_decimal(start: Decimal, stop: Decimal) -> Result<impl Iterator<Item = Decimal>>
 where
 {
     validate_range_parameters(start, stop, Decimal::one())?;
-    range_generic::<Decimal, Decimal, true>(start, stop, Decimal::one())
+    range_generic::<Decimal, Decimal, _, true>(start, stop, Decimal::one(), ())
 }
 
 #[function("generate_series(int4, int4, int4) -> setof int4")]
 #[function("generate_series(int8, int8, int8) -> setof int8")]
 #[function("generate_series(timestamp, timestamp, interval) -> setof timestamp")]
-fn generate_series_step<T, S>(start: T, stop: T, step: S) -> Result<impl Iterator<Item = Result<T>>>
+fn generate_series_step<T, S>(start: T, stop: T, step: S) -> Result<impl Iterator<Item = T>>
 where
     T: CheckedAdd<S, Output = T> + PartialOrd + Copy,
     S: IsNegative + Copy,
 {
-    range_generic::<_, _, true>(start, stop, step)
+    range_generic::<_, _, _, true>(start, stop, step, ())
 }
 
 #[function("generate_series(decimal, decimal, decimal) -> setof decimal")]
@@ -52,37 +51,68 @@ fn generate_series_step_decimal(
     start: Decimal,
     stop: Decimal,
     step: Decimal,
-) -> Result<impl Iterator<Item = Result<Decimal>>> {
+) -> Result<impl Iterator<Item = Decimal>> {
     validate_range_parameters(start, stop, step)?;
-    range_generic::<_, _, true>(start, stop, step)
+    range_generic::<_, _, _, true>(start, stop, step, ())
+}
+
+#[function("generate_series(timestamptz, timestamptz, interval) -> setof timestamptz")]
+fn generate_series_timestamptz_session(
+    start: Timestamptz,
+    stop: Timestamptz,
+    step: Interval,
+) -> Result<impl Iterator<Item = Timestamptz>> {
+    generate_series_timestamptz_impl_captured(start, stop, step)
+}
+
+#[function("generate_series(timestamptz, timestamptz, interval, varchar) -> setof timestamptz")]
+fn generate_series_timestamptz_at_zone(
+    start: Timestamptz,
+    stop: Timestamptz,
+    step: Interval,
+    time_zone: &str,
+) -> Result<impl Iterator<Item = Timestamptz>> {
+    generate_series_timestamptz_impl(time_zone, start, stop, step)
+}
+
+#[capture_context(TIME_ZONE)]
+fn generate_series_timestamptz_impl(
+    time_zone: &str,
+    start: Timestamptz,
+    stop: Timestamptz,
+    step: Interval,
+) -> Result<impl Iterator<Item = Timestamptz> + use<>> {
+    let time_zone =
+        Timestamptz::lookup_time_zone(time_zone).map_err(crate::scalar::time_zone_err)?;
+    range_generic::<_, _, _, true>(start, stop, step, time_zone)
 }
 
 #[function("range(int4, int4) -> setof int4")]
 #[function("range(int8, int8) -> setof int8")]
-fn range<T>(start: T, stop: T) -> Result<impl Iterator<Item = Result<T>>>
+fn range<T>(start: T, stop: T) -> Result<impl Iterator<Item = T>>
 where
     T: CheckedAdd<Output = T> + PartialOrd + Copy + One + IsNegative,
 {
-    range_generic::<_, _, false>(start, stop, T::one())
+    range_generic::<_, _, _, false>(start, stop, T::one(), ())
 }
 
 #[function("range(decimal, decimal) -> setof decimal")]
-fn range_decimal(start: Decimal, stop: Decimal) -> Result<impl Iterator<Item = Result<Decimal>>>
+fn range_decimal(start: Decimal, stop: Decimal) -> Result<impl Iterator<Item = Decimal>>
 where
 {
     validate_range_parameters(start, stop, Decimal::one())?;
-    range_generic::<Decimal, Decimal, false>(start, stop, Decimal::one())
+    range_generic::<Decimal, Decimal, _, false>(start, stop, Decimal::one(), ())
 }
 
 #[function("range(int4, int4, int4) -> setof int4")]
 #[function("range(int8, int8, int8) -> setof int8")]
 #[function("range(timestamp, timestamp, interval) -> setof timestamp")]
-fn range_step<T, S>(start: T, stop: T, step: S) -> Result<impl Iterator<Item = Result<T>>>
+fn range_step<T, S>(start: T, stop: T, step: S) -> Result<impl Iterator<Item = T>>
 where
     T: CheckedAdd<S, Output = T> + PartialOrd + Copy,
     S: IsNegative + Copy,
 {
-    range_generic::<_, _, false>(start, stop, step)
+    range_generic::<_, _, _, false>(start, stop, step, ())
 }
 
 #[function("range(decimal, decimal, decimal) -> setof decimal")]
@@ -90,20 +120,46 @@ fn range_step_decimal(
     start: Decimal,
     stop: Decimal,
     step: Decimal,
-) -> Result<impl Iterator<Item = Result<Decimal>>> {
+) -> Result<impl Iterator<Item = Decimal>> {
     validate_range_parameters(start, stop, step)?;
-    range_generic::<_, _, false>(start, stop, step)
+    range_generic::<_, _, _, false>(start, stop, step, ())
+}
+
+pub trait CheckedAddWithExtra<Rhs = Self, Extra = ()> {
+    type Output;
+    fn checked_add_with_extra(self, rhs: Rhs, extra: Extra) -> Option<Self::Output>;
+}
+
+impl<L, R> CheckedAddWithExtra<R, ()> for L
+where
+    L: CheckedAdd<R>,
+{
+    type Output = L::Output;
+
+    fn checked_add_with_extra(self, rhs: R, _: ()) -> Option<Self::Output> {
+        self.checked_add(rhs)
+    }
+}
+
+impl CheckedAddWithExtra<Interval, Tz> for Timestamptz {
+    type Output = Self;
+
+    fn checked_add_with_extra(self, rhs: Interval, extra: Tz) -> Option<Self::Output> {
+        crate::scalar::timestamptz_interval_add_internal(self, rhs, extra).ok()
+    }
 }
 
 #[inline]
-fn range_generic<T, S, const INCLUSIVE: bool>(
+fn range_generic<T, S, E, const INCLUSIVE: bool>(
     start: T,
     stop: T,
     step: S,
-) -> Result<impl Iterator<Item = Result<T>>>
+    extra: E,
+) -> Result<impl Iterator<Item = T>>
 where
-    T: CheckedAdd<S, Output = T> + PartialOrd + Copy,
+    T: CheckedAddWithExtra<S, E, Output = T> + PartialOrd + Copy,
     S: IsNegative + Copy,
+    E: Copy,
 {
     if step.is_zero() {
         return Err(ExprError::InvalidParam {
@@ -113,21 +169,22 @@ where
     }
     let mut cur = start;
     let neg = step.is_negative();
-    let mut next = move || {
+    let next = move || {
         match (INCLUSIVE, neg) {
-            (true, true) if cur < stop => return Ok(None),
-            (true, false) if cur > stop => return Ok(None),
-            (false, true) if cur <= stop => return Ok(None),
-            (false, false) if cur >= stop => return Ok(None),
+            (true, true) if cur < stop => return None,
+            (true, false) if cur > stop => return None,
+            (false, true) if cur <= stop => return None,
+            (false, false) if cur >= stop => return None,
             _ => {}
         };
         let ret = cur;
-        cur = cur.checked_add(step).ok_or(ExprError::NumericOutOfRange)?;
-        Ok(Some(ret))
+        cur = cur.checked_add_with_extra(step, extra)?;
+        Some(ret)
     };
-    Ok(std::iter::from_fn(move || next().transpose()))
+    Ok(std::iter::from_fn(next))
 }
 
+/// Validate decimals can not be `NaN` or `infinity`.
 #[inline]
 fn validate_range_parameters(start: Decimal, stop: Decimal, step: Decimal) -> Result<()> {
     validate_decimal(start, "start")?;
@@ -160,8 +217,7 @@ mod tests {
     use risingwave_common::types::test_utils::IntervalTestExt;
     use risingwave_common::types::{DataType, Decimal, Interval, ScalarImpl, Timestamp};
     use risingwave_expr::expr::{BoxedExpression, ExpressionBoxExt, LiteralExpression};
-    use risingwave_expr::table_function::build;
-    use risingwave_expr::ExprError;
+    use risingwave_expr::table_function::{build, check_error};
     use risingwave_pb::expr::table_function::PbType;
 
     const CHUNK_SIZE: usize = 1024;
@@ -309,40 +365,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_series_decimal() {
-        let start = Decimal::from_str("1").unwrap();
-        let start_inf = Decimal::from_str("infinity").unwrap();
-        let stop = Decimal::from_str("5").unwrap();
-        let stop_inf = Decimal::from_str("-infinity").unwrap();
-
-        let step = Decimal::from_str("1").unwrap();
-        let step_nan = Decimal::from_str("nan").unwrap();
-        let step_inf = Decimal::from_str("infinity").unwrap();
-        generate_series_decimal(start, stop, step, true).await;
-        generate_series_decimal(start_inf, stop, step, false).await;
-        generate_series_decimal(start_inf, stop_inf, step, false).await;
-        generate_series_decimal(start, stop_inf, step, false).await;
-        generate_series_decimal(start, stop, step_nan, false).await;
-        generate_series_decimal(start, stop, step_inf, false).await;
-        generate_series_decimal(start, stop_inf, step_nan, false).await;
+        generate_series_decimal("1", "5", "1", true).await;
+        generate_series_decimal("inf", "5", "1", false).await;
+        generate_series_decimal("inf", "-inf", "1", false).await;
+        generate_series_decimal("1", "-inf", "1", false).await;
+        generate_series_decimal("1", "5", "nan", false).await;
+        generate_series_decimal("1", "5", "inf", false).await;
+        generate_series_decimal("1", "-inf", "nan", false).await;
     }
 
-    async fn generate_series_decimal(
-        start: Decimal,
-        stop: Decimal,
-        step: Decimal,
-        expect_ok: bool,
-    ) {
-        fn literal(ty: DataType, v: ScalarImpl) -> BoxedExpression {
-            LiteralExpression::new(ty, Some(v)).boxed()
+    async fn generate_series_decimal(start: &str, stop: &str, step: &str, expect_ok: bool) {
+        fn decimal_literal(v: Decimal) -> BoxedExpression {
+            LiteralExpression::new(DataType::Decimal, Some(v.into())).boxed()
         }
         let function = build(
             PbType::GenerateSeries,
             DataType::Decimal,
             CHUNK_SIZE,
             vec![
-                literal(DataType::Decimal, start.into()),
-                literal(DataType::Decimal, stop.into()),
-                literal(DataType::Decimal, step.into()),
+                decimal_literal(start.parse().unwrap()),
+                decimal_literal(stop.parse().unwrap()),
+                decimal_literal(step.parse().unwrap()),
             ],
         )
         .unwrap();
@@ -350,17 +393,13 @@ mod tests {
         let dummy_chunk = DataChunk::new_dummy(1);
         let mut output = function.eval(&dummy_chunk).await;
         while let Some(res) = output.next().await {
-            match res {
-                Ok(_) => {
-                    assert!(expect_ok);
-                }
-                Err(ExprError::InvalidParam { .. }) => {
-                    assert!(!expect_ok);
-                }
-                Err(_) => {
-                    unreachable!();
-                }
-            }
+            let chunk = res.unwrap();
+            let error = check_error(&chunk);
+            assert_eq!(
+                error.is_ok(),
+                expect_ok,
+                "generate_series({start}, {stop}, {step})"
+            );
         }
     }
 }

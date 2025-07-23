@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,16 +13,18 @@
 // limitations under the License.
 
 use std::fmt::Debug;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::mem::size_of;
 
-use risingwave_pb::common::buffer::CompressionType;
+use anyhow::Context;
+use byteorder::{BigEndian, ReadBytesExt};
+use risingwave_common_estimate_size::{EstimateSize, ZeroHeapSize};
 use risingwave_pb::common::Buffer;
+use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::data::{ArrayType, PbArray};
 
 use super::{Array, ArrayBuilder, ArrayImpl, ArrayResult};
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::{EstimateSize, ZeroHeapSize};
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::for_all_native_types;
 use crate::types::*;
 
@@ -50,6 +52,7 @@ where
 
     // item methods
     fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize>;
+    fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Self>;
 }
 
 macro_rules! impl_array_methods {
@@ -81,13 +84,19 @@ macro_rules! impl_array_methods {
 }
 
 macro_rules! impl_primitive_for_native_types {
-    ($({ $naive_type:ty, $scalar_type:ident } ),*) => {
+    ($({ $naive_type:ty, $scalar_type:ident, $read_fn:ident } ),*) => {
         $(
             impl PrimitiveArrayItemType for $naive_type {
                 impl_array_methods!($naive_type, $scalar_type, $scalar_type);
 
                 fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
                     NativeType::to_protobuf(self, output)
+                }
+                fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Self> {
+                    let v = cur
+                        .$read_fn::<BigEndian>()
+                        .context("failed to read value from buffer")?;
+                    Ok(v.into())
                 }
             }
         )*
@@ -105,6 +114,9 @@ macro_rules! impl_primitive_for_others {
 
                 fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
                     <$scalar_type>::to_protobuf(self, output)
+                }
+                fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Self> {
+                    <$scalar_type>::from_protobuf(cur)
                 }
             }
         )*
@@ -205,10 +217,10 @@ impl<T: PrimitiveArrayItemType> Array for PrimitiveArray<T> {
     type RefItem<'a> = T;
 
     unsafe fn raw_value_at_unchecked(&self, idx: usize) -> Self::RefItem<'_> {
-        *self.data.get_unchecked(idx)
+        unsafe { *self.data.get_unchecked(idx) }
     }
 
-    fn raw_iter(&self) -> impl DoubleEndedIterator<Item = Self::RefItem<'_>> {
+    fn raw_iter(&self) -> impl ExactSizeIterator<Item = Self::RefItem<'_>> {
         self.data.iter().cloned()
     }
 
@@ -280,11 +292,11 @@ impl<T: PrimitiveArrayItemType> ArrayBuilder for PrimitiveArrayBuilder<T> {
         match value {
             Some(x) => {
                 self.bitmap.append_n(n, true);
-                self.data.extend(std::iter::repeat(x).take(n));
+                self.data.extend(std::iter::repeat_n(x, n));
             }
             None => {
                 self.bitmap.append_n(n, false);
-                self.data.extend(std::iter::repeat(T::default()).take(n));
+                self.data.extend(std::iter::repeat_n(T::default(), n));
             }
         }
     }
@@ -315,7 +327,6 @@ impl<T: PrimitiveArrayItemType> ArrayBuilder for PrimitiveArrayBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{F32, F64};
 
     fn helper_test_builder<T: PrimitiveArrayItemType>(data: Vec<Option<T>>) -> PrimitiveArray<T> {
         let mut builder = PrimitiveArrayBuilder::<T>::new(data.len());

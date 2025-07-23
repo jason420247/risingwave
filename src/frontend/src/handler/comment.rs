@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::error::{ErrorCode, Result};
 use risingwave_pb::catalog::PbComment;
 use risingwave_sqlparser::ast::{CommentObject, ObjectName};
 
 use super::{HandlerArgs, RwPgResponse};
 use crate::Binder;
+use crate::error::{ErrorCode, Result};
 
 pub async fn handle_comment(
     handler_args: HandlerArgs,
@@ -43,13 +43,20 @@ pub async fn handle_comment(
                 };
 
                 let (schema, table) = Binder::resolve_schema_qualified_name(
-                    session.database(),
-                    ObjectName(tab.to_vec()),
+                    &session.database(),
+                    &ObjectName(tab.to_vec()),
                 )?;
 
                 let (database_id, schema_id) =
-                    session.get_database_and_schema_id_for_create(schema)?;
-                let table = binder.bind_table(None, &table, None)?;
+                    session.get_database_and_schema_id_for_create(schema.clone())?;
+                let table = binder.bind_table(schema.as_deref(), &table)?;
+                if table.table_catalog.owner != session.user_id() && !session.is_super_user() {
+                    return Err(ErrorCode::PermissionDenied(format!(
+                        "must be owner of relation {}",
+                        table.table_catalog.name
+                    ))
+                    .into());
+                }
                 binder.bind_columns_to_context(col.real_value(), &table.table_catalog.columns)?;
 
                 let column = binder.bind_column(object_name.0.as_slice())?;
@@ -64,10 +71,17 @@ pub async fn handle_comment(
             }
             CommentObject::Table => {
                 let (schema, table) =
-                    Binder::resolve_schema_qualified_name(session.database(), object_name)?;
+                    Binder::resolve_schema_qualified_name(&session.database(), &object_name)?;
                 let (database_id, schema_id) =
-                    session.get_database_and_schema_id_for_create(schema)?;
-                let table = binder.bind_table(None, &table, None)?;
+                    session.get_database_and_schema_id_for_create(schema.clone())?;
+                let table = binder.bind_table(schema.as_deref(), &table)?;
+                if table.table_catalog.owner != session.user_id() && !session.is_super_user() {
+                    return Err(ErrorCode::PermissionDenied(format!(
+                        "must be owner of relation {}",
+                        table.table_catalog.name
+                    ))
+                    .into());
+                }
 
                 PbComment {
                     table_id: table.table_id.into(),

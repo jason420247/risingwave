@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use core::str::FromStr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use anyhow::Context as _;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::Stream;
 use itertools::Itertools;
 use pgwire::pg_field_descriptor::PgFieldDescriptor;
@@ -27,17 +27,28 @@ use pgwire::pg_server::BoxedError;
 use pgwire::types::{Format, FormatIterator, Row};
 use pin_project_lite::pin_project;
 use risingwave_common::array::DataChunk;
-use risingwave_common::catalog::{ColumnCatalog, Field};
-use risingwave_common::error::{ErrorCode, Result as RwResult};
+use risingwave_common::catalog::Field;
 use risingwave_common::row::Row as _;
-use risingwave_common::types::{DataType, ScalarRefImpl, Timestamptz};
+use risingwave_common::types::{
+    DataType, Interval, ScalarRefImpl, Timestamptz, write_date_time_tz,
+};
+use risingwave_common::util::epoch::Epoch;
 use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_connector::sink::elasticsearch_opensearch::elasticsearch::ES_SINK;
 use risingwave_connector::source::KAFKA_CONNECTOR;
-use risingwave_sqlparser::ast::{display_comma_separated, CompatibleSourceSchema, ConnectorSchema};
+use risingwave_connector::source::iceberg::ICEBERG_CONNECTOR;
+use risingwave_pb::catalog::connection_params::PbConnectionType;
+use risingwave_sqlparser::ast::{
+    CompatibleFormatEncode, FormatEncodeOptions, ObjectName, Query, Select, SelectItem, SetExpr,
+    TableFactor, TableWithJoins,
+};
+use thiserror_ext::AsReport;
 
-use crate::catalog::IndexCatalog;
-use crate::handler::create_source::UPSTREAM_SOURCE_KEY;
-use crate::session::{current, SessionImpl};
+use crate::catalog::root_catalog::SchemaPath;
+use crate::error::ErrorCode::ProtocolError;
+use crate::error::{ErrorCode, Result as RwResult, RwError};
+use crate::session::{SessionImpl, current};
+use crate::{Binder, HashSet, TableCatalog};
 
 pin_project! {
     /// Wrapper struct that converts a stream of DataChunk to a stream of RowSet based on formatting
@@ -53,14 +64,14 @@ pin_project! {
         #[pin]
         chunk_stream: VS,
         column_types: Vec<DataType>,
-        formats: Vec<Format>,
+        pub formats: Vec<Format>,
         session_data: StaticSessionData,
     }
 }
 
 // Static session data frozen at the time of the creation of the stream
-struct StaticSessionData {
-    timezone: String,
+pub struct StaticSessionData {
+    pub timezone: String,
 }
 
 impl<VS> DataChunkToRowSetAdapter<VS>
@@ -110,7 +121,7 @@ where
 }
 
 /// Format scalars according to postgres convention.
-fn pg_value_format(
+pub fn pg_value_format(
     data_type: &DataType,
     d: ScalarRefImpl<'_>,
     format: Format,
@@ -139,10 +150,9 @@ fn timestamptz_to_string_with_session_data(
     let tz = d.into_timestamptz();
     let time_zone = Timestamptz::lookup_time_zone(&session_data.timezone).unwrap();
     let instant_local = tz.to_datetime_in_zone(time_zone);
-    instant_local
-        .format("%Y-%m-%d %H:%M:%S%.f%:z")
-        .to_string()
-        .into()
+    let mut result_string = BytesMut::new();
+    write_date_time_tz(instant_local, &mut result_string).unwrap();
+    result_string.into()
 }
 
 fn to_pg_rows(
@@ -152,6 +162,15 @@ fn to_pg_rows(
     session_data: &StaticSessionData,
 ) -> RwResult<Vec<Row>> {
     assert_eq!(chunk.dimension(), column_types.len());
+    if cfg!(debug_assertions) {
+        let chunk_data_types = chunk.data_types();
+        for (ty1, ty2) in chunk_data_types.iter().zip_eq_fast(column_types) {
+            debug_assert!(
+                ty1.equals_datatype(ty2),
+                "chunk_data_types: {chunk_data_types:?}, column_types: {column_types:?}"
+            )
+        }
+    }
 
     chunk
         .rows()
@@ -172,66 +191,6 @@ fn to_pg_rows(
         .try_collect()
 }
 
-/// Convert column descs to rows which conclude name and type
-pub fn col_descs_to_rows(columns: Vec<ColumnCatalog>) -> Vec<Row> {
-    columns
-        .iter()
-        .flat_map(|col| {
-            col.column_desc
-                .flatten()
-                .into_iter()
-                .map(|c| {
-                    let type_name = if let DataType::Struct { .. } = c.data_type {
-                        c.type_name.clone()
-                    } else {
-                        c.data_type.to_string()
-                    };
-                    Row::new(vec![
-                        Some(c.name.into()),
-                        Some(type_name.into()),
-                        Some(col.is_hidden.to_string().into()),
-                        c.description.map(Into::into),
-                    ])
-                })
-                .collect_vec()
-        })
-        .collect_vec()
-}
-
-pub fn indexes_to_rows(indexes: Vec<Arc<IndexCatalog>>) -> Vec<Row> {
-    indexes
-        .iter()
-        .map(|index| {
-            let index_display = index.display();
-            Row::new(vec![
-                Some(index.name.clone().into()),
-                Some(index.primary_table.name.clone().into()),
-                Some(
-                    format!(
-                        "{}",
-                        display_comma_separated(&index_display.index_columns_with_ordering)
-                    )
-                    .into(),
-                ),
-                Some(
-                    format!(
-                        "{}",
-                        display_comma_separated(&index_display.include_columns)
-                    )
-                    .into(),
-                ),
-                Some(
-                    format!(
-                        "{}",
-                        display_comma_separated(&index_display.distributed_by_columns)
-                    )
-                    .into(),
-                ),
-            ])
-        })
-        .collect_vec()
-}
-
 /// Convert from [`Field`] to [`PgFieldDescriptor`].
 pub fn to_pg_field(f: &Field) -> PgFieldDescriptor {
     PgFieldDescriptor::new(
@@ -241,51 +200,127 @@ pub fn to_pg_field(f: &Field) -> PgFieldDescriptor {
     )
 }
 
-#[inline(always)]
-pub fn get_connector(with_properties: &HashMap<String, String>) -> Option<String> {
-    with_properties
-        .get(UPSTREAM_SOURCE_KEY)
-        .map(|s| s.to_lowercase())
-}
-
-#[inline(always)]
-pub fn is_kafka_connector(with_properties: &HashMap<String, String>) -> bool {
-    let Some(connector) = get_connector(with_properties) else {
-        return false;
-    };
-
-    connector == KAFKA_CONNECTOR
-}
-
-#[inline(always)]
-pub fn is_cdc_connector(with_properties: &HashMap<String, String>) -> bool {
-    let Some(connector) = get_connector(with_properties) else {
-        return false;
-    };
-    connector.contains("-cdc")
-}
-
 #[easy_ext::ext(SourceSchemaCompatExt)]
-impl CompatibleSourceSchema {
-    /// Convert `self` to [`ConnectorSchema`] and warn the user if the syntax is deprecated.
-    pub fn into_v2_with_warning(self) -> ConnectorSchema {
+impl CompatibleFormatEncode {
+    /// Convert `self` to [`FormatEncodeOptions`] and warn the user if the syntax is deprecated.
+    pub fn into_v2_with_warning(self) -> FormatEncodeOptions {
         match self {
-            CompatibleSourceSchema::RowFormat(inner) => {
+            CompatibleFormatEncode::RowFormat(inner) => {
                 // TODO: should be warning
-                current::notice_to_user("RisingWave will stop supporting the syntax \"ROW FORMAT\" in future versions, which will be changed to \"FORMAT ... ENCODE ...\" syntax.");
-                inner.into_source_schema_v2()
+                current::notice_to_user(
+                    "RisingWave will stop supporting the syntax \"ROW FORMAT\" in future versions, which will be changed to \"FORMAT ... ENCODE ...\" syntax.",
+                );
+                inner.into_format_encode_v2()
             }
-            CompatibleSourceSchema::V2(inner) => inner,
+            CompatibleFormatEncode::V2(inner) => inner,
         }
     }
 }
 
+pub fn gen_query_from_table_name(from_name: ObjectName) -> Query {
+    let table_factor = TableFactor::Table {
+        name: from_name,
+        alias: None,
+        as_of: None,
+    };
+    let from = vec![TableWithJoins {
+        relation: table_factor,
+        joins: vec![],
+    }];
+    let select = Select {
+        from,
+        projection: vec![SelectItem::Wildcard(None)],
+        ..Default::default()
+    };
+    let body = SetExpr::Select(Box::new(select));
+    Query {
+        with: None,
+        body,
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        fetch: None,
+    }
+}
+
+pub fn convert_unix_millis_to_logstore_u64(unix_millis: u64) -> u64 {
+    Epoch::from_unix_millis(unix_millis).0
+}
+
+pub fn convert_logstore_u64_to_unix_millis(logstore_u64: u64) -> u64 {
+    Epoch::from(logstore_u64).as_unix_millis()
+}
+
+pub fn convert_interval_to_u64_seconds(interval: &String) -> RwResult<u64> {
+    let seconds = (Interval::from_str(interval)
+        .map_err(|err| {
+            ErrorCode::InternalError(format!(
+                "Convert interval to u64 error, please check format, error: {:?}",
+                err.to_report_string()
+            ))
+        })?
+        .epoch_in_micros()
+        / 1000000) as u64;
+    Ok(seconds)
+}
+
+pub fn ensure_connection_type_allowed(
+    connection_type: PbConnectionType,
+    allowed_types: &HashSet<PbConnectionType>,
+) -> RwResult<()> {
+    if !allowed_types.contains(&connection_type) {
+        return Err(RwError::from(ProtocolError(format!(
+            "connection type {:?} is not allowed, allowed types: {:?}",
+            connection_type, allowed_types
+        ))));
+    }
+    Ok(())
+}
+
+fn connection_type_to_connector(connection_type: &PbConnectionType) -> &str {
+    match connection_type {
+        PbConnectionType::Kafka => KAFKA_CONNECTOR,
+        PbConnectionType::Iceberg => ICEBERG_CONNECTOR,
+        PbConnectionType::Elasticsearch => ES_SINK,
+        _ => unreachable!(),
+    }
+}
+
+pub fn check_connector_match_connection_type(
+    connector: &str,
+    connection_type: &PbConnectionType,
+) -> RwResult<()> {
+    if !connector.eq(connection_type_to_connector(connection_type)) {
+        return Err(RwError::from(ProtocolError(format!(
+            "connector {} and connection type {:?} are not compatible",
+            connector, connection_type
+        ))));
+    }
+    Ok(())
+}
+
+pub fn get_table_catalog_by_table_name(
+    session: &SessionImpl,
+    table_name: &ObjectName,
+) -> RwResult<(Arc<TableCatalog>, String)> {
+    let db_name = &session.database();
+    let (schema_name, real_table_name) =
+        Binder::resolve_schema_qualified_name(db_name, table_name)?;
+    let search_path = session.config().search_path();
+    let user_name = &session.user_name();
+
+    let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
+    let reader = session.env().catalog_reader().read_guard();
+    let (table, schema_name) =
+        reader.get_created_table_by_name(db_name, schema_path, &real_table_name)?;
+
+    Ok((table.clone(), schema_name.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
-    use bytes::BytesMut;
     use postgres_types::{ToSql, Type};
     use risingwave_common::array::*;
-    use risingwave_common::types::Timestamptz;
 
     use super::*;
 

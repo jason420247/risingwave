@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,55 +15,45 @@
 use std::marker::PhantomData;
 
 use anyhow::Context;
+use opendal::Operator;
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::services::S3;
-use opendal::Operator;
 
-use super::opendal_enumerator::OpendalEnumerator;
 use super::OpendalSource;
-use crate::source::filesystem::s3::enumerator::get_prefix;
+use super::opendal_enumerator::OpendalEnumerator;
+use crate::error::ConnectorResult;
+use crate::source::filesystem::file_common::CompressionFormat;
 use crate::source::filesystem::s3::S3PropertiesCommon;
+use crate::source::filesystem::s3::enumerator::get_prefix;
 
 impl<Src: OpendalSource> OpendalEnumerator<Src> {
     /// create opendal s3 source.
     pub fn new_s3_source(
-        s3_properties: S3PropertiesCommon,
+        s3_properties: &S3PropertiesCommon,
         assume_role: Option<String>,
-    ) -> anyhow::Result<Self> {
+        compression_format: CompressionFormat,
+    ) -> ConnectorResult<Self> {
         // Create s3 builder.
-        let mut builder = S3::default();
-        builder.bucket(&s3_properties.bucket_name);
-        builder.region(&s3_properties.region_name);
+        let mut builder = S3::default()
+            .bucket(&s3_properties.bucket_name)
+            .region(&s3_properties.region_name);
 
-        if let Some(endpoint_url) = s3_properties.endpoint_url {
-            builder.endpoint(&endpoint_url);
+        if let Some(endpoint_url) = &s3_properties.endpoint_url {
+            builder = builder.endpoint(endpoint_url);
         }
 
-        if let Some(access) = s3_properties.access {
-            builder.access_key_id(&access);
-        } else {
-            tracing::error!(
-                "access key id of aws s3 is not set, bucket {}",
-                s3_properties.bucket_name
-            );
+        if let Some(access) = &s3_properties.access {
+            builder = builder.access_key_id(access);
         }
 
-        if let Some(secret) = s3_properties.secret {
-            builder.secret_access_key(&secret);
-        } else {
-            tracing::error!(
-                "secret access key of aws s3 is not set, bucket {}",
-                s3_properties.bucket_name
-            );
+        if let Some(secret) = &s3_properties.secret {
+            builder = builder.secret_access_key(secret);
         }
-
-        builder.enable_virtual_host_style();
 
         if let Some(assume_role) = assume_role {
-            builder.role_arn(&assume_role);
+            builder = builder.role_arn(&assume_role);
         }
 
-        builder.disable_config_load();
         let (prefix, matcher) = if let Some(pattern) = s3_properties.match_pattern.as_ref() {
             let prefix = get_prefix(pattern);
             let matcher = glob::Pattern::new(pattern)
@@ -73,6 +63,10 @@ impl<Src: OpendalSource> OpendalEnumerator<Src> {
             (None, None)
         };
 
+        // Default behavior is disable loading config from environment.
+        if !s3_properties.enable_config_load() {
+            builder = builder.disable_config_load();
+        }
         let op: Operator = Operator::new(builder)?
             .layer(LoggingLayer::default())
             .layer(RetryLayer::default())
@@ -83,6 +77,7 @@ impl<Src: OpendalSource> OpendalEnumerator<Src> {
             prefix,
             matcher,
             marker: PhantomData,
+            compression_format,
         })
     }
 }

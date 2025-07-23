@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,24 +13,24 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
-use anyhow::anyhow;
+use anyhow::Context;
 use futures::stream::BoxStream;
-use futures::{pin_mut, StreamExt};
+use futures::{StreamExt, pin_mut};
 use futures_async_stream::try_stream;
 use itertools::Itertools;
 use risingwave_common::catalog::Schema;
 use risingwave_common::row::{OwnedRow, Row};
-use risingwave_common::types::DatumRef;
+use risingwave_common::util::iter_util::ZipEqFast;
 use serde_derive::{Deserialize, Serialize};
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::NoTls;
 
-use crate::error::ConnectorError;
+use crate::connector_common::create_pg_client;
+use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::postgres_row_to_owned_row;
+use crate::parser::scalar_adapter::ScalarAdapter;
 use crate::source::cdc::external::{
-    CdcOffset, ConnectorResult, DebeziumOffset, ExternalTableConfig, ExternalTableReader,
+    CdcOffset, CdcOffsetParseFunc, DebeziumOffset, ExternalTableConfig, ExternalTableReader,
     SchemaTableName,
 };
 
@@ -51,40 +51,30 @@ impl PartialOrd for PostgresOffset {
 
 impl PostgresOffset {
     pub fn parse_debezium_offset(offset: &str) -> ConnectorResult<Self> {
-        let dbz_offset: DebeziumOffset = serde_json::from_str(offset).map_err(|e| {
-            ConnectorError::Internal(anyhow!("invalid upstream offset: {}, error: {}", offset, e))
-        })?;
+        let dbz_offset: DebeziumOffset = serde_json::from_str(offset)
+            .with_context(|| format!("invalid upstream offset: {}", offset))?;
 
         Ok(Self {
             txid: dbz_offset
                 .source_offset
                 .txid
-                .ok_or_else(|| anyhow!("invalid postgres txid"))?,
+                .context("invalid postgres txid")?,
             lsn: dbz_offset
                 .source_offset
                 .lsn
-                .ok_or_else(|| anyhow!("invalid postgres lsn"))?,
+                .context("invalid postgres lsn")?,
         })
     }
 }
 
-#[derive(Debug)]
 pub struct PostgresExternalTableReader {
-    config: ExternalTableConfig,
     rw_schema: Schema,
     field_names: String,
-
+    pk_indices: Vec<usize>,
     client: tokio::sync::Mutex<tokio_postgres::Client>,
 }
 
 impl ExternalTableReader for PostgresExternalTableReader {
-    fn get_normalized_table_name(&self, table_name: &SchemaTableName) -> String {
-        format!(
-            "\"{}\".\"{}\"",
-            table_name.schema_name, table_name.table_name
-        )
-    }
-
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset> {
         let mut client = self.client.lock().await;
         // start a transaction to read current lsn and txid
@@ -105,51 +95,39 @@ impl ExternalTableReader for PostgresExternalTableReader {
         Ok(CdcOffset::Postgres(pg_offset))
     }
 
-    fn parse_cdc_offset(&self, offset: &str) -> ConnectorResult<CdcOffset> {
-        Ok(CdcOffset::Postgres(PostgresOffset::parse_debezium_offset(
-            offset,
-        )?))
-    }
-
     fn snapshot_read(
         &self,
         table_name: SchemaTableName,
         start_pk: Option<OwnedRow>,
         primary_keys: Vec<String>,
+        limit: u32,
     ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
-        self.snapshot_read_inner(table_name, start_pk, primary_keys)
+        self.snapshot_read_inner(table_name, start_pk, primary_keys, limit)
     }
 }
 
 impl PostgresExternalTableReader {
     pub async fn new(
-        properties: HashMap<String, String>,
+        config: ExternalTableConfig,
         rw_schema: Schema,
+        pk_indices: Vec<usize>,
     ) -> ConnectorResult<Self> {
-        tracing::debug!(?rw_schema, "create postgres external table reader");
-
-        let config = serde_json::from_value::<ExternalTableConfig>(
-            serde_json::to_value(properties).unwrap(),
-        )
-        .map_err(|e| {
-            ConnectorError::Config(anyhow!(
-                "fail to extract postgres connector properties: {}",
-                e
-            ))
-        })?;
-
-        let database_url = format!(
-            "postgresql://{}:{}@{}:{}/{}",
-            config.username, config.password, config.host, config.port, config.database
+        tracing::info!(
+            ?rw_schema,
+            ?pk_indices,
+            "create postgres external table reader"
         );
 
-        let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::error!("connection error: {}", e);
-            }
-        });
+        let client = create_pg_client(
+            &config.username,
+            &config.password,
+            &config.host,
+            &config.port,
+            &config.database,
+            &config.ssl_mode,
+            &config.ssl_root_cert,
+        )
+        .await?;
 
         let field_names = rw_schema
             .fields
@@ -158,10 +136,25 @@ impl PostgresExternalTableReader {
             .join(",");
 
         Ok(Self {
-            config,
             rw_schema,
             field_names,
+            pk_indices,
             client: tokio::sync::Mutex::new(client),
+        })
+    }
+
+    pub fn get_normalized_table_name(table_name: &SchemaTableName) -> String {
+        format!(
+            "\"{}\".\"{}\"",
+            table_name.schema_name, table_name.table_name
+        )
+    }
+
+    pub fn get_cdc_offset_parser() -> CdcOffsetParseFunc {
+        Box::new(move |offset| {
+            Ok(CdcOffset::Postgres(PostgresOffset::parse_debezium_offset(
+                offset,
+            )?))
         })
     }
 
@@ -171,38 +164,61 @@ impl PostgresExternalTableReader {
         table_name: SchemaTableName,
         start_pk_row: Option<OwnedRow>,
         primary_keys: Vec<String>,
+        scan_limit: u32,
     ) {
-        let order_key = primary_keys.iter().join(",");
-        let sql = if start_pk_row.is_none() {
-            format!(
-                "SELECT {} FROM {} ORDER BY {}",
-                self.field_names,
-                self.get_normalized_table_name(&table_name),
-                order_key
-            )
-        } else {
-            let filter_expr = Self::filter_expression(&primary_keys);
-            format!(
-                "SELECT {} FROM {} WHERE {} ORDER BY {}",
-                self.field_names,
-                self.get_normalized_table_name(&table_name),
-                filter_expr,
-                order_key
-            )
-        };
-
+        let order_key = Self::get_order_key(&primary_keys);
         let client = self.client.lock().await;
         client.execute("set time zone '+00:00'", &[]).await?;
 
-        let params: Vec<DatumRef<'_>> = match start_pk_row {
-            Some(ref pk_row) => pk_row.iter().collect_vec(),
-            None => Vec::new(),
+        let stream = match start_pk_row {
+            Some(ref pk_row) => {
+                // prepare the scan statement, since we may need to convert the RW data type to postgres data type
+                // e.g. varchar to uuid
+                let prepared_scan_stmt = {
+                    let primary_keys = self
+                        .pk_indices
+                        .iter()
+                        .map(|i| self.rw_schema.fields[*i].name.clone())
+                        .collect_vec();
+
+                    let order_key = Self::get_order_key(&primary_keys);
+                    let scan_sql = format!(
+                        "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {scan_limit}",
+                        self.field_names,
+                        Self::get_normalized_table_name(&table_name),
+                        Self::filter_expression(&primary_keys),
+                        order_key,
+                    );
+                    client.prepare(&scan_sql).await?
+                };
+
+                let params: Vec<Option<ScalarAdapter>> = pk_row
+                    .iter()
+                    .zip_eq_fast(prepared_scan_stmt.params())
+                    .map(|(datum, ty)| {
+                        datum
+                            .map(|scalar| ScalarAdapter::from_scalar(scalar, ty))
+                            .transpose()
+                    })
+                    .try_collect()?;
+
+                client.query_raw(&prepared_scan_stmt, &params).await?
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {} FROM {} ORDER BY {} LIMIT {scan_limit}",
+                    self.field_names,
+                    Self::get_normalized_table_name(&table_name),
+                    order_key,
+                );
+                let params: Vec<Option<ScalarAdapter>> = vec![];
+                client.query_raw(&sql, &params).await?
+            }
         };
 
-        let stream = client.query_raw(&sql, &params).await?;
         let row_stream = stream.map(|row| {
             let row = row?;
-            Ok::<_, anyhow::Error>(postgres_row_to_owned_row(row, &self.rw_schema))
+            Ok::<_, crate::error::ConnectorError>(postgres_row_to_owned_row(row, &self.rw_schema))
         });
 
         pin_mut!(row_stream);
@@ -228,6 +244,13 @@ impl PostgresExternalTableReader {
         format!("({}) > ({})", col_expr, arg_expr)
     }
 
+    fn get_order_key(primary_keys: &Vec<String>) -> String {
+        primary_keys
+            .iter()
+            .map(|col| Self::quote_column(col))
+            .join(",")
+    }
+
     fn quote_column(column: &str) -> String {
         format!("\"{}\"", column)
     }
@@ -235,6 +258,8 @@ impl PostgresExternalTableReader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use futures::pin_mut;
     use futures_async_stream::for_await;
     use maplit::{convert_args, hashmap};
@@ -242,8 +267,45 @@ mod tests {
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::{DataType, ScalarImpl};
 
+    use crate::connector_common::PostgresExternalTable;
     use crate::source::cdc::external::postgres::{PostgresExternalTableReader, PostgresOffset};
-    use crate::source::cdc::external::{ExternalTableReader, SchemaTableName};
+    use crate::source::cdc::external::{ExternalTableConfig, ExternalTableReader, SchemaTableName};
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_postgres_schema() {
+        let config = ExternalTableConfig {
+            connector: "postgres-cdc".to_owned(),
+            host: "localhost".to_owned(),
+            port: "8432".to_owned(),
+            username: "myuser".to_owned(),
+            password: "123456".to_owned(),
+            database: "mydb".to_owned(),
+            schema: "public".to_owned(),
+            table: "mytest".to_owned(),
+            ssl_mode: Default::default(),
+            ssl_root_cert: None,
+            encrypt: "false".to_owned(),
+        };
+
+        let table = PostgresExternalTable::connect(
+            &config.username,
+            &config.password,
+            &config.host,
+            config.port.parse::<u16>().unwrap(),
+            &config.database,
+            &config.schema,
+            &config.table,
+            &config.ssl_mode,
+            &config.ssl_root_cert,
+            false,
+        )
+        .await
+        .unwrap();
+
+        println!("columns: {:?}", &table.column_descs());
+        println!("primary keys: {:?}", &table.pk_names());
+    }
 
     #[test]
     fn test_postgres_offset() {
@@ -258,15 +320,15 @@ mod tests {
 
     #[test]
     fn test_filter_expression() {
-        let cols = vec!["v1".to_string()];
+        let cols = vec!["v1".to_owned()];
         let expr = PostgresExternalTableReader::filter_expression(&cols);
         assert_eq!(expr, "(\"v1\") > ($1)");
 
-        let cols = vec!["v1".to_string(), "v2".to_string()];
+        let cols = vec!["v1".to_owned(), "v2".to_owned()];
         let expr = PostgresExternalTableReader::filter_expression(&cols);
         assert_eq!(expr, "(\"v1\", \"v2\") > ($1, $2)");
 
-        let cols = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+        let cols = vec!["v1".to_owned(), "v2".to_owned(), "v3".to_owned()];
         let expr = PostgresExternalTableReader::filter_expression(&cols);
         assert_eq!(expr, "(\"v1\", \"v2\", \"v3\") > ($1, $2, $3)");
     }
@@ -285,7 +347,7 @@ mod tests {
             fields: columns.iter().map(Field::from).collect(),
         };
 
-        let props = convert_args!(hashmap!(
+        let props: HashMap<String, String> = convert_args!(hashmap!(
                 "hostname" => "localhost",
                 "port" => "8432",
                 "username" => "myuser",
@@ -293,7 +355,11 @@ mod tests {
                 "database.name" => "mydb",
                 "schema.name" => "public",
                 "table.name" => "t1"));
-        let reader = PostgresExternalTableReader::new(props, rw_schema)
+
+        let config =
+            serde_json::from_value::<ExternalTableConfig>(serde_json::to_value(props).unwrap())
+                .unwrap();
+        let reader = PostgresExternalTableReader::new(config, rw_schema, vec![0, 1])
             .await
             .unwrap();
 
@@ -303,11 +369,12 @@ mod tests {
         let start_pk = OwnedRow::new(vec![Some(ScalarImpl::from(3)), Some(ScalarImpl::from("c"))]);
         let stream = reader.snapshot_read(
             SchemaTableName {
-                schema_name: "public".to_string(),
-                table_name: "t1".to_string(),
+                schema_name: "public".to_owned(),
+                table_name: "t1".to_owned(),
             },
             Some(start_pk),
-            vec!["v1".to_string(), "v2".to_string()],
+            vec!["v1".to_owned(), "v2".to_owned()],
+            1000,
         );
 
         pin_mut!(stream);

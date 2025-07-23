@@ -6,28 +6,24 @@ homepage = { workspace = true }
 keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
 
 [dependencies]
 async-trait = "0.1"
+axum = { workspace = true }
+axum-extra = { workspace = true, features = ["query"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
-hyper = "0.14"
-prometheus = { version = "0.13" }
+http = "1"
+prometheus = { version = "0.14" }
 risingwave_common = { workspace = true }
 risingwave_pb = { workspace = true }
 risingwave_rpc_client = { workspace = true }
-thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = { workspace = true }
 thiserror-ext = { workspace = true }
 tokio = { version = "0.2", package = "madsim-tokio", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "signal"] }
 tonic = { workspace = true }
-tower = { version = "0.4", features = ["util", "load-shed"] }
-tower-http = { version = "0.4", features = ["add-extension", "cors"] }
+tower = { version = "0.5", features = ["util", "load-shed"] }
+tower-http = { version = "0.6", features = ["add-extension", "compression-gzip"] }
 tracing = "0.1"
 
 [target.'cfg(not(madsim))'.dependencies]

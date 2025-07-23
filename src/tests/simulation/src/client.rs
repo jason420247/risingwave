@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ where
     stmts_iter: core::iter::Rev<Iter<'b, String, String>>,
 }
 
-impl<'a, 'b> SetStmtsIterator<'a, 'b> {
+impl<'a> SetStmtsIterator<'a, '_> {
     fn new(stmts: &'a SetStmts) -> Self {
         Self {
             _stmts: stmts,
@@ -78,7 +78,7 @@ impl SetStmts {
             } => {
                 let key = variable.real_value().to_lowercase();
                 // store complete sql as value.
-                self.stmts_cache.put(key, sql.to_string());
+                self.stmts_cache.put(key, sql.to_owned());
             }
             _ => unreachable!(),
         }
@@ -129,10 +129,6 @@ impl RisingWave {
                 tracing::error!("postgres connection error: {e}");
             }
         });
-        // for recovery
-        client
-            .simple_query("SET RW_IMPLICIT_FLUSH TO true;")
-            .await?;
         // replay all SET statements
         for stmt in SetStmtsIterator::new(set_stmts) {
             client.simple_query(&stmt).await?;
@@ -188,12 +184,12 @@ impl sqllogictest::AsyncDB for RisingWave {
                         match row.get(i) {
                             Some(v) => {
                                 if v.is_empty() {
-                                    row_vec.push("(empty)".to_string());
+                                    row_vec.push("(empty)".to_owned());
                                 } else {
-                                    row_vec.push(v.to_string());
+                                    row_vec.push(v.to_owned());
                                 }
                             }
-                            None => row_vec.push("NULL".to_string()),
+                            None => row_vec.push("NULL".to_owned()),
                         }
                     }
                 }
@@ -216,6 +212,8 @@ impl sqllogictest::AsyncDB for RisingWave {
         }
     }
 
+    async fn shutdown(&mut self) {}
+
     fn engine_name(&self) -> &str {
         "risingwave"
     }
@@ -224,9 +222,7 @@ impl sqllogictest::AsyncDB for RisingWave {
         tokio::time::sleep(dur).await
     }
 
-    async fn run_command(
-        _command: std::process::Command,
-    ) -> std::io::Result<std::process::ExitStatus> {
+    async fn run_command(_command: std::process::Command) -> std::io::Result<std::process::Output> {
         unimplemented!("spawning process is not supported in simulation mode")
     }
 }

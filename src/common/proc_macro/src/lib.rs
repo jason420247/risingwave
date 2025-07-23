@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg_attr(coverage, feature(coverage_attribute))]
+#![feature(coverage_attribute)]
 
 use estimate_size::{
     add_trait_bounds, extract_ignored_generics_list, has_nested_flag_attribute_list,
@@ -23,13 +23,14 @@ use quote::quote;
 use syn::parse_macro_input;
 
 mod config;
+mod config_doc;
 mod estimate_size;
 mod session_config;
 
 /// Sections in the configuration file can use `#[derive(OverrideConfig)]` to generate the
 /// implementation of overwriting configs from the file.
 ///
-/// In the struct definition, use #[override_opts(path = ...)] on a field to indicate the field in
+/// In the struct definition, use `#[override_opts(path = ...)]` on a field to indicate the field in
 /// `RwConfig` to override.
 ///
 /// An example:
@@ -53,15 +54,14 @@ mod session_config;
 ///     }
 /// }
 /// ```
-#[cfg_attr(coverage, coverage(off))]
 #[proc_macro_derive(OverrideConfig, attributes(override_opts))]
 #[proc_macro_error]
 pub fn override_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input);
 
-    let gen = config::produce_override_config(input);
+    let r#gen = config::produce_override_config(input);
 
-    gen.into()
+    r#gen.into()
 }
 
 /// `EstimateSize` can be derived if when all the fields in a
@@ -89,14 +89,14 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
         syn::Data::Enum(data_enum) => {
             if data_enum.variants.is_empty() {
                 // Empty enums are easy to implement.
-                let gen = quote! {
+                let r#gen = quote! {
                     impl EstimateSize for #name {
                         fn estimated_heap_size(&self) -> usize {
                             0
                         }
                     }
                 };
-                return gen.into();
+                return r#gen.into();
             }
 
             let mut cmds = Vec::with_capacity(data_enum.variants.len());
@@ -173,7 +173,7 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
             }
 
             // Build the trait implementation
-            let gen = quote! {
+            let r#gen = quote! {
                 impl #impl_generics EstimateSize for #name #ty_generics #where_clause {
                     fn estimated_heap_size(&self) -> usize {
                         match self {
@@ -182,7 +182,7 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
                     }
                 }
             };
-            gen.into()
+            r#gen.into()
         }
         syn::Data::Union(_data_union) => {
             panic!("Deriving EstimateSize for unions is currently not supported.")
@@ -190,14 +190,14 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
         syn::Data::Struct(data_struct) => {
             if data_struct.fields.is_empty() {
                 // Empty structs are easy to implement.
-                let gen = quote! {
+                let r#gen = quote! {
                     impl EstimateSize for #name {
                         fn estimated_heap_size(&self) -> usize {
                             0
                         }
                     }
                 };
-                return gen.into();
+                return r#gen.into();
             }
 
             let mut field_cmds = Vec::with_capacity(data_struct.fields.len());
@@ -233,7 +233,7 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
             }
 
             // Build the trait implementation
-            let gen = quote! {
+            let r#gen = quote! {
                 impl #impl_generics EstimateSize for #name #ty_generics #where_clause {
                     fn estimated_heap_size(&self) -> usize {
                         let mut total = 0;
@@ -244,7 +244,7 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
                     }
                 }
             };
-            gen.into()
+            r#gen.into()
         }
     }
 }
@@ -257,9 +257,52 @@ pub fn derive_estimate_size(input: TokenStream) -> TokenStream {
 /// `flags` options include
 /// - `SETTER`: to manually write a `set_your_parameter_name` function, in which you should call `set_your_parameter_name_inner`.
 /// - `REPORT`: to report the parameter through `ConfigReporter`
+/// - `NO_ALTER_SYS`: disallow the parameter to be set by `alter system set`
 #[proc_macro_derive(SessionConfig, attributes(parameter))]
 #[proc_macro_error]
 pub fn session_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input);
     session_config::derive_config(input).into()
+}
+
+/// This proc macro recursively extracts rustdoc comments from the fields in a struct and generates a method
+/// that produces docs for each field.
+///
+/// Unlike rustdoc, this tool focuses solely on extracting rustdoc for struct fields, without methods.
+///
+/// Example:
+///
+/// ```ignore
+/// #[derive(ConfigDoc)]
+/// pub struct Foo {
+///   /// Description for `a`.
+///   a: i32,
+///
+///   #[config_doc(nested)]
+///   b: Bar,
+///
+///   #[config_doc(omitted)]
+///   dummy: (),
+/// }
+/// ```
+///
+/// The `#[config_doc(nested)]` attribute indicates that the field is a nested config that will be documented in a separate section.
+/// Fields marked with `#[config_doc(omitted)]` will simply be omitted from the doc.
+///
+/// Here is the method generated by this macro:
+///
+/// ```ignore
+/// impl Foo {
+///     pub fn config_docs(name: String, docs: &mut std::collections::BTreeMap<String, Vec<(String, String)>>)
+/// }
+/// ```
+///
+/// In `test_example_up_to_date`, we further process the output of this method to generate a markdown in src/config/docs.md.
+#[proc_macro_derive(ConfigDoc, attributes(config_doc))]
+pub fn config_doc(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input);
+
+    let r#gen = config_doc::generate_config_doc_fn(input);
+
+    r#gen.into()
 }

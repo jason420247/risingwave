@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,75 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod aggregation;
-mod delete;
-mod expand;
-mod filter;
-mod generic_exchange;
-mod group_top_n;
-mod hash_agg;
-mod hop_window;
-mod insert;
-mod join;
-mod limit;
+mod fast_insert;
 mod managed;
-mod max_one_row;
-mod merge_sort_exchange;
-mod order_by;
-mod project;
-mod project_set;
-mod row_seq_scan;
-mod sort_agg;
-mod sort_over_window;
-mod source;
-mod sys_row_seq_scan;
-mod table_function;
 pub mod test_utils;
-mod top_n;
-mod union;
-mod update;
-mod utils;
-mod values;
+
+use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::Context;
 use async_recursion::async_recursion;
-pub use delete::*;
-pub use expand::*;
-pub use filter::*;
+pub use fast_insert::*;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-pub use generic_exchange::*;
-pub use group_top_n::*;
-pub use hash_agg::*;
-pub use hop_window::*;
-pub use insert::*;
-pub use join::*;
-pub use limit::*;
 pub use managed::*;
-pub use max_one_row::*;
-pub use merge_sort_exchange::*;
-pub use order_by::*;
-pub use project::*;
-pub use project_set::*;
 use risingwave_common::array::DataChunk;
 use risingwave_common::catalog::Schema;
-use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::PlanNode;
+use risingwave_pb::batch_plan::plan_node::NodeBodyDiscriminants;
 use risingwave_pb::common::BatchQueryEpoch;
-pub use row_seq_scan::*;
-pub use sort_agg::*;
-pub use sort_over_window::SortOverWindowExecutor;
-pub use source::*;
-pub use table_function::*;
 use thiserror_ext::AsReport;
-pub use top_n::TopNExecutor;
-pub use union::*;
-pub use update::*;
-pub use utils::*;
-pub use values::*;
 
-use self::test_utils::{BlockExecutorBuilder, BusyLoopExecutorBuilder};
 use crate::error::Result;
-use crate::executor::sys_row_seq_scan::SysRowSeqScanExecutorBuilder;
 use crate::task::{BatchTaskContext, ShutdownToken, TaskId};
 
 pub type BoxedExecutor = Box<dyn Executor>;
@@ -115,39 +67,26 @@ impl std::fmt::Debug for BoxedExecutor {
 
 /// Every Executor should impl this trait to provide a static method to build a `BoxedExecutor`
 /// from proto and global environment.
-#[async_trait::async_trait]
 pub trait BoxedExecutorBuilder {
-    async fn new_boxed_executor<C: BatchTaskContext>(
-        source: &ExecutorBuilder<'_, C>,
+    fn new_boxed_executor(
+        source: &ExecutorBuilder<'_>,
         inputs: Vec<BoxedExecutor>,
-    ) -> Result<BoxedExecutor>;
+    ) -> impl Future<Output = Result<BoxedExecutor>> + Send;
 }
 
-pub struct ExecutorBuilder<'a, C> {
+pub struct ExecutorBuilder<'a> {
     pub plan_node: &'a PlanNode,
     pub task_id: &'a TaskId,
-    context: C,
+    context: Arc<dyn BatchTaskContext>,
     epoch: BatchQueryEpoch,
     shutdown_rx: ShutdownToken,
 }
 
-macro_rules! build_executor {
-    ($source: expr, $inputs: expr, $($proto_type_name:path => $data_type:ty),* $(,)?) => {
-        match $source.plan_node().get_node_body().unwrap() {
-            $(
-                $proto_type_name(..) => {
-                    <$data_type>::new_boxed_executor($source, $inputs)
-                },
-            )*
-        }
-    }
-}
-
-impl<'a, C: Clone> ExecutorBuilder<'a, C> {
+impl<'a> ExecutorBuilder<'a> {
     pub fn new(
         plan_node: &'a PlanNode,
         task_id: &'a TaskId,
-        context: C,
+        context: Arc<dyn BatchTaskContext>,
         epoch: BatchQueryEpoch,
         shutdown_rx: ShutdownToken,
     ) -> Self {
@@ -166,7 +105,7 @@ impl<'a, C: Clone> ExecutorBuilder<'a, C> {
             plan_node,
             self.task_id,
             self.context.clone(),
-            self.epoch.clone(),
+            self.epoch,
             self.shutdown_rx.clone(),
         )
     }
@@ -175,16 +114,56 @@ impl<'a, C: Clone> ExecutorBuilder<'a, C> {
         self.plan_node
     }
 
-    pub fn context(&self) -> &C {
+    pub fn context(&self) -> &Arc<dyn BatchTaskContext> {
         &self.context
     }
 
     pub fn epoch(&self) -> BatchQueryEpoch {
-        self.epoch.clone()
+        self.epoch
+    }
+
+    pub fn shutdown_rx(&self) -> &ShutdownToken {
+        &self.shutdown_rx
     }
 }
 
-impl<'a, C: BatchTaskContext> ExecutorBuilder<'a, C> {
+/// Descriptor for executor builder.
+///
+/// We will call `builder` to build the executor if the `node_body` matches.
+pub struct ExecutorBuilderDescriptor {
+    pub node_body: NodeBodyDiscriminants,
+
+    /// Typically from [`BoxedExecutorBuilder::new_boxed_executor`].
+    pub builder: for<'a> fn(
+        source: &'a ExecutorBuilder<'a>,
+        inputs: Vec<BoxedExecutor>,
+    ) -> BoxFuture<'a, Result<BoxedExecutor>>,
+}
+
+/// All registered executor builders.
+#[linkme::distributed_slice]
+pub static BUILDER_DESCS: [ExecutorBuilderDescriptor];
+
+/// Register an executor builder so that it can be used to build the executor from protobuf.
+#[macro_export]
+macro_rules! register_executor {
+    ($node_body:ident, $builder:ty) => {
+        const _: () = {
+            use futures::FutureExt;
+            use risingwave_batch::executor::{BUILDER_DESCS, ExecutorBuilderDescriptor};
+            use risingwave_pb::batch_plan::plan_node::NodeBodyDiscriminants;
+
+            #[linkme::distributed_slice(BUILDER_DESCS)]
+            static BUILDER: ExecutorBuilderDescriptor = ExecutorBuilderDescriptor {
+                node_body: NodeBodyDiscriminants::$node_body,
+                builder: |a, b| <$builder>::new_boxed_executor(a, b).boxed(),
+            };
+        };
+    };
+}
+pub use register_executor;
+
+impl ExecutorBuilder<'_> {
     pub async fn build(&self) -> Result<BoxedExecutor> {
         self.try_build()
             .await
@@ -204,41 +183,21 @@ impl<'a, C: BatchTaskContext> ExecutorBuilder<'a, C> {
             inputs.push(input);
         }
 
-        let real_executor = build_executor! { self, inputs,
-            NodeBody::RowSeqScan => RowSeqScanExecutorBuilder,
-            NodeBody::Insert => InsertExecutor,
-            NodeBody::Delete => DeleteExecutor,
-            NodeBody::Exchange => GenericExchangeExecutorBuilder,
-            NodeBody::Update => UpdateExecutor,
-            NodeBody::Filter => FilterExecutor,
-            NodeBody::Project => ProjectExecutor,
-            NodeBody::SortAgg => SortAggExecutor,
-            NodeBody::Sort => SortExecutor,
-            NodeBody::TopN => TopNExecutor,
-            NodeBody::GroupTopN => GroupTopNExecutorBuilder,
-            NodeBody::Limit => LimitExecutor,
-            NodeBody::Values => ValuesExecutor,
-            NodeBody::NestedLoopJoin => NestedLoopJoinExecutor,
-            NodeBody::HashJoin => HashJoinExecutor<()>,
-            // NodeBody::SortMergeJoin => SortMergeJoinExecutor,
-            NodeBody::HashAgg => HashAggExecutorBuilder,
-            NodeBody::MergeSortExchange => MergeSortExchangeExecutorBuilder,
-            NodeBody::TableFunction => TableFunctionExecutorBuilder,
-            NodeBody::HopWindow => HopWindowExecutor,
-            NodeBody::SysRowSeqScan => SysRowSeqScanExecutorBuilder,
-            NodeBody::Expand => ExpandExecutor,
-            NodeBody::LocalLookupJoin => LocalLookupJoinExecutorBuilder,
-            NodeBody::DistributedLookupJoin => DistributedLookupJoinExecutorBuilder,
-            NodeBody::ProjectSet => ProjectSetExecutor,
-            NodeBody::Union => UnionExecutor,
-            NodeBody::Source => SourceExecutor,
-            NodeBody::SortOverWindow => SortOverWindowExecutor,
-            NodeBody::MaxOneRow => MaxOneRowExecutor,
-            // Follow NodeBody only used for test
-            NodeBody::BlockExecutor => BlockExecutorBuilder,
-            NodeBody::BusyLoopExecutor => BusyLoopExecutorBuilder,
-        }
-        .await?;
+        let node_body_discriminants: NodeBodyDiscriminants =
+            self.plan_node.get_node_body().unwrap().into();
+
+        let builder = BUILDER_DESCS
+            .iter()
+            .find(|x| x.node_body == node_body_discriminants)
+            .with_context(|| {
+                format!(
+                    "no executor builder found for {:?}",
+                    node_body_discriminants
+                )
+            })?
+            .builder;
+
+        let real_executor = builder(self, inputs).await?;
 
         Ok(Box::new(ManagedExecutor::new(
             real_executor,
@@ -249,25 +208,25 @@ impl<'a, C: BatchTaskContext> ExecutorBuilder<'a, C> {
 
 #[cfg(test)]
 mod tests {
-    use risingwave_hummock_sdk::to_committed_batch_query_epoch;
+    use risingwave_hummock_sdk::test_batch_query_epoch;
     use risingwave_pb::batch_plan::PlanNode;
 
     use crate::executor::ExecutorBuilder;
     use crate::task::{ComputeNodeContext, ShutdownToken, TaskId};
 
-    #[test]
-    fn test_clone_for_plan() {
+    #[tokio::test]
+    async fn test_clone_for_plan() {
         let plan_node = PlanNode::default();
         let task_id = &TaskId {
             task_id: 1,
             stage_id: 1,
-            query_id: "test_query_id".to_string(),
+            query_id: "test_query_id".to_owned(),
         };
         let builder = ExecutorBuilder::new(
             &plan_node,
             task_id,
             ComputeNodeContext::for_test(),
-            to_committed_batch_query_epoch(u64::MAX),
+            test_batch_query_epoch(),
             ShutdownToken::empty(),
         );
         let child_plan = &PlanNode::default();

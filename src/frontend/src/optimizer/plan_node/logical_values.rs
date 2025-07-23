@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,15 @@ use std::vec;
 use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{Field, Schema};
-use risingwave_common::error::Result;
 use risingwave_common::types::{DataType, ScalarImpl};
 
 use super::generic::GenericPlanRef;
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
     BatchValues, ColPrunable, ExprRewritable, Logical, LogicalFilter, PlanBase, PlanRef,
     PredicatePushdown, StreamValues, ToBatch, ToStream,
 };
+use crate::error::Result;
 use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor, Literal};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
@@ -205,11 +205,9 @@ impl ToStream for LogicalValues {
 #[cfg(test)]
 mod tests {
 
-    use risingwave_common::catalog::Field;
-    use risingwave_common::types::{DataType, Datum};
+    use risingwave_common::types::Datum;
 
     use super::*;
-    use crate::expr::Literal;
     use crate::optimizer::optimizer_context::OptimizerContext;
 
     fn literal(val: i32) -> ExprImpl {

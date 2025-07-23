@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use governor::Quota;
@@ -46,10 +46,13 @@ impl LogSuppresser {
 
     /// Check if the log should be suppressed.
     /// If the log should be suppressed, return `Err(LogSuppressed)`.
-    /// Otherwise, return `Ok(usize)` with count of suppressed messages before.
-    pub fn check(&self) -> core::result::Result<usize, LogSuppressed> {
+    /// Otherwise, return `Ok(Some(..))` with count of suppressed messages since last check,
+    /// or `Ok(None)` if there's none.
+    pub fn check(&self) -> core::result::Result<Option<NonZeroUsize>, LogSuppressed> {
         match self.rate_limiter.check() {
-            Ok(()) => Ok(self.suppressed_count.swap(0, Ordering::Relaxed)),
+            Ok(()) => Ok(NonZeroUsize::new(
+                self.suppressed_count.swap(0, Ordering::Relaxed),
+            )),
             Err(_) => {
                 self.suppressed_count.fetch_add(1, Ordering::Relaxed);
                 Err(LogSuppressed)
@@ -70,14 +73,26 @@ impl Default for LogSuppresser {
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use tracing_subscriber::util::SubscriberInitExt;
 
     use super::*;
 
     #[tokio::test]
     async fn demo() {
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        for _ in 0..100 {
+        let _logger = tracing_subscriber::fmt::Subscriber::builder()
+            .with_max_level(tracing::Level::ERROR)
+            .set_default();
+
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+
+        let mut allowed = 0;
+        let mut suppressed = 0;
+
+        let start = Instant::now();
+
+        for _ in 0..1000 {
             interval.tick().await;
             static RATE_LIMITER: LazyLock<LogSuppresser> = LazyLock::new(|| {
                 LogSuppresser::new(RateLimiter::direct(Quota::per_second(
@@ -86,8 +101,18 @@ mod tests {
             });
 
             if let Ok(suppressed_count) = RATE_LIMITER.check() {
-                println!("failed to foo bar. suppressed_count = {}", suppressed_count);
+                suppressed += suppressed_count.map(|v| v.get()).unwrap_or_default();
+                allowed += 1;
+                tracing::error!(suppressed_count, "failed to foo bar");
             }
         }
+        let duration = Instant::now().duration_since(start);
+
+        tracing::error!(
+            allowed,
+            suppressed,
+            ?duration,
+            rate = allowed as f64 / duration.as_secs_f64()
+        );
     }
 }

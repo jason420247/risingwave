@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,11 +32,6 @@ public class JniSinkValidationHandler {
         try {
             var request =
                     ConnectorServiceProto.ValidateSinkRequest.parseFrom(validateSinkRequestBytes);
-
-            // For jni.rs
-            java.lang.Thread.currentThread()
-                    .setContextClassLoader(java.lang.ClassLoader.getSystemClassLoader());
-
             ConnectorServiceProto.SinkParam sinkParam = request.getSinkParam();
             TableSchema tableSchema = TableSchema.fromProto(sinkParam.getTableSchema());
             String connectorName = getConnectorName(request.getSinkParam());

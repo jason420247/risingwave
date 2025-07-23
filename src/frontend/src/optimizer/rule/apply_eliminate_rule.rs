@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ use risingwave_pb::plan_common::JoinType;
 
 use super::{BoxedRule, Rule};
 use crate::expr::{Expr, ExprImpl, ExprType, FunctionCall, InputRef};
+use crate::optimizer::PlanRef;
 use crate::optimizer::plan_node::{LogicalFilter, LogicalJoin, LogicalProject};
 use crate::optimizer::plan_visitor::PlanCorrelatedIdFinder;
-use crate::optimizer::PlanRef;
 use crate::utils::Condition;
 
 /// Eliminate `LogicalApply` if we can't find its `correlated_id` in its RHS.
@@ -79,10 +79,10 @@ impl Rule for ApplyEliminateRule {
         // TODO: Do some transformation for IN, and try to remove DAG for it.
         let mut column_mapping = HashMap::new();
         on.conjunctions.iter().for_each(|expr| {
-            if let ExprImpl::FunctionCall(func_call) = expr {
-                if let Some((left, right, data_type)) = Self::check(func_call, apply_left_len) {
-                    column_mapping.insert(left, (right, data_type));
-                }
+            if let ExprImpl::FunctionCall(func_call) = expr
+                && let Some((left, right, data_type)) = Self::check(func_call, apply_left_len)
+            {
+                column_mapping.insert(left, (right, data_type));
             }
         });
         if column_mapping.len() == apply_left_len {

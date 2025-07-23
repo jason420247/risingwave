@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::stream::prelude::*;
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::property::Distribution;
@@ -50,6 +50,7 @@ impl StreamRowIdGen {
             input.append_only(),
             input.emit_on_window_close(),
             input.watermark_columns().clone(),
+            input.columns_monotonicity().clone(),
         );
         Self {
             base,
@@ -82,9 +83,9 @@ impl StreamNode for StreamRowIdGen {
     fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> PbNodeBody {
         use risingwave_pb::stream_plan::*;
 
-        PbNodeBody::RowIdGen(RowIdGenNode {
+        PbNodeBody::RowIdGen(Box::new(RowIdGenNode {
             row_id_index: self.row_id_index as _,
-        })
+        }))
     }
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,9 @@
 use std::collections::HashMap;
 
 use itertools::Itertools;
-use risingwave_common::catalog::PG_CATALOG_SCHEMA_NAME;
 use risingwave_pb::catalog::{PbDatabase, PbSchema};
 
-use super::OwnedByUserCatalog;
+use super::{OwnedByUserCatalog, OwnedGrantObject};
 use crate::catalog::schema_catalog::SchemaCatalog;
 use crate::catalog::{DatabaseId, SchemaId, TableId};
 use crate::user::UserId;
@@ -30,6 +29,9 @@ pub struct DatabaseCatalog {
     schema_by_name: HashMap<String, SchemaCatalog>,
     schema_name_by_id: HashMap<SchemaId, String>,
     pub owner: u32,
+    pub resource_group: String,
+    pub barrier_interval_ms: Option<u32>,
+    pub checkpoint_frequency: Option<u64>,
 }
 
 impl DatabaseCatalog {
@@ -58,19 +60,6 @@ impl DatabaseCatalog {
             .flat_map(|schema| schema.iter_all().map(|t| t.id()))
     }
 
-    pub fn get_all_schema_info(&self) -> Vec<PbSchema> {
-        self.schema_by_name
-            .values()
-            .cloned()
-            .map(|schema| PbSchema {
-                id: schema.id(),
-                database_id: self.id,
-                name: schema.name(),
-                owner: schema.owner(),
-            })
-            .collect_vec()
-    }
-
     pub fn iter_schemas(&self) -> impl Iterator<Item = &SchemaCatalog> {
         self.schema_by_name.values()
     }
@@ -93,10 +82,14 @@ impl DatabaseCatalog {
         self.schema_by_name.get_mut(name)
     }
 
-    pub fn find_schema_containing_table_id(&self, table_id: &TableId) -> Option<&SchemaCatalog> {
-        self.schema_by_name
-            .values()
-            .find(|schema| schema.get_table_by_id(table_id).is_some())
+    pub fn get_grant_object_by_oid(&self, oid: u32) -> Option<OwnedGrantObject> {
+        for schema in self.schema_by_name.values() {
+            let object = schema.get_grant_object_by_oid(oid);
+            if object.is_some() {
+                return object;
+            }
+        }
+        None
     }
 
     pub fn update_schema(&mut self, prost: &PbSchema) {
@@ -106,21 +99,17 @@ impl DatabaseCatalog {
         let old_schema_name = self.schema_name_by_id.get(&id).unwrap().to_owned();
         if old_schema_name != name {
             let mut schema = self.schema_by_name.remove(&old_schema_name).unwrap();
-            schema.name = name.clone();
+            schema.name.clone_from(&name);
             schema.database_id = prost.database_id;
             schema.owner = prost.owner;
             self.schema_by_name.insert(name.clone(), schema);
             self.schema_name_by_id.insert(id, name);
         } else {
             let schema = self.get_schema_mut(id).unwrap();
-            schema.name = name.clone();
+            schema.name.clone_from(&name);
             schema.database_id = prost.database_id;
             schema.owner = prost.owner;
         };
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.schema_by_name.len() == 1 && self.schema_by_name.contains_key(PG_CATALOG_SCHEMA_NAME)
     }
 
     pub fn id(&self) -> DatabaseId {
@@ -129,6 +118,17 @@ impl DatabaseCatalog {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn to_prost(&self) -> PbDatabase {
+        PbDatabase {
+            id: self.id,
+            name: self.name.clone(),
+            owner: self.owner,
+            resource_group: self.resource_group.clone(),
+            barrier_interval_ms: self.barrier_interval_ms,
+            checkpoint_frequency: self.checkpoint_frequency,
+        }
     }
 }
 
@@ -146,6 +146,9 @@ impl From<&PbDatabase> for DatabaseCatalog {
             schema_by_name: HashMap::new(),
             schema_name_by_id: HashMap::new(),
             owner: db.owner,
+            resource_group: db.resource_group.clone(),
+            barrier_interval_ms: db.barrier_interval_ms,
+            checkpoint_frequency: db.checkpoint_frequency,
         }
     }
 }

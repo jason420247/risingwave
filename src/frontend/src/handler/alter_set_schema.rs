@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use pgwire::pg_response::StatementType;
-use risingwave_common::error::{ErrorCode, Result};
 use risingwave_pb::ddl_service::alter_set_schema_request::Object;
 use risingwave_sqlparser::ast::{ObjectName, OperateFunctionArg};
 
 use super::{HandlerArgs, RwPgResponse};
 use crate::catalog::root_catalog::SchemaPath;
-use crate::{bind_data_type, Binder};
+use crate::error::{ErrorCode, Result};
+use crate::{Binder, bind_data_type};
 
 // Steps for validation:
 // 1. Check permission to alter original object.
@@ -35,11 +35,10 @@ pub async fn handle_alter_set_schema(
     func_args: Option<Vec<OperateFunctionArg>>,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, real_obj_name) =
-        Binder::resolve_schema_qualified_name(db_name, obj_name.clone())?;
+    let db_name = &session.database();
+    let (schema_name, real_obj_name) = Binder::resolve_schema_qualified_name(db_name, &obj_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let new_schema_name = Binder::resolve_schema_name(new_schema_name)?;
@@ -48,8 +47,11 @@ pub async fn handle_alter_set_schema(
 
         match stmt_type {
             StatementType::ALTER_TABLE | StatementType::ALTER_MATERIALIZED_VIEW => {
-                let (table, old_schema_name) =
-                    catalog_reader.get_table_by_name(db_name, schema_path, &real_obj_name)?;
+                let (table, old_schema_name) = catalog_reader.get_created_table_by_name(
+                    db_name,
+                    schema_path,
+                    &real_obj_name,
+                )?;
                 if old_schema_name == new_schema_name {
                     return Ok(RwPgResponse::empty_result(stmt_type));
                 }
@@ -90,8 +92,11 @@ pub async fn handle_alter_set_schema(
                 Object::SourceId(source.id)
             }
             StatementType::ALTER_SINK => {
-                let (sink, old_schema_name) =
-                    catalog_reader.get_sink_by_name(db_name, schema_path, &real_obj_name)?;
+                let (sink, old_schema_name) = catalog_reader.get_created_sink_by_name(
+                    db_name,
+                    schema_path,
+                    &real_obj_name,
+                )?;
                 if old_schema_name == new_schema_name {
                     return Ok(RwPgResponse::empty_result(stmt_type));
                 }
@@ -102,6 +107,23 @@ pub async fn handle_alter_set_schema(
                     &sink.name,
                 )?;
                 Object::SinkId(sink.id.sink_id)
+            }
+            StatementType::ALTER_SUBSCRIPTION => {
+                let (subscription, old_schema_name) = catalog_reader.get_subscription_by_name(
+                    db_name,
+                    schema_path,
+                    &real_obj_name,
+                )?;
+                if old_schema_name == new_schema_name {
+                    return Ok(RwPgResponse::empty_result(stmt_type));
+                }
+                session.check_privilege_for_drop_alter(old_schema_name, &**subscription)?;
+                catalog_reader.check_relation_name_duplicated(
+                    db_name,
+                    &new_schema_name,
+                    &subscription.name,
+                )?;
+                Object::SubscriptionId(subscription.id.subscription_id)
             }
             StatementType::ALTER_CONNECTION => {
                 let (connection, old_schema_name) =
@@ -168,50 +190,4 @@ pub async fn handle_alter_set_schema(
         .await?;
 
     Ok(RwPgResponse::empty_result(stmt_type))
-}
-
-#[cfg(test)]
-pub mod tests {
-    use risingwave_common::catalog::{DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME};
-
-    use crate::catalog::root_catalog::SchemaPath;
-    use crate::test_utils::LocalFrontend;
-
-    #[tokio::test]
-    async fn test_alter_set_schema_handler() {
-        let frontend = LocalFrontend::new(Default::default()).await;
-        let session = frontend.session_ref();
-
-        let sql = "CREATE TABLE test_table (u INT, v INT);";
-        frontend.run_sql(sql).await.unwrap();
-
-        let sql = "CREATE SCHEMA test_schema;";
-        frontend.run_sql(sql).await.unwrap();
-
-        let get_table = |schema_name| {
-            let catalog_reader = session.env().catalog_reader().read_guard();
-            let schema_path = SchemaPath::Name(schema_name);
-            catalog_reader
-                .get_table_by_name(DEFAULT_DATABASE_NAME, schema_path, "test_table")
-                .unwrap()
-                .0
-                .clone()
-        };
-
-        let get_schema_name_by_table_id = |table_id| {
-            let catalog_reader = session.env().catalog_reader().read_guard();
-            catalog_reader
-                .get_schema_by_table_id(DEFAULT_DATABASE_NAME, &table_id)
-                .unwrap()
-                .name()
-        };
-
-        let old_schema_name = get_schema_name_by_table_id(get_table(DEFAULT_SCHEMA_NAME).id);
-        assert_eq!(old_schema_name, "public");
-
-        let sql = "ALTER TABLE test_table SET SCHEMA test_schema;";
-        frontend.run_sql(sql).await.unwrap();
-        let new_schema_name = get_schema_name_by_table_id(get_table("test_schema").id);
-        assert_eq!(new_schema_name, "test_schema");
-    }
 }

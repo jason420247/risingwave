@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,14 @@
 
 use risingwave_common::catalog::{Schema, TableId};
 use risingwave_common::util::sort_util::OrderType;
-use risingwave_connector::source::cdc::external::{ExternalTableReaderImpl, SchemaTableName};
+use risingwave_connector::error::ConnectorResult;
+use risingwave_connector::source::cdc::external::{
+    CdcOffset, CdcTableType, ExternalTableConfig, ExternalTableReader, ExternalTableReaderImpl,
+    SchemaTableName,
+};
 
 /// This struct represents an external table to be read during backfill
+#[derive(Debug, Clone)]
 pub struct ExternalStorageTable {
     /// Id for this table.
     table_id: TableId,
@@ -26,10 +31,14 @@ pub struct ExternalStorageTable {
 
     schema_name: String,
 
-    table_reader: ExternalTableReaderImpl,
+    database_name: String,
+
+    config: ExternalTableConfig,
+
+    table_type: CdcTableType,
 
     /// The schema of the output columns, i.e., this table VIEWED BY some executor like
-    /// RowSeqScanExecutor.
+    /// `RowSeqScanExecutor`.
     /// todo: the schema of the external table defined in the CREATE TABLE DDL
     schema: Schema,
 
@@ -38,32 +47,48 @@ pub struct ExternalStorageTable {
     /// Indices of primary key.
     /// Note that the index is based on the all columns of the table.
     pk_indices: Vec<usize>,
-
-    output_indices: Vec<usize>,
 }
 
 impl ExternalStorageTable {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table_id: TableId,
         SchemaTableName {
             table_name,
             schema_name,
         }: SchemaTableName,
-        table_reader: ExternalTableReaderImpl,
+        database_name: String,
+        config: ExternalTableConfig,
+        table_type: CdcTableType,
         schema: Schema,
         pk_order_types: Vec<OrderType>,
         pk_indices: Vec<usize>,
-        output_indices: Vec<usize>,
     ) -> Self {
         Self {
             table_id,
             table_name,
             schema_name,
-            table_reader,
+            database_name,
+            config,
+            table_type,
             schema,
             pk_order_types,
             pk_indices,
-            output_indices,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test_undefined() -> Self {
+        Self {
+            table_id: 1.into(),
+            table_name: "for_test_table_name".into(),
+            schema_name: "for_test_schema_name".into(),
+            database_name: "for_test_database_name".into(),
+            config: ExternalTableConfig::default(),
+            table_type: CdcTableType::Undefined,
+            schema: Schema::empty().to_owned(),
+            pk_order_types: vec![],
+            pk_indices: vec![],
         }
     }
 
@@ -83,16 +108,6 @@ impl ExternalStorageTable {
         &self.pk_indices
     }
 
-    /// Get the indices of the primary key columns in the output columns.
-    ///
-    /// Returns `None` if any of the primary key columns is not in the output columns.
-    pub fn pk_in_output_indices(&self) -> Option<Vec<usize>> {
-        self.pk_indices
-            .iter()
-            .map(|&i| self.output_indices.iter().position(|&j| i == j))
-            .collect()
-    }
-
     pub fn schema_table_name(&self) -> SchemaTableName {
         SchemaTableName {
             schema_name: self.schema_name.clone(),
@@ -100,11 +115,29 @@ impl ExternalStorageTable {
         }
     }
 
-    pub fn table_reader(&self) -> &ExternalTableReaderImpl {
-        &self.table_reader
+    pub async fn create_table_reader(&self) -> ConnectorResult<ExternalTableReaderImpl> {
+        self.table_type
+            .create_table_reader(
+                self.config.clone(),
+                self.schema.clone(),
+                self.pk_indices.clone(),
+            )
+            .await
     }
 
     pub fn qualified_table_name(&self) -> String {
         format!("{}.{}", self.schema_name, self.table_name)
+    }
+
+    pub fn database_name(&self) -> &str {
+        self.database_name.as_str()
+    }
+
+    pub async fn current_cdc_offset(
+        &self,
+        table_reader: &ExternalTableReaderImpl,
+    ) -> ConnectorResult<Option<CdcOffset>> {
+        let binlog = table_reader.current_cdc_offset().await?;
+        Ok(Some(binlog))
     }
 }

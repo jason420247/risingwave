@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@ import java.util.Iterator;
 import java.util.UUID;
 import java.util.stream.IntStream;
 
+// `FileSink` only serves for testing purpose. It is NOT the file sink in RisingWave docs.
+// TODO: consider rename or remove it to avoid confusion
 public class FileSink extends SinkWriterBase {
     private final FileWriter sinkWriter;
 

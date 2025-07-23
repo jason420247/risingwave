@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +16,19 @@ use std::rc::Rc;
 
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{CdcTableDesc, ColumnDesc};
-use risingwave_common::error::Result;
 
 use super::generic::GenericPlanRef;
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    generic, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef, PredicatePushdown, ToBatch,
-    ToStream,
+    ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef, PredicatePushdown, ToBatch, ToStream,
+    generic,
 };
 use crate::catalog::ColumnId;
+use crate::error::Result;
 use crate::expr::{ExprRewriter, ExprVisitor};
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::plan_node::generic::CdcScanOptions;
 use crate::optimizer::plan_node::{
     ColumnPruningContext, PredicatePushdownContext, RewriteStreamContext, StreamCdcTableScan,
     ToStreamContext,
@@ -60,12 +61,14 @@ impl LogicalCdcScan {
         table_name: String, // explain-only
         cdc_table_desc: Rc<CdcTableDesc>,
         ctx: OptimizerContextRef,
+        options: CdcScanOptions,
     ) -> Self {
         generic::CdcScan::new(
             table_name,
             (0..cdc_table_desc.columns.len()).collect(),
             cdc_table_desc,
             ctx,
+            options,
         )
         .into()
     }
@@ -90,10 +93,11 @@ impl LogicalCdcScan {
 
     pub fn clone_with_output_indices(&self, output_col_idx: Vec<usize>) -> Self {
         generic::CdcScan::new(
-            self.table_name().to_string(),
+            self.table_name().to_owned(),
             output_col_idx,
             self.core.cdc_table_desc.clone(),
             self.base.ctx().clone(),
+            self.core.options.clone(),
         )
         .into()
     }
@@ -128,7 +132,7 @@ impl Distill for LogicalCdcScan {
                             Pretty::from(if verbose {
                                 format!("{}.{}", self.table_name(), col_name)
                             } else {
-                                col_name.to_string()
+                                col_name.clone()
                             })
                         })
                         .collect(),
@@ -146,9 +150,11 @@ impl ColPrunable for LogicalCdcScan {
             .iter()
             .map(|i| self.output_col_idx()[*i])
             .collect();
-        assert!(output_col_idx
-            .iter()
-            .all(|i| self.output_col_idx().contains(i)));
+        assert!(
+            output_col_idx
+                .iter()
+                .all(|i| self.output_col_idx().contains(i))
+        );
 
         self.clone_with_output_indices(output_col_idx).into()
     }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_hummock_sdk::version::HummockVersion;
 use risingwave_hummock_sdk::HummockEpoch;
+use risingwave_hummock_sdk::version::HummockVersion;
 
 use crate::CtlContext;
 
@@ -22,8 +22,8 @@ pub async fn disable_commit_epoch(context: &CtlContext) -> anyhow::Result<()> {
     let version = meta_client.disable_commit_epoch().await?;
     println!(
         "Disabled.\
-        Current version: id {}, max_committed_epoch {}",
-        version.id, version.max_committed_epoch
+        Current version: id {}",
+        version.id,
     );
     Ok(())
 }
@@ -61,7 +61,7 @@ pub async fn replay_version(context: &CtlContext) -> anyhow::Result<()> {
     println!("replay starts");
     println!("base version {}", base_version.id);
     let delta_fetch_size = 100;
-    let mut current_delta_id = base_version.id + 1;
+    let mut current_delta_id = base_version.next_version_id();
     loop {
         let deltas = meta_client
             .list_version_deltas(current_delta_id, delta_fetch_size, HummockEpoch::MAX)
@@ -78,7 +78,7 @@ pub async fn replay_version(context: &CtlContext) -> anyhow::Result<()> {
             base_version.apply_version_delta(&delta);
             println!("replayed version {}", base_version.id);
         }
-        current_delta_id = base_version.id + 1;
+        current_delta_id = base_version.next_version_id();
     }
     println!("replay ends");
     Ok(())

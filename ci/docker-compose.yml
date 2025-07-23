@@ -1,19 +1,22 @@
-version: "3.9"
 services:
+  # TODO: Rename this to `postgres`
   db:
     image: postgres:15-alpine
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      # Test with a password containing special characters #21943, for example 0x5c.
+      # Note that 0x5c 0x74 are TWO characters. It is NOT 0x09.
+      - POSTGRES_PASSWORD=post\tgres
       - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
     ports:
       - 5432
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
-    command: [ "postgres", "-c", "wal_level=logical" ]
+    command:
+      ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=50", "-c", "max_wal_senders=20"]
 
   mysql:
     image: mysql:8.0
@@ -25,17 +28,30 @@ services:
       - MYSQL_USER=mysqluser
       - MYSQL_PASSWORD=mysqlpw
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "mysqladmin ping -h 127.0.0.1 -u root -p123456"
-        ]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p123456"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # TODO: reuse the same mysql instance for connector test and meta store
+  #       after https://github.com/risingwavelabs/risingwave/issues/19783 addressed
+  mysql-meta:
+    image: mysql:8.0
+    command: --character-set-server=utf8 --collation-server=utf8_general_ci
+    ports:
+      - 3306
+    environment:
+      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_USER=mysqluser
+      - MYSQL_PASSWORD=mysqlpw
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p123456"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   message_queue:
-    image: "docker.vectorized.io/vectorized/redpanda:latest"
+    image: "redpandadata/redpanda:latest"
     command:
       - redpanda
       - start
@@ -61,17 +77,82 @@ services:
       - "29092:29092"
       - "9092:9092"
       - "9644:9644"
-      - "8081:8081"
+      # Don't use Redpanda's schema registry, use the separated service instead
+      # - "8081:8081"
     environment: {}
-    container_name: message_queue
     healthcheck:
       test: curl -f localhost:9644/v1/status/ready
       interval: 1s
       timeout: 5s
       retries: 5
 
+  message_queue_sasl_1:
+    image: docker.io/bitnami/kafka:4.0
+    ports:
+      - "19092:19092"
+    environment:
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_BROKER_ID=1
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@message_queue_sasl_1:19093
+      - KAFKA_CFG_LISTENERS=BROKER://:19092,CONTROLLER://:19093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=BROKER:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_ADVERTISED_LISTENERS=BROKER://message_queue_sasl_1:19092
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=BROKER
+      - KAFKA_CFG_SASL_ENABLED_MECHANISMS=PLAIN
+      - KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL=PLAIN
+      - KAFKA_CFG_SASL_MECHANISM_CONTROLLER_PROTOCOL=PLAIN
+      - KAFKA_CFG_LISTENER_NAME_BROKER_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required username="dev" password="rw," user_dev="rw";
+      - KAFKA_CFG_LISTENER_NAME_CONTROLLER_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required username="dev" password="rw" user_dev="rw";
+
   source-test-env:
-    image: public.ecr.aws/x5u3w5h6/rw-build-env:v20240104_1
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
+    depends_on:
+      - mysql
+      - mysql-meta
+      - sqlserver-server
+      - db
+      - message_queue
+      - schemaregistry
+      - pulsar-server
+      - mongodb
+      - mongodb-setup
+      - mongo_data_generator
+      - nats-server
+      - message_queue_sasl_1
+    volumes:
+      - ..:/risingwave
+    stop_grace_period: 30s
+
+  sink-test-env:
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
+    depends_on:
+      - mysql
+      - mysql-meta
+      - db
+      - message_queue
+      - schemaregistry
+      - elasticsearch
+      - clickhouse-server
+      - redis-server
+      - pulsar-server
+      - mqtt-server
+      - cassandra-server
+      - doris-server
+      - starrocks-fe-server
+      - starrocks-be-server
+      - mongodb
+      - mongodb-setup
+      - sqlserver-server
+    volumes:
+      - ..:/risingwave
+    stop_grace_period: 30s
+
+  iceberg-test-env:
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
     depends_on:
       - mysql
       - db
@@ -79,26 +160,34 @@ services:
       - schemaregistry
     volumes:
       - ..:/risingwave
-
-  sink-test-env:
-    image: public.ecr.aws/x5u3w5h6/rw-build-env:v20240104_1
-    depends_on:
-      - mysql
-      - db
-      - message_queue
-      - elasticsearch
-      - clickhouse-server
-      - pulsar
-    volumes:
-      - ..:/risingwave
+    stop_grace_period: 30s
 
   rw-build-env:
-    image: public.ecr.aws/x5u3w5h6/rw-build-env:v20240104_1
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
     volumes:
       - ..:/risingwave
+    stop_grace_period: 30s
+
+  # Standard environment for CI, including MySQL and Postgres for metadata.
+  ci-standard-env:
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
+    depends_on:
+      - mysql-meta
+      - db
+    volumes:
+      - ..:/risingwave
+    stop_grace_period: 30s
+
+  iceberg-engine-env:
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
+    depends_on:
+      - db
+    volumes:
+      - ..:/risingwave
+    stop_grace_period: 30s
 
   ci-flamegraph-env:
-    image: public.ecr.aws/x5u3w5h6/rw-build-env:v20240104_1
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
     # NOTE(kwannoel): This is used in order to permit
     # syscalls for `nperf` (perf_event_open),
     # so it can do CPU profiling.
@@ -109,31 +198,36 @@ services:
       - ..:/risingwave
 
   regress-test-env:
-    image: public.ecr.aws/x5u3w5h6/rw-build-env:v20240104_1
+    image: public.ecr.aws/w1p7b4n3/rw-build-env:${BUILD_ENV_VERSION:?}
     depends_on:
       db:
         condition: service_healthy
     volumes:
       - ..:/risingwave
 
-  release-env:
-    # build binaries on a earlier Linux distribution (therefore with earlier version GLIBC)
-    # See https://github.com/risingwavelabs/risingwave/issues/4556 for more details.
+  release-env-x86:
+    # Build binaries on a earlier Linux distribution (therefore with earlier version GLIBC)
+    # `manylinux_2_28` is based on AlmaLinux 8 with GLIBC 2.28.
     #
     # GLIBC versions on some systems:
-    # Amazon Linux 2: 2.26 (EOL 2025-06-30) (We will definitely want to support this)
-    # AL2023: 2.34
-    # Ubuntu 18.04: 2.27 (Already EOL 2023-05-31)
-    # Ubuntu 20.04: 2.31
+    # - Amazon Linux 2023 (AL2023): 2.34
+    # - Ubuntu 20.04: 2.31
     #
-    # manylinux2014: CentOS 7 (EOL 2024-06-30), GLIBC 2.17
-    image: quay.io/pypa/manylinux2014_x86_64
+    # Systems that we don't provide support for:
+    # - Ubuntu 18.04: 2.27 (Already EOL 2023-05-31)
+    # - Amazon Linux 2: 2.26 (Originally EOL 2023-06-30, superseded by AL2023)
+    image: quay.io/pypa/manylinux_2_28_x86_64:2025.03.23-1
+    working_dir: /mnt
+    volumes:
+      - ..:/mnt
+
+  release-env-arm:
+    image: quay.io/pypa/manylinux_2_28_aarch64:2025.03.23-1
     working_dir: /mnt
     volumes:
       - ..:/mnt
 
   elasticsearch:
-    container_name: elasticsearch
     image: docker.elastic.co/elasticsearch/elasticsearch:7.11.0
     environment:
       - xpack.security.enabled=true
@@ -143,60 +237,99 @@ services:
       - 9200:9200
 
   clickhouse-server:
-    image: clickhouse/clickhouse-server:23.3.8.21-alpine
-    container_name: clickhouse-server-1
-    hostname: clickhouse-server-1
+    image: clickhouse/clickhouse-server:25.5
     ports:
       - "8123:8123"
       - "9000:9000"
       - "9004:9004"
     expose:
       - 9009
-
-# Temporary workaround for json schema registry test since redpanda only supports
-# protobuf/avro schema registry. Should be removed after the support.
-# Related tracking issue:
-# https://github.com/redpanda-data/redpanda/issues/1878
-  zookeeper:
-    container_name: zookeeper
-    image: confluentinc/cp-zookeeper:latest
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
+      CLICKHOUSE_USER: "default"
+      CLICKHOUSE_PASSWORD: "default"
 
+  redis-server:
+    image: "redis:latest"
+    expose:
+      - 6379
+    ports:
+      - 6378:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 30s
+      retries: 50
+
+  cassandra-server:
+    image: cassandra:4.0
+    ports:
+      - 9042:9042
+    environment:
+      - CASSANDRA_CLUSTER_NAME=cloudinfra
+
+  doris-server:
+    image: apache/doris:doris-all-in-one-2.1.0
+    ports:
+      - 8030:8030
+      - 8040:8040
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9030"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  sqlserver-server:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    ports:
+      - 1433:1433
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "SomeTestOnly@SA"
+      MSSQL_AGENT_ENABLED: "true"
+
+  starrocks-fe-server:
+    image: starrocks/fe-ubuntu:3.1.7
+    command: /opt/starrocks/fe/bin/start_fe.sh
+    ports:
+      - 28030:8030
+      - 29020:9020
+      - 29030:9030
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9030"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  starrocks-be-server:
+    image: starrocks/be-ubuntu:3.1.7
+    command:
+      - /bin/bash
+      - -c
+      - |
+        sleep 15s; mysql --connect-timeout 2 -h starrocks-fe-server -P9030 -uroot -e "alter system add backend \"starrocks-be-server:9050\";"
+        /opt/starrocks/be/bin/start_be.sh
+    ports:
+      - 28040:8040
+      - 29050:9050
+    depends_on:
+      - starrocks-fe-server
+
+  # # Temporary workaround for json schema registry test since redpanda only supports
+  # # protobuf/avro schema registry. Should be removed after the support.
+  # # Related tracking issue:
+  # # https://github.com/redpanda-data/redpanda/issues/1878
   schemaregistry:
-    container_name: schemaregistry
-    hostname: schemaregistry
     image: confluentinc/cp-schema-registry:latest
     depends_on:
-      - kafka
+      - message_queue
     ports:
       - "8082:8082"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schemaregistry
-      SCHEMA_REGISTRY_KAFKASTORE_CONNECTION_URL: 'zookeeper:2181'
       SCHEMA_REGISTRY_LISTENERS: http://schemaregistry:8082
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9093,PLAINTEXT_INTERNAL://localhost:29093
-      SCHEMA_REGISTRY_DEBUG: 'true'
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: message_queue:29092
 
-  kafka:
-    container_name: kafka
-    image: confluentinc/cp-kafka:latest
-    ports:
-      - "29093:29093"
-    depends_on:
-      - zookeeper
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9093,PLAINTEXT_INTERNAL://localhost:29093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-
-  pulsar:
-    container_name: pulsar
+  pulsar-server:
     image: apachepulsar/pulsar:latest
     command: bin/pulsar standalone
     ports:
@@ -206,7 +339,72 @@ services:
       - "8080"
       - "6650"
     healthcheck:
-      test: [ "CMD-SHELL", "bin/pulsar-admin brokers healthcheck"]
+      test: ["CMD-SHELL", "bin/pulsar-admin brokers healthcheck"]
       interval: 5s
       timeout: 5s
       retries: 5
+
+  mongodb:
+    image: mongo:4.4
+    ports:
+      - "27017"
+    command: --replSet rs0 --oplogSize 128
+    restart: always
+    healthcheck:
+      test: "echo 'db.runCommand({ping: 1})' | mongo"
+      interval: 5s
+      timeout: 10s
+      retries: 3
+
+  mongodb-setup:
+    image: mongo:4.4
+    depends_on:
+      - mongodb
+    entrypoint:
+      [
+        "bash",
+        "-c",
+        "sleep 10 && mongo --host mongodb:27017 /config-replica.js && sleep 10",
+      ]
+    restart: "no"
+    volumes:
+      - ./mongodb/config-replica.js:/config-replica.js
+
+  mongo_data_generator:
+    build:
+      context: .
+      dockerfile: ./mongodb/Dockerfile.generator
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+      MONGO_DB_NAME: random_data
+  mqtt-server:
+    image: eclipse-mosquitto
+    command:
+      - sh
+      - -c
+      - echo "running command"; printf 'allow_anonymous true\nlistener 1883 0.0.0.0' > /mosquitto/config/mosquitto.conf; echo "starting service..."; cat /mosquitto/config/mosquitto.conf;/docker-entrypoint.sh;/usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+    ports:
+      - 1883:1883
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "(mosquitto_sub -h localhost -p 1883 -t 'topic' -E -i probe 2>&1 | grep Error) && exit 1 || exit 0",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+  nats-server:
+    image: nats:latest
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

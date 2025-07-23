@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 #![cfg_attr(not(madsim), allow(unused_imports))]
 
+use std::cmp::max;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
@@ -21,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use cfg_or_panic::cfg_or_panic;
 use clap::Parser;
 use futures::channel::{mpsc, oneshot};
@@ -30,12 +31,18 @@ use futures::{SinkExt, StreamExt};
 use itertools::Itertools;
 #[cfg(madsim)]
 use madsim::runtime::{Handle, NodeHandle};
-use rand::seq::IteratorRandom;
 use rand::Rng;
+use rand::seq::IteratorRandom;
+use risingwave_common::util::tokio_util::sync::CancellationToken;
+use risingwave_common::util::worker_util::DEFAULT_RESOURCE_GROUP;
+#[cfg(madsim)]
+use risingwave_object_store::object::sim::SimServer as ObjectStoreSimServer;
 use risingwave_pb::common::WorkerNode;
 use sqllogictest::AsyncDB;
+use tempfile::NamedTempFile;
 #[cfg(not(madsim))]
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use crate::client::RisingWave;
 
@@ -79,18 +86,48 @@ pub struct Configuration {
 
     /// The number of CPU cores for each compute node.
     ///
-    /// This determines worker_node_parallelism.
+    /// This determines `worker_node_parallelism`.
     pub compute_node_cores: usize,
 
-    /// The probability of etcd request timeout.
-    pub etcd_timeout_rate: f32,
+    /// Queries to run per session.
+    pub per_session_queries: Arc<Vec<String>>,
 
-    /// Path to etcd data file.
-    pub etcd_data_path: Option<PathBuf>,
+    /// Resource groups for compute nodes.
+    pub compute_resource_groups: HashMap<usize, String>,
+}
+
+impl Default for Configuration {
+    fn default() -> Self {
+        let config_path = {
+            let mut file =
+                tempfile::NamedTempFile::new().expect("failed to create temp config file");
+
+            let config_data = r#"
+[server]
+telemetry_enabled = false
+metrics_level = "Disabled"
+"#
+            .to_owned();
+            file.write_all(config_data.as_bytes())
+                .expect("failed to write config file");
+            file.into_temp_path()
+        };
+
+        Configuration {
+            config_path: ConfigPath::Temp(config_path.into()),
+            frontend_nodes: 1,
+            compute_nodes: 1,
+            meta_nodes: 1,
+            compactor_nodes: 1,
+            compute_node_cores: 1,
+            per_session_queries: vec![].into(),
+            compute_resource_groups: Default::default(),
+        }
+    }
 }
 
 impl Configuration {
-    /// Returns the config for scale test.
+    /// Returns the configuration for scale test.
     pub fn for_scale() -> Self {
         // Embed the config file and create a temporary file at runtime. The file will be deleted
         // automatically when it's dropped.
@@ -106,19 +143,34 @@ impl Configuration {
             config_path: ConfigPath::Temp(config_path.into()),
             frontend_nodes: 2,
             compute_nodes: 3,
-            meta_nodes: 3,
+            meta_nodes: 1,
             compactor_nodes: 2,
             compute_node_cores: 2,
-            etcd_timeout_rate: 0.0,
-            etcd_data_path: None,
+            ..Default::default()
         }
+    }
+
+    /// Provides a configuration for scale test which ensures that the arrangement backfill is disabled,
+    /// so table scan will use `no_shuffle`.
+    pub fn for_scale_no_shuffle() -> Self {
+        let mut conf = Self::for_scale();
+        conf.per_session_queries =
+            vec!["SET STREAMING_USE_ARRANGEMENT_BACKFILL = false;".into()].into();
+        conf
+    }
+
+    pub fn for_scale_shared_source() -> Self {
+        let mut conf = Self::for_scale();
+        conf.per_session_queries = vec!["SET STREAMING_USE_SHARED_SOURCE = true;".into()].into();
+        conf
     }
 
     pub fn for_auto_parallelism(
         max_heartbeat_interval_secs: u64,
-        enable_auto_scale_in: bool,
         enable_auto_parallelism: bool,
     ) -> Self {
+        let disable_automatic_parallelism_control = !enable_auto_parallelism;
+
         let config_path = {
             let mut file =
                 tempfile::NamedTempFile::new().expect("failed to create temp config file");
@@ -126,8 +178,10 @@ impl Configuration {
             let config_data = format!(
                 r#"[meta]
 max_heartbeat_interval_secs = {max_heartbeat_interval_secs}
-enable_scale_in_when_recovery = {enable_auto_scale_in}
-enable_automatic_parallelism_control = {enable_auto_parallelism}
+disable_automatic_parallelism_control = {disable_automatic_parallelism_control}
+parallelism_control_trigger_first_delay_sec = 0
+parallelism_control_batch_size = 10
+parallelism_control_trigger_period_sec = 10
 
 [system]
 barrier_interval_ms = 250
@@ -150,8 +204,44 @@ metrics_level = "Disabled"
             meta_nodes: 1,
             compactor_nodes: 1,
             compute_node_cores: 2,
-            etcd_timeout_rate: 0.0,
-            etcd_data_path: None,
+            per_session_queries: vec![
+                "create view if not exists table_parallelism as select t.name, tf.parallelism from rw_tables t, rw_table_fragments tf where t.id = tf.table_id;".into(),
+                "create view if not exists mview_parallelism as select m.name, tf.parallelism from rw_materialized_views m, rw_table_fragments tf where m.id = tf.table_id;".into(),
+            ]
+                .into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn for_default_parallelism(default_parallelism: usize) -> Self {
+        let config_path = {
+            let mut file =
+                tempfile::NamedTempFile::new().expect("failed to create temp config file");
+
+            let config_data = format!(
+                r#"
+[server]
+telemetry_enabled = false
+metrics_level = "Disabled"
+[meta]
+default_parallelism = {default_parallelism}
+"#
+            )
+            .to_owned();
+            file.write_all(config_data.as_bytes())
+                .expect("failed to write config file");
+            file.into_temp_path()
+        };
+
+        Configuration {
+            config_path: ConfigPath::Temp(config_path.into()),
+            frontend_nodes: 1,
+            compute_nodes: 1,
+            meta_nodes: 1,
+            compactor_nodes: 1,
+            compute_node_cores: default_parallelism * 2,
+            per_session_queries: vec![].into(),
+            compute_resource_groups: Default::default(),
         }
     }
 
@@ -174,8 +264,31 @@ metrics_level = "Disabled"
             meta_nodes: 1,
             compactor_nodes: 1,
             compute_node_cores: 4,
-            etcd_timeout_rate: 0.0,
-            etcd_data_path: None,
+            ..Default::default()
+        }
+    }
+
+    pub fn for_arrangement_backfill() -> Self {
+        // Embed the config file and create a temporary file at runtime. The file will be deleted
+        // automatically when it's dropped.
+        let config_path = {
+            let mut file =
+                tempfile::NamedTempFile::new().expect("failed to create temp config file");
+            file.write_all(include_bytes!("arrangement_backfill.toml"))
+                .expect("failed to write config file");
+            file.into_temp_path()
+        };
+
+        Configuration {
+            config_path: ConfigPath::Temp(config_path.into()),
+            frontend_nodes: 1,
+            compute_nodes: 3,
+            meta_nodes: 1,
+            compactor_nodes: 1,
+            compute_node_cores: 1,
+            per_session_queries: vec!["SET STREAMING_USE_ARRANGEMENT_BACKFILL = true;".into()]
+                .into(),
+            ..Default::default()
         }
     }
 
@@ -199,11 +312,30 @@ metrics_level = "Disabled"
             // in a different process.
             frontend_nodes: 1,
             compute_nodes: 3,
-            meta_nodes: 3,
+            meta_nodes: 1,
             compactor_nodes: 2,
             compute_node_cores: 2,
-            etcd_timeout_rate: 0.0,
-            etcd_data_path: None,
+            ..Default::default()
+        }
+    }
+
+    pub fn enable_arrangement_backfill() -> Self {
+        let config_path = {
+            let mut file =
+                tempfile::NamedTempFile::new().expect("failed to create temp config file");
+            file.write_all(include_bytes!("disable_arrangement_backfill.toml"))
+                .expect("failed to write config file");
+            file.into_temp_path()
+        };
+        Configuration {
+            config_path: ConfigPath::Temp(config_path.into()),
+            frontend_nodes: 1,
+            compute_nodes: 1,
+            meta_nodes: 1,
+            compactor_nodes: 1,
+            compute_node_cores: 1,
+            per_session_queries: vec![].into(),
+            ..Default::default()
         }
     }
 }
@@ -212,18 +344,17 @@ metrics_level = "Disabled"
 ///
 /// # Nodes
 ///
-/// | Name           | IP            |
-/// | -------------- | ------------- |
-/// | meta-x         | 192.168.1.x   |
-/// | frontend-x     | 192.168.2.x   |
-/// | compute-x      | 192.168.3.x   |
-/// | compactor-x    | 192.168.4.x   |
-/// | etcd           | 192.168.10.1  |
-/// | kafka-broker   | 192.168.11.1  |
-/// | kafka-producer | 192.168.11.2  |
-/// | s3             | 192.168.12.1  |
-/// | client         | 192.168.100.1 |
-/// | ctl            | 192.168.101.1 |
+/// | Name             | IP            |
+/// | ---------------- | ------------- |
+/// | meta-x           | 192.168.1.x   |
+/// | frontend-x       | 192.168.2.x   |
+/// | compute-x        | 192.168.3.x   |
+/// | compactor-x      | 192.168.4.x   |
+/// | kafka-broker     | 192.168.11.1  |
+/// | kafka-producer   | 192.168.11.2  |
+/// | object_store_sim | 192.168.12.1  |
+/// | client           | 192.168.100.1 |
+/// | ctl              | 192.168.101.1 |
 pub struct Cluster {
     config: Configuration,
     handle: Handle,
@@ -231,6 +362,8 @@ pub struct Cluster {
     pub(crate) client: NodeHandle,
     #[cfg(madsim)]
     pub(crate) ctl: NodeHandle,
+    #[cfg(madsim)]
+    pub(crate) sqlite_file_handle: NamedTempFile,
 }
 
 impl Cluster {
@@ -245,9 +378,11 @@ impl Cluster {
         println!("seed = {}", handle.seed());
         println!("{:#?}", conf);
 
+        // TODO: support mutil meta nodes
+        assert_eq!(conf.meta_nodes, 1);
+
         // setup DNS and load balance
         let net = madsim::net::NetSim::current();
-        net.add_dns_record("etcd", "192.168.10.1".parse().unwrap());
         for i in 1..=conf.meta_nodes {
             net.add_dns_record(
                 &format!("meta-{i}"),
@@ -268,26 +403,6 @@ impl Cluster {
             )
         }
 
-        // etcd node
-        let etcd_data = conf
-            .etcd_data_path
-            .as_ref()
-            .map(|path| std::fs::read_to_string(path).unwrap());
-        handle
-            .create_node()
-            .name("etcd")
-            .ip("192.168.10.1".parse().unwrap())
-            .init(move || {
-                let addr = "0.0.0.0:2388".parse().unwrap();
-                let mut builder =
-                    etcd_client::SimServer::builder().timeout_rate(conf.etcd_timeout_rate);
-                if let Some(data) = &etcd_data {
-                    builder = builder.load(data.clone());
-                }
-                builder.serve(addr)
-            })
-            .build();
-
         // kafka broker
         handle
             .create_node()
@@ -300,14 +415,13 @@ impl Cluster {
             })
             .build();
 
-        // s3
+        // object_store_sim
         handle
             .create_node()
-            .name("s3")
+            .name("object_store_sim")
             .ip("192.168.12.1".parse().unwrap())
             .init(move || async move {
-                aws_sdk_s3::server::SimServer::default()
-                    .with_bucket("hummock001")
+                ObjectStoreSimServer::builder()
                     .serve("0.0.0.0:9301".parse().unwrap())
                     .await
             })
@@ -320,11 +434,17 @@ impl Cluster {
         for i in 1..=conf.meta_nodes {
             meta_addrs.push(format!("http://meta-{i}:5690"));
         }
-        std::env::set_var("RW_META_ADDR", meta_addrs.join(","));
+        unsafe { std::env::set_var("RW_META_ADDR", meta_addrs.join(",")) };
+
+        let sqlite_file_handle: NamedTempFile = NamedTempFile::new().unwrap();
+        let file_path = sqlite_file_handle.path().display().to_string();
+        tracing::info!(?file_path, "sqlite_file_path");
+        let sql_endpoint = format!("sqlite://{}?mode=rwc", file_path);
+        let backend_args = vec!["--backend", "sql", "--sql-endpoint", &sql_endpoint];
 
         // meta node
         for i in 1..=conf.meta_nodes {
-            let opts = risingwave_meta_node::MetaNodeOpts::parse_from([
+            let args = [
                 "meta-node",
                 "--config-path",
                 conf.config_path.as_str(),
@@ -332,20 +452,25 @@ impl Cluster {
                 "0.0.0.0:5690",
                 "--advertise-addr",
                 &format!("meta-{i}:5690"),
-                "--backend",
-                "etcd",
-                "--etcd-endpoints",
-                "etcd:2388",
                 "--state-store",
-                "hummock+minio://hummockadmin:hummockadmin@192.168.12.1:9301/hummock001",
+                "hummock+sim://hummockadmin:hummockadmin@192.168.12.1:9301/hummock001",
                 "--data-directory",
                 "hummock_001",
-            ]);
+                "--temp-secret-file-dir",
+                &format!("./secrets/meta-{i}"),
+            ];
+            let args = args.into_iter().chain(backend_args.clone().into_iter());
+            let opts = risingwave_meta_node::MetaNodeOpts::parse_from(args);
             handle
                 .create_node()
                 .name(format!("meta-{i}"))
                 .ip([192, 168, 1, i as u8].into())
-                .init(move || risingwave_meta_node::start(opts.clone()))
+                .init(move || {
+                    risingwave_meta_node::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -360,14 +485,23 @@ impl Cluster {
                 conf.config_path.as_str(),
                 "--listen-addr",
                 "0.0.0.0:4566",
+                "--health-check-listener-addr",
+                "0.0.0.0:6786",
                 "--advertise-addr",
                 &format!("192.168.2.{i}:4566"),
+                "--temp-secret-file-dir",
+                &format!("./secrets/frontend-{i}"),
             ]);
             handle
                 .create_node()
                 .name(format!("frontend-{i}"))
                 .ip([192, 168, 2, i as u8].into())
-                .init(move || risingwave_frontend::start(opts.clone()))
+                .init(move || {
+                    risingwave_frontend::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -385,13 +519,26 @@ impl Cluster {
                 "6979321856",
                 "--parallelism",
                 &conf.compute_node_cores.to_string(),
+                "--temp-secret-file-dir",
+                &format!("./secrets/compute-{i}"),
+                "--resource-group",
+                &conf
+                    .compute_resource_groups
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or(DEFAULT_RESOURCE_GROUP.to_string()),
             ]);
             handle
                 .create_node()
                 .name(format!("compute-{i}"))
                 .ip([192, 168, 3, i as u8].into())
                 .cores(conf.compute_node_cores)
-                .init(move || risingwave_compute::start(opts.clone()))
+                .init(move || {
+                    risingwave_compute::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -410,7 +557,12 @@ impl Cluster {
                 .create_node()
                 .name(format!("compactor-{i}"))
                 .ip([192, 168, 4, i as u8].into())
-                .init(move || risingwave_compactor::start(opts.clone()))
+                .init(move || {
+                    risingwave_compactor::start(
+                        opts.clone(),
+                        CancellationToken::new(), // dummy
+                    )
+                })
                 .build();
         }
 
@@ -436,16 +588,28 @@ impl Cluster {
             handle,
             client,
             ctl,
+            sqlite_file_handle,
         })
+    }
+
+    #[cfg_or_panic(madsim)]
+    fn per_session_queries(&self) -> Arc<Vec<String>> {
+        self.config.per_session_queries.clone()
     }
 
     /// Start a SQL session on the client node.
     #[cfg_or_panic(madsim)]
     pub fn start_session(&mut self) -> Session {
         let (query_tx, mut query_rx) = mpsc::channel::<SessionRequest>(0);
+        let per_session_queries = self.per_session_queries();
 
         self.client.spawn(async move {
             let mut client = RisingWave::connect("frontend".into(), "dev".into()).await?;
+
+            for sql in per_session_queries.as_ref() {
+                client.run(sql).await?;
+            }
+            drop(per_session_queries);
 
             while let Some((sql, tx)) = query_rx.next().await {
                 let result = client
@@ -500,7 +664,7 @@ impl Cluster {
         }
         let rand_nodes = worker_nodes
             .iter()
-            .choose_multiple(&mut rand::thread_rng(), n)
+            .choose_multiple(&mut rand::rng(), n)
             .to_vec();
         Ok(rand_nodes.iter().cloned().cloned().collect_vec())
     }
@@ -546,12 +710,12 @@ impl Cluster {
     pub async fn kill_node(&self, opts: &KillOpts) {
         let mut nodes = vec![];
         if opts.kill_meta {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.meta_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("meta-{}", i));
@@ -562,36 +726,36 @@ impl Cluster {
             }
         }
         if opts.kill_frontend {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.frontend_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("frontend-{}", i));
             }
         }
         if opts.kill_compute {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.compute_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("compute-{}", i));
             }
         }
         if opts.kill_compactor {
-            let rand = rand::thread_rng().gen_range(0..3);
+            let rand = rand::rng().random_range(0..3);
             for i in 1..=self.config.compactor_nodes {
                 match rand {
-                    0 => break,                                         // no killed
-                    1 => {}                                             // all killed
-                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    0 => break,                                     // no killed
+                    1 => {}                                         // all killed
+                    _ if !rand::rng().random_bool(0.5) => continue, // random killed
                     _ => {}
                 }
                 nodes.push(format!("compactor-{}", i));
@@ -601,7 +765,7 @@ impl Cluster {
         self.kill_nodes(nodes, opts.restart_delay_secs).await
     }
 
-    /// Kill the given nodes by their names and restart them in 2s + restart_delay_secs with a
+    /// Kill the given nodes by their names and restart them in 2s + `restart_delay_secs` with a
     /// probability of 0.1.
     #[cfg_or_panic(madsim)]
     pub async fn kill_nodes(
@@ -611,16 +775,15 @@ impl Cluster {
     ) {
         join_all(nodes.into_iter().map(|name| async move {
             let name = name.as_ref();
-            let t = rand::thread_rng().gen_range(Duration::from_secs(0)..Duration::from_secs(1));
+            let t = rand::rng().random_range(Duration::from_secs(0)..Duration::from_secs(1));
             tokio::time::sleep(t).await;
             tracing::info!("kill {name}");
             Handle::current().kill(name);
 
-            let mut t =
-                rand::thread_rng().gen_range(Duration::from_secs(0)..Duration::from_secs(1));
+            let mut t = rand::rng().random_range(Duration::from_secs(0)..Duration::from_secs(1));
             // has a small chance to restart after a long time
             // so that the node is expired and removed from the cluster
-            if rand::thread_rng().gen_bool(0.1) {
+            if rand::rng().random_bool(0.1) {
                 // max_heartbeat_interval_secs = 15
                 t += Duration::from_secs(restart_delay_secs as u64);
             }
@@ -741,6 +904,45 @@ impl Cluster {
             }
         }
     }
+
+    pub async fn wait_for_recovery(&mut self) -> Result<()> {
+        let timeout = Duration::from_secs(200);
+        let mut session = self.start_session();
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(result) = session.run("select rw_recovery_status()").await
+                    && result == "RUNNING"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_nanos(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// This function only works if all actors in your cluster are following adaptive scaling.
+    pub async fn wait_for_scale(&mut self, parallelism: usize) -> Result<()> {
+        let timeout = Duration::from_secs(200);
+        let mut session = self.start_session();
+        tokio::time::timeout(timeout, async {
+            loop {
+                let parallelism_sql = format!(
+                    "select count(parallelism) filter (where parallelism != {parallelism})\
+                from (select count(*) parallelism from rw_actors group by fragment_id);"
+                );
+                if let Ok(result) = session.run(&parallelism_sql).await
+                    && result == "0"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_nanos(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 type SessionRequest = (
@@ -755,6 +957,16 @@ pub struct Session {
 }
 
 impl Session {
+    /// Run the given SQLs on the session.
+    pub async fn run_all(&mut self, sqls: Vec<impl Into<String>>) -> Result<Vec<String>> {
+        let mut results = Vec::with_capacity(sqls.len());
+        for sql in sqls {
+            let result = self.run(sql).await?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     /// Run the given SQL query on the session.
     pub async fn run(&mut self, sql: impl Into<String>) -> Result<String> {
         let (tx, rx) = oneshot::channel();
@@ -766,6 +978,11 @@ impl Session {
     pub async fn flush(&mut self) -> Result<()> {
         self.run("FLUSH").await?;
         Ok(())
+    }
+
+    pub async fn is_arrangement_backfill_enabled(&mut self) -> Result<bool> {
+        let result = self.run("show streaming_use_arrangement_backfill").await?;
+        Ok(result == "true")
     }
 }
 
@@ -784,7 +1001,7 @@ impl KillOpts {
     /// Killing all kind of nodes.
     pub const ALL: Self = KillOpts {
         kill_rate: 1.0,
-        kill_meta: true,
+        kill_meta: false, // FIXME: make it true when multiple meta nodes are supported
         kill_frontend: true,
         kill_compute: true,
         kill_compactor: true,
@@ -792,7 +1009,7 @@ impl KillOpts {
     };
     pub const ALL_FAST: Self = KillOpts {
         kill_rate: 1.0,
-        kill_meta: true,
+        kill_meta: false, // FIXME: make it true when multiple meta nodes are supported
         kill_frontend: true,
         kill_compute: true,
         kill_compactor: true,

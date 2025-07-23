@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,42 +12,89 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::select_all;
 use itertools::Itertools;
 use reqwest::{Method, Url};
-use risingwave_common::error::ErrorCode::ProtocolError;
-use risingwave_common::error::{Result, RwError};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use thiserror_ext::AsReport as _;
+use tokio_retry::Retry;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 use super::util::*;
+use crate::connector_common::ConfluentSchemaRegistryConnection;
+use crate::schema::{InvalidOptionError, invalid_option_error};
+use crate::with_options::Get;
 
 pub const SCHEMA_REGISTRY_USERNAME: &str = "schema.registry.username";
 pub const SCHEMA_REGISTRY_PASSWORD: &str = "schema.registry.password";
 
-#[derive(Debug, Clone, Default)]
-pub struct SchemaRegistryAuth {
-    username: Option<String>,
-    password: Option<String>,
+pub const SCHEMA_REGISTRY_MAX_DELAY_KEY: &str = "schema.registry.max.delay.sec";
+pub const SCHEMA_REGISTRY_BACKOFF_DURATION_KEY: &str = "schema.registry.backoff.duration.ms";
+pub const SCHEMA_REGISTRY_BACKOFF_FACTOR_KEY: &str = "schema.registry.backoff.factor";
+pub const SCHEMA_REGISTRY_RETRIES_MAX_KEY: &str = "schema.registry.retries.max";
+
+const DEFAULT_MAX_DELAY_SEC: u32 = 3;
+const DEFAULT_BACKOFF_DURATION_MS: u64 = 100;
+const DEFAULT_BACKOFF_FACTOR: u64 = 2;
+const DEFAULT_RETRIES_MAX: usize = 3;
+
+#[derive(Debug, Clone)]
+struct SchemaRegistryRetryConfig {
+    pub max_delay_sec: u32,
+    pub backoff_duration_ms: u64,
+    pub backoff_factor: u64,
+    pub retries_max: usize,
 }
 
-impl From<&HashMap<String, String>> for SchemaRegistryAuth {
-    fn from(props: &HashMap<String, String>) -> Self {
-        SchemaRegistryAuth {
-            username: props.get(SCHEMA_REGISTRY_USERNAME).cloned(),
-            password: props.get(SCHEMA_REGISTRY_PASSWORD).cloned(),
+impl Default for SchemaRegistryRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_delay_sec: DEFAULT_MAX_DELAY_SEC,
+            backoff_duration_ms: DEFAULT_BACKOFF_DURATION_MS,
+            backoff_factor: DEFAULT_BACKOFF_FACTOR,
+            retries_max: DEFAULT_RETRIES_MAX,
         }
     }
 }
 
-impl From<&BTreeMap<String, String>> for SchemaRegistryAuth {
-    fn from(props: &BTreeMap<String, String>) -> Self {
-        SchemaRegistryAuth {
+#[derive(Debug, Clone, Default)]
+pub struct SchemaRegistryConfig {
+    username: Option<String>,
+    password: Option<String>,
+
+    retry_config: SchemaRegistryRetryConfig,
+}
+
+impl<T: Get> From<&T> for SchemaRegistryConfig {
+    fn from(props: &T) -> Self {
+        SchemaRegistryConfig {
             username: props.get(SCHEMA_REGISTRY_USERNAME).cloned(),
             password: props.get(SCHEMA_REGISTRY_PASSWORD).cloned(),
+
+            retry_config: SchemaRegistryRetryConfig {
+                max_delay_sec: props
+                    .get(SCHEMA_REGISTRY_MAX_DELAY_KEY)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(DEFAULT_MAX_DELAY_SEC),
+                backoff_duration_ms: props
+                    .get(SCHEMA_REGISTRY_BACKOFF_DURATION_KEY)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_BACKOFF_DURATION_MS),
+                backoff_factor: props
+                    .get(SCHEMA_REGISTRY_BACKOFF_FACTOR_KEY)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(DEFAULT_BACKOFF_FACTOR),
+                retries_max: props
+                    .get(SCHEMA_REGISTRY_RETRIES_MAX_KEY)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_RETRIES_MAX),
+            },
         }
     }
 }
@@ -59,10 +106,41 @@ pub struct Client {
     url: Vec<Url>,
     username: Option<String>,
     password: Option<String>,
+
+    retry_config: SchemaRegistryRetryConfig,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("all request confluent registry all timeout, {context}\n{}", errs.iter().map(|e| format!("\t{}", e.as_report())).join("\n"))]
+pub struct ConcurrentRequestError {
+    errs: Vec<itertools::Either<RequestError, tokio::task::JoinError>>,
+    context: String,
+}
+
+type SrResult<T> = Result<T, ConcurrentRequestError>;
+
+impl TryFrom<&ConfluentSchemaRegistryConnection> for Client {
+    type Error = InvalidOptionError;
+
+    fn try_from(value: &ConfluentSchemaRegistryConnection) -> Result<Self, Self::Error> {
+        let urls = handle_sr_list(value.url.as_str())?;
+
+        Client::new(
+            urls,
+            &SchemaRegistryConfig {
+                username: value.username.clone(),
+                password: value.password.clone(),
+                ..Default::default()
+            },
+        )
+    }
 }
 
 impl Client {
-    pub(crate) fn new(url: Vec<Url>, client_config: &SchemaRegistryAuth) -> Result<Self> {
+    pub(crate) fn new(
+        url: Vec<Url>,
+        client_config: &SchemaRegistryConfig,
+    ) -> Result<Self, InvalidOptionError> {
         let valid_urls = url
             .iter()
             .map(|url| (url.cannot_be_a_base(), url))
@@ -70,10 +148,7 @@ impl Client {
             .map(|(_, url)| url.clone())
             .collect_vec();
         if valid_urls.is_empty() {
-            return Err(RwError::from(ProtocolError(format!(
-                "no valid url provided, got {:?}",
-                url
-            ))));
+            return Err(invalid_option_error!("non-base: {}", url.iter().join(" ")));
         } else {
             tracing::debug!(
                 "schema registry client will use url {:?} to connect",
@@ -81,15 +156,15 @@ impl Client {
             );
         }
 
-        let inner = reqwest::Client::builder().build().map_err(|e| {
-            RwError::from(ProtocolError(format!("build reqwest client failed {}", e)))
-        })?;
+        // `unwrap` as the builder is not affected by any input right now
+        let inner = reqwest::Client::builder().build().unwrap();
 
         Ok(Client {
             inner,
             url: valid_urls,
             username: client_config.username.clone(),
             password: client_config.password.clone(),
+            retry_config: client_config.retry_config.clone(),
         })
     }
 
@@ -97,7 +172,7 @@ impl Client {
         &'a self,
         method: Method,
         path: &'a [&'a (impl AsRef<str> + ?Sized + Debug + ToString)],
-    ) -> Result<T>
+    ) -> SrResult<T>
     where
         T: DeserializeOwned + Send + Sync + 'static,
     {
@@ -109,12 +184,27 @@ impl Client {
             client: self.inner.clone(),
             path: path.iter().map(|p| p.to_string()).collect_vec(),
         });
+        tracing::debug!("retry config: {:?}", self.retry_config);
+
+        let retry_strategy = ExponentialBackoff::from_millis(self.retry_config.backoff_duration_ms)
+            .factor(self.retry_config.backoff_factor)
+            .max_delay(Duration::from_secs(self.retry_config.max_delay_sec as u64))
+            .take(self.retry_config.retries_max)
+            .map(jitter);
+
         for url in &self.url {
-            fut_req.push(tokio::spawn(req_inner(
-                ctx.clone(),
-                url.clone(),
-                method.clone(),
-            )));
+            let url_clone = url.clone();
+            let ctx_clone = ctx.clone();
+            let method_clone = method.clone();
+
+            let retry_future = Retry::spawn(retry_strategy.clone(), move || {
+                let ctx = ctx_clone.clone();
+                let url = url_clone.clone();
+                let method = method_clone.clone();
+                async move { req_inner(ctx, url, method).await }
+            });
+
+            fut_req.push(tokio::spawn(retry_future));
         }
 
         while !fut_req.is_empty() {
@@ -124,22 +214,20 @@ impl Client {
                     let _ = remaining.iter().map(|ele| ele.abort());
                     return Ok(res);
                 }
-                Ok(Err(e)) => errs.push(e),
-                Err(e) => errs.push(RwError::from(e)),
+                Ok(Err(e)) => errs.push(itertools::Either::Left(e)),
+                Err(e) => errs.push(itertools::Either::Right(e)),
             }
             fut_req = remaining;
         }
 
-        Err(RwError::from(ProtocolError(format!(
-            "all request confluent registry all timeout, req path {:?}, urls {:?}, err: {:?}",
-            path,
-            self.url,
-            errs.iter().map(|e| e.to_string()).collect_vec()
-        ))))
+        Err(ConcurrentRequestError {
+            errs,
+            context: format!("req path {:?}, urls {}", path, self.url.iter().join(" ")),
+        })
     }
 
     /// get schema by id
-    pub async fn get_schema_by_id(&self, id: i32) -> Result<ConfluentSchema> {
+    pub async fn get_schema_by_id(&self, id: i32) -> SrResult<ConfluentSchema> {
         let res: GetByIdResp = self
             .concurrent_req(Method::GET, &["schemas", "ids", &id.to_string()])
             .await?;
@@ -150,12 +238,24 @@ impl Client {
     }
 
     /// get the latest schema of the subject
-    pub async fn get_schema_by_subject(&self, subject: &str) -> Result<ConfluentSchema> {
+    pub async fn get_schema_by_subject(&self, subject: &str) -> SrResult<ConfluentSchema> {
         self.get_subject(subject).await.map(|s| s.schema)
     }
 
+    // used for connection validate, just check if request is ok
+    pub async fn validate_connection(&self) -> SrResult<()> {
+        #[derive(Debug, Deserialize)]
+        struct GetConfigResp {
+            #[serde(rename = "compatibilityLevel")]
+            _compatibility_level: String,
+        }
+
+        let _: GetConfigResp = self.concurrent_req(Method::GET, &["config"]).await?;
+        Ok(())
+    }
+
     /// get the latest version of the subject
-    pub async fn get_subject(&self, subject: &str) -> Result<Subject> {
+    pub async fn get_subject(&self, subject: &str) -> SrResult<Subject> {
         let res: GetBySubjectResp = self
             .concurrent_req(Method::GET, &["subjects", subject, "versions", "latest"])
             .await?;
@@ -174,7 +274,7 @@ impl Client {
     pub async fn get_subject_and_references(
         &self,
         subject: &str,
-    ) -> Result<(Subject, Vec<Subject>)> {
+    ) -> SrResult<(Subject, Vec<Subject>)> {
         let mut subjects = vec![];
         let mut visited = HashSet::new();
         let mut queue = vec![(subject.to_owned(), "latest".to_owned())];
@@ -216,9 +316,10 @@ mod tests {
         let url = Url::parse("http://localhost:8081").unwrap();
         let client = Client::new(
             vec![url],
-            &SchemaRegistryAuth {
+            &SchemaRegistryConfig {
                 username: None,
                 password: None,
+                retry_config: SchemaRegistryRetryConfig::default(),
             },
         )
         .unwrap();

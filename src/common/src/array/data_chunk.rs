@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,37 +13,37 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::sync::Arc;
-use std::{fmt, usize};
 
 use bytes::Bytes;
 use either::Either;
 use itertools::Itertools;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::PbDataChunk;
 
 use super::{Array, ArrayImpl, ArrayRef, ArrayResult, StructArray};
-use crate::array::data_chunk_iter::RowRef;
 use crate::array::ArrayBuilderImpl;
-use crate::buffer::{Bitmap, BitmapBuilder};
-use crate::estimate_size::EstimateSize;
+use crate::array::data_chunk_iter::RowRef;
+use crate::bitmap::{Bitmap, BitmapBuilder};
 use crate::field_generator::{FieldGeneratorImpl, VarcharProperty};
 use crate::hash::HashCode;
 use crate::row::Row;
-use crate::types::{DataType, DatumRef, StructType, ToOwnedDatum, ToText};
+use crate::types::{DataType, DatumRef, MapType, StructType, ToOwnedDatum, ToText};
 use crate::util::chunk_coalesce::DataChunkBuilder;
 use crate::util::hash_util::finalize_hashers;
 use crate::util::iter_util::ZipEqFast;
 use crate::util::value_encoding::{
-    estimate_serialize_datum_size, serialize_datum_into, try_get_exact_serialize_datum_size,
-    ValueRowSerializer,
+    ValueRowSerializer, estimate_serialize_datum_size, serialize_datum_into,
+    try_get_exact_serialize_datum_size,
 };
 
 /// [`DataChunk`] is a collection of Columns,
-/// a with visibility mask for each row.
+/// with a visibility mask for each row.
 /// For instance, we could have a [`DataChunk`] of this format.
 ///
 /// | v1 | v2 | v3 |
@@ -140,11 +140,13 @@ impl DataChunk {
         self.columns.len()
     }
 
+    // TODO(rc): shall we rename this to `visible_size`? I sometimes find this confused with `capacity`.
     /// `cardinality` returns the number of visible tuples
     pub fn cardinality(&self) -> usize {
         self.visibility.count_ones()
     }
 
+    // TODO(rc): shall we rename this to `size`?
     /// `capacity` returns physical length of any chunk column
     pub fn capacity(&self) -> usize {
         self.visibility.len()
@@ -247,6 +249,7 @@ impl DataChunk {
         Self::new(columns, Bitmap::ones(cardinality))
     }
 
+    /// Scatter a compacted chunk to a new chunk with the given visibility.
     pub fn uncompact(self, vis: Bitmap) -> Self {
         let mut uncompact_builders: Vec<_> = self
             .columns
@@ -344,18 +347,20 @@ impl DataChunk {
         Ok(outputs)
     }
 
-    /// Compute hash values for each row.
+    /// Compute hash values for each row. The number of the returning `HashCodes` is `self.capacity()`.
+    /// When `skip_invisible_row` is true, the `HashCode` for the invisible rows is arbitrary.
     pub fn get_hash_values<H: BuildHasher>(
         &self,
         column_idxes: &[usize],
         hasher_builder: H,
     ) -> Vec<HashCode<H>> {
-        let mut states = Vec::with_capacity(self.capacity());
-        states.resize_with(self.capacity(), || hasher_builder.build_hasher());
+        let len = self.capacity();
+        let mut states = Vec::with_capacity(len);
+        states.resize_with(len, || hasher_builder.build_hasher());
         // Compute hash for the specified columns.
         for column_idx in column_idxes {
             let array = self.column_at(*column_idx);
-            array.hash_vec(&mut states[..]);
+            array.hash_vec(&mut states[..], self.visibility());
         }
         finalize_hashers(&states[..])
             .into_iter()
@@ -383,7 +388,7 @@ impl DataChunk {
     }
 
     /// Returns a table-like text representation of the `DataChunk`.
-    pub fn to_pretty(&self) -> impl Display {
+    pub fn to_pretty(&self) -> impl Display + use<> {
         use comfy_table::Table;
 
         if self.cardinality() == 0 {
@@ -502,10 +507,12 @@ impl DataChunk {
         variable_cols: &[&ArrayRef],
         row_idx: usize,
     ) -> usize {
-        variable_cols
-            .iter()
-            .map(|col| estimate_serialize_datum_size(col.value_at_unchecked(row_idx)))
-            .sum::<usize>()
+        unsafe {
+            variable_cols
+                .iter()
+                .map(|col| estimate_serialize_datum_size(col.value_at_unchecked(row_idx)))
+                .sum::<usize>()
+        }
     }
 
     unsafe fn init_buffer(
@@ -513,9 +520,11 @@ impl DataChunk {
         variable_cols: &[&ArrayRef],
         row_idx: usize,
     ) -> Vec<u8> {
-        Vec::with_capacity(
-            row_len_fixed + Self::compute_size_of_variable_cols_in_row(variable_cols, row_idx),
-        )
+        unsafe {
+            Vec::with_capacity(
+                row_len_fixed + Self::compute_size_of_variable_cols_in_row(variable_cols, row_idx),
+            )
+        }
     }
 
     /// Serialize each row into value encoding bytes.
@@ -716,6 +725,19 @@ impl DataChunkTestExt for DataChunk {
             if let Some(s) = s.strip_suffix("[]") {
                 return DataType::List(Box::new(parse_type(s)));
             }
+
+            // Special logic to support Map type in `DataChunk::from_pretty`.
+            // Please refer to `src/expr/impl/src/scalar/map_filter.rs`.
+            if let Some(inner) = s.strip_prefix("map<").and_then(|s| s.strip_suffix('>')) {
+                let mut parts = inner.split(',');
+                let key_type = parts.next().expect("Key type expected");
+                let value_type = parts.next().expect("Value type expected");
+                return DataType::Map(MapType::from_kv(
+                    parse_type(key_type),
+                    parse_type(value_type),
+                ));
+            }
+
             match s {
                 "B" => DataType::Boolean,
                 "I" => DataType::Int64,
@@ -726,6 +748,7 @@ impl DataChunkTestExt for DataChunk {
                 "TZ" => DataType::Timestamptz,
                 "T" => DataType::Varchar,
                 "SRL" => DataType::Serial,
+                "D" => DataType::Date,
                 array if array.starts_with('<') && array.ends_with('>') => {
                     DataType::Struct(StructType::unnamed(
                         array[1..array.len() - 1]
@@ -761,7 +784,8 @@ impl DataChunkTestExt for DataChunk {
                 let datum = match val_str {
                     "." => None,
                     "(empty)" => Some("".into()),
-                    _ => Some(ScalarImpl::from_text(val_str.as_bytes(), ty).unwrap()),
+                    // `from_text_for_test` has support for Map.
+                    _ => Some(ScalarImpl::from_text_for_test(val_str, ty).unwrap()),
                 };
                 builder.append(datum);
             }
@@ -799,7 +823,7 @@ impl DataChunkTestExt for DataChunk {
                 let arr = col;
                 let mut builder = arr.create_builder(n * 2);
                 for v in arr.iter() {
-                    builder.append(&v.to_owned_datum());
+                    builder.append(v.to_owned_datum());
                     builder.append_null();
                 }
 
@@ -835,7 +859,7 @@ impl DataChunkTestExt for DataChunk {
             let mut rng = SmallRng::from_seed([0; 32]);
             let mut vis_builder = BitmapBuilder::with_capacity(chunk_size);
             for _i in 0..chunk_size {
-                vis_builder.append(rng.gen_bool(visibility_percent));
+                vis_builder.append(rng.random_bool(visibility_percent));
             }
             vis_builder.finish()
         };

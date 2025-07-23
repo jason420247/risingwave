@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,20 +19,16 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use risingwave_hummock_sdk::key::{FullKey, TableKey, UserKeyRangeRef};
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::{HummockEpoch, *};
-use risingwave_pb::hummock::SstableInfo;
 
-mod block_cache;
+pub mod block_cache;
 pub use block_cache::*;
-
-pub mod file_cache;
-pub use file_cache::*;
 
 pub mod sstable;
 pub use sstable::*;
 
 pub mod compactor;
-pub mod conflict_detector;
 mod error;
 pub mod hummock_meta_client;
 pub mod iterator;
@@ -48,14 +44,22 @@ pub mod local_version;
 pub mod observer_manager;
 pub mod store;
 pub use store::*;
-pub mod vacuum;
 mod validator;
 pub mod value;
 pub mod write_limiter;
 
-pub mod block_stream;
+pub mod recent_filter;
+pub use recent_filter::*;
 
+pub mod block_stream;
+mod iceberg_compactor_runner;
+mod time_travel_version_cache;
+
+pub(crate) mod vector;
+
+mod object_id_manager;
 pub use error::*;
+pub use object_id_manager::*;
 pub use risingwave_common::cache::{CacheableEntry, LookupResult, LruCache};
 pub use validator::*;
 use value::*;
@@ -73,14 +77,14 @@ pub async fn get_from_sstable_info(
     read_options: &ReadOptions,
     dist_key_hash: Option<u64>,
     local_stats: &mut StoreLocalStatistic,
-) -> HummockResult<Option<(HummockValue<Bytes>, EpochWithGap)>> {
+) -> HummockResult<Option<impl HummockIterator>> {
     let sstable = sstable_store_ref.sstable(sstable_info, local_stats).await?;
 
     // Bloom filter key is the distribution key, which is no need to be the prefix of pk, and do not
     // contain `TablePrefix` and `VnodePrefix`.
     if let Some(hash) = dist_key_hash
         && !hit_sstable_bloom_filter(
-            sstable.value(),
+            &sstable,
             &(
                 Bound::Included(full_key.user_key),
                 Bound::Included(full_key.user_key),
@@ -89,80 +93,42 @@ pub async fn get_from_sstable_info(
             local_stats,
         )
     {
-        if !read_options.ignore_range_tombstone {
-            let delete_epoch = get_min_delete_range_epoch_from_sstable(
-                sstable.value().as_ref(),
-                full_key.user_key,
-            );
-            if delete_epoch <= full_key.epoch_with_gap.pure_epoch() {
-                return Ok(Some((
-                    HummockValue::Delete,
-                    EpochWithGap::new_from_epoch(delete_epoch),
-                )));
-            }
-        }
-
         return Ok(None);
     }
 
-    // TODO: now SstableIterator does not use prefetch through SstableIteratorReadOptions, so we
-    // use default before refinement.
     let mut iter = SstableIterator::create(
         sstable,
         sstable_store_ref.clone(),
         Arc::new(SstableIteratorReadOptions::from_read_options(read_options)),
+        sstable_info,
     );
     iter.seek(full_key).await?;
     // Iterator has sought passed the borders.
     if !iter.is_valid() {
-        if !read_options.ignore_range_tombstone {
-            let delete_epoch = get_min_delete_range_epoch_from_sstable(
-                iter.sst().value().as_ref(),
-                full_key.user_key,
-            );
-            if delete_epoch <= full_key.epoch_with_gap.pure_epoch() {
-                return Ok(Some((
-                    HummockValue::Delete,
-                    EpochWithGap::new_from_epoch(delete_epoch),
-                )));
-            }
-        }
-
         return Ok(None);
     }
+
+    iter.collect_local_statistic(local_stats);
 
     // Iterator gets us the key, we tell if it's the key we want
     // or key next to it.
     let value = if iter.key().user_key == full_key.user_key {
-        Some((iter.value().to_bytes(), iter.key().epoch_with_gap))
-    } else if !read_options.ignore_range_tombstone {
-        let delete_epoch =
-            get_min_delete_range_epoch_from_sstable(iter.sst().value().as_ref(), full_key.user_key);
-        if delete_epoch <= full_key.epoch_with_gap.pure_epoch() {
-            Some((
-                HummockValue::Delete,
-                EpochWithGap::new_from_epoch(delete_epoch),
-            ))
-        } else {
-            None
-        }
+        Some(iter)
     } else {
         None
     };
-
-    iter.collect_local_statistic(local_stats);
 
     Ok(value)
 }
 
 pub fn hit_sstable_bloom_filter(
-    sstable_info_ref: &Sstable,
+    sstable_ref: &Sstable,
     user_key_range: &UserKeyRangeRef<'_>,
     prefix_hash: u64,
     local_stats: &mut StoreLocalStatistic,
 ) -> bool {
     local_stats.bloom_filter_check_counts += 1;
-    let may_exist = sstable_info_ref.may_match_hash(user_key_range, prefix_hash);
+    let may_exist = sstable_ref.may_match_hash(user_key_range, prefix_hash);
     if !may_exist {
         local_stats.bloom_filter_true_negative_counts += 1;
     }
@@ -170,15 +136,14 @@ pub fn hit_sstable_bloom_filter(
 }
 
 /// Get `user_value` from `ImmutableMemtable`
-pub fn get_from_batch(
-    imm: &ImmutableMemtable,
+pub fn get_from_batch<'a>(
+    imm: &'a ImmutableMemtable,
     table_key: TableKey<&[u8]>,
     read_epoch: HummockEpoch,
     read_options: &ReadOptions,
     local_stats: &mut StoreLocalStatistic,
-) -> Option<(HummockValue<Bytes>, EpochWithGap)> {
-    imm.get(table_key, read_epoch, read_options).map(|v| {
+) -> Option<(HummockValue<&'a Bytes>, EpochWithGap)> {
+    imm.get(table_key, read_epoch, read_options).inspect(|_| {
         local_stats.get_shared_buffer_hit_counts += 1;
-        v
     })
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 use std::collections::HashMap;
 
 use itertools::Itertools;
+use risingwave_hummock_sdk::level::Level;
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::{HummockCompactionTaskId, HummockSstableId};
 use risingwave_pb::hummock::level_handler::RunningCompactTask;
-use risingwave_pb::hummock::{Level, SstableInfo};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelHandler {
@@ -90,9 +91,9 @@ impl LevelHandler {
         let mut table_ids = vec![];
         let mut total_file_size = 0;
         for sst in ssts {
-            self.compacting_files.insert(sst.get_sst_id(), task_id);
-            total_file_size += sst.file_size;
-            table_ids.push(sst.get_sst_id());
+            self.compacting_files.insert(sst.sst_id, task_id);
+            total_file_size += sst.sst_size;
+            table_ids.push(sst.sst_id.inner());
         }
 
         self.pending_tasks.push(RunningCompactTask {
@@ -103,18 +104,18 @@ impl LevelHandler {
         });
     }
 
-    pub fn get_pending_file_count(&self) -> usize {
+    pub fn pending_file_count(&self) -> usize {
         self.compacting_files.len()
     }
 
-    pub fn get_pending_file_size(&self) -> u64 {
+    pub fn pending_file_size(&self) -> u64 {
         self.pending_tasks
             .iter()
             .map(|task| task.total_file_size)
             .sum::<u64>()
     }
 
-    pub fn get_pending_output_file_size(&self, target_level: u32) -> u64 {
+    pub fn pending_output_file_size(&self, target_level: u32) -> u64 {
         self.pending_tasks
             .iter()
             .filter(|task| task.target_level == target_level)
@@ -129,8 +130,17 @@ impl LevelHandler {
             .collect_vec()
     }
 
-    pub fn get_pending_tasks(&self) -> &[RunningCompactTask] {
+    pub fn pending_tasks(&self) -> &[RunningCompactTask] {
         &self.pending_tasks
+    }
+
+    pub fn compacting_files(&self) -> &HashMap<HummockSstableId, HummockCompactionTaskId> {
+        &self.compacting_files
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_add_pending_sst(&mut self, sst_id: HummockSstableId, task_id: u64) {
+        self.compacting_files.insert(sst_id, task_id);
     }
 }
 
@@ -150,7 +160,7 @@ impl From<&risingwave_pb::hummock::LevelHandler> for LevelHandler {
         for task in &lh.tasks {
             pending_tasks.push(task.clone());
             for s in &task.ssts {
-                compacting_files.insert(*s, task.task_id);
+                compacting_files.insert((*s).into(), task.task_id);
             }
         }
         Self {

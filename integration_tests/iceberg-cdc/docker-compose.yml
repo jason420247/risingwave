@@ -5,10 +5,10 @@ services:
     extends:
       file: ../../docker/docker-compose.yml
       service: risingwave-standalone
-  etcd-0:
+  postgres-0:
     extends:
       file: ../../docker/docker-compose.yml
-      service: etcd-0
+      service: postgres-0
   grafana-0:
     extends:
       file: ../../docker/docker-compose.yml
@@ -31,7 +31,7 @@ services:
       - AWS_REGION=us-east-1
     entrypoint: >
       /bin/sh -c "
-      until (/usr/bin/mc config host add minio http://minio-0:9301 hummockadmin hummockadmin) do echo '...waiting...' && sleep 1; done;
+      until (/usr/bin/mc alias set minio http://minio-0:9301 hummockadmin hummockadmin) do echo '...waiting...' && sleep 1; done;
       /usr/bin/mc rm -r --force minio/icebergdata;
       /usr/bin/mc mb minio/icebergdata;
       /usr/bin/mc anonymous set public minio/icebergdata;
@@ -127,7 +127,7 @@ services:
 volumes:
   risingwave-standalone:
     external: false
-  etcd-0:
+  postgres-0:
     external: false
   grafana-0:
     external: false

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,18 +14,18 @@
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_common::error::Result;
 use risingwave_common::types::DataType;
 
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchProjectSet, ColPrunable, ExprRewritable, Logical,
-    LogicalProject, PlanBase, PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamProjectSet,
-    ToBatch, ToStream,
+    BatchProjectSet, ColPrunable, ExprRewritable, Logical, LogicalProject, PlanBase, PlanRef,
+    PlanTreeNodeUnary, PredicatePushdown, StreamProjectSet, ToBatch, ToStream,
+    gen_filter_and_pushdown, generic,
 };
+use crate::error::{ErrorCode, Result};
 use crate::expr::{
-    collect_input_refs, Expr, ExprImpl, ExprRewriter, ExprVisitor, FunctionCall, InputRef,
-    TableFunction,
+    Expr, ExprImpl, ExprRewriter, ExprVisitor, FunctionCall, InputRef, TableFunction,
+    collect_input_refs,
 };
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::generic::GenericPlanRef;
@@ -104,7 +104,7 @@ impl LogicalProjectSet {
                         args,
                         return_type,
                         function_type,
-                        udtf_catalog,
+                        user_defined,
                     } = table_func;
                     let args = args
                         .into_iter()
@@ -116,7 +116,7 @@ impl LogicalProjectSet {
                         args,
                         return_type,
                         function_type,
-                        udtf_catalog,
+                        user_defined,
                     }
                     .into()
                 } else {
@@ -204,7 +204,6 @@ impl PlanTreeNodeUnary for LogicalProjectSet {
         Self::new(input, self.select_list().clone())
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -400,6 +399,15 @@ impl ToStream for LogicalProjectSet {
     // TODO: implement to_stream_with_dist_required like LogicalProject
 
     fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+        if self.select_list().iter().any(|item| item.has_now()) {
+            // User may use `now()` in table function in a wrong way, because we allow `now()` in `FROM` clause.
+            return Err(ErrorCode::NotSupported(
+                "General `now()` function in streaming queries".to_owned(),
+                "Streaming `now()` is currently only supported in GenerateSeries and TemporalFilter patterns.".to_owned(),
+            )
+            .into());
+        }
+
         let new_input = self.input().to_stream(ctx)?;
         let mut new_logical = self.core.clone();
         new_logical.input = new_input;
@@ -412,10 +420,8 @@ mod test {
     use std::collections::HashSet;
 
     use risingwave_common::catalog::{Field, Schema};
-    use risingwave_common::types::DataType;
 
     use super::*;
-    use crate::expr::{ExprImpl, InputRef, TableFunction};
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::LogicalValues;
     use crate::optimizer::property::FunctionalDependency;

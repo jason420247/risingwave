@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,17 @@
 //
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::Schema;
-use risingwave_common::error::{ErrorCode, Result, RwError};
 use risingwave_pb::plan_common::JoinType;
 
 use super::generic::{
-    self, push_down_into_join, push_down_join_condition, GenericPlanNode, GenericPlanRef,
+    self, GenericPlanNode, GenericPlanRef, push_down_into_join, push_down_join_condition,
 };
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
     ColPrunable, Logical, LogicalJoin, LogicalProject, PlanBase, PlanRef, PlanTreeNodeBinary,
     PredicatePushdown, ToBatch, ToStream,
 };
+use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{CorrelatedId, Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::{
@@ -46,13 +46,17 @@ pub struct LogicalApply {
     join_type: JoinType,
 
     /// Id of the Apply operator.
-    /// So correlated_input_ref can refer the Apply operator exactly by correlated_id.
+    /// So `correlated_input_ref` can refer the Apply operator exactly by `correlated_id`.
     correlated_id: CorrelatedId,
     /// The indices of `CorrelatedInputRef`s in `right`.
     correlated_indices: Vec<usize>,
     /// Whether we require the subquery to produce at most one row. If `true`, we have to report an
     /// error if the subquery produces more than one row.
     max_one_row: bool,
+
+    /// An apply has been translated by `translate_apply()`, so we should not translate it in `translate_apply_rule` again.
+    /// This flag is used to avoid infinite loop in General Unnesting(Translate Apply), since we use a top-down apply order instead of bottom-up to improve the multi-scalar subqueries optimization time.
+    translated: bool,
 }
 
 impl Distill for LogicalApply {
@@ -85,6 +89,7 @@ impl LogicalApply {
         correlated_id: CorrelatedId,
         correlated_indices: Vec<usize>,
         max_one_row: bool,
+        translated: bool,
     ) -> Self {
         let ctx = left.ctx();
         let join_core = generic::Join::with_full_output(left, right, join_type, on);
@@ -105,6 +110,7 @@ impl LogicalApply {
             correlated_id,
             correlated_indices,
             max_one_row,
+            translated,
         }
     }
 
@@ -125,6 +131,7 @@ impl LogicalApply {
             correlated_id,
             correlated_indices,
             max_one_row,
+            false,
         )
         .into()
     }
@@ -162,6 +169,10 @@ impl LogicalApply {
 
     pub fn correlated_indices(&self) -> Vec<usize> {
         self.correlated_indices.to_owned()
+    }
+
+    pub fn translated(&self) -> bool {
+        self.translated
     }
 
     pub fn max_one_row(&self) -> bool {
@@ -202,7 +213,7 @@ impl LogicalApply {
         let apply_left_len = apply_left.schema().len();
         let correlated_indices_len = correlated_indices.len();
 
-        let new_apply = LogicalApply::create(
+        let new_apply = LogicalApply::new(
             domain,
             apply_right,
             JoinType::Inner,
@@ -210,7 +221,9 @@ impl LogicalApply {
             correlated_id,
             correlated_indices,
             max_one_row,
-        );
+            true,
+        )
+        .into();
 
         let on = Self::rewrite_on(on, correlated_indices_len, apply_left_len).and(Condition {
             conjunctions: eq_predicates,
@@ -285,6 +298,7 @@ impl PlanTreeNodeBinary for LogicalApply {
             self.correlated_id,
             self.correlated_indices.clone(),
             self.max_one_row,
+            self.translated,
         )
     }
 }
@@ -355,7 +369,7 @@ impl PredicatePushdown for LogicalApply {
 impl ToBatch for LogicalApply {
     fn to_batch(&self) -> Result<PlanRef> {
         Err(RwError::from(ErrorCode::InternalError(
-            "LogicalApply should be unnested".to_string(),
+            "LogicalApply should be unnested".to_owned(),
         )))
     }
 }
@@ -363,7 +377,7 @@ impl ToBatch for LogicalApply {
 impl ToStream for LogicalApply {
     fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<PlanRef> {
         Err(RwError::from(ErrorCode::InternalError(
-            "LogicalApply should be unnested".to_string(),
+            "LogicalApply should be unnested".to_owned(),
         )))
     }
 
@@ -372,7 +386,7 @@ impl ToStream for LogicalApply {
         _ctx: &mut RewriteStreamContext,
     ) -> Result<(PlanRef, ColIndexMapping)> {
         Err(RwError::from(ErrorCode::InternalError(
-            "LogicalApply should be unnested".to_string(),
+            "LogicalApply should be unnested".to_owned(),
         )))
     }
 }

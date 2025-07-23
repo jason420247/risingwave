@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,6 +51,11 @@ impl KeyRange {
     #[inline]
     fn end_bound_inf(&self) -> bool {
         self.right.is_empty()
+    }
+
+    #[inline]
+    pub fn inf_key_range(&self) -> bool {
+        self.start_bound_inf() && self.end_bound_inf()
     }
 }
 

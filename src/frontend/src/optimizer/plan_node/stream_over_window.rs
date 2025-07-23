@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,18 +14,17 @@
 
 use std::collections::HashSet;
 
-use fixedbitset::FixedBitSet;
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
 use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::generic::{GenericPlanNode, PlanWindowFunction};
 use super::stream::prelude::*;
-use super::utils::{impl_distill_by_unit, TableCatalogBuilder};
-use super::{generic, ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
-use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::plan_node::generic::GenericPlanRef;
-use crate::stream_fragmenter::BuildFragmentGraphState;
+use super::utils::{TableCatalogBuilder, impl_distill_by_unit};
+use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode, generic};
 use crate::TableCatalog;
+use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::property::{MonotonicityMap, WatermarkColumns};
+use crate::stream_fragmenter::BuildFragmentGraphState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamOverWindow {
@@ -38,7 +37,7 @@ impl StreamOverWindow {
         assert!(core.funcs_have_same_partition_and_order());
 
         let input = &core.input;
-        let watermark_columns = FixedBitSet::with_capacity(core.output_len());
+        let watermark_columns = WatermarkColumns::new();
 
         let base = PlanBase::new_stream_with_core(
             &core,
@@ -46,13 +45,13 @@ impl StreamOverWindow {
             false, // general over window cannot be append-only
             false,
             watermark_columns,
+            MonotonicityMap::new(), // TODO: derive monotonicity
         );
         StreamOverWindow { base, core }
     }
 
     fn infer_state_table(&self) -> TableCatalog {
-        let mut tbl_builder =
-            TableCatalogBuilder::new(self.ctx().with_options().internal_table_subset());
+        let mut tbl_builder = TableCatalogBuilder::default();
 
         let out_schema = self.core.schema();
         for field in out_schema.fields() {
@@ -130,13 +129,13 @@ impl StreamNode for StreamOverWindow {
             .config()
             .streaming_over_window_cache_policy();
 
-        PbNodeBody::OverWindow(OverWindowNode {
+        PbNodeBody::OverWindow(Box::new(OverWindowNode {
             calls,
             partition_by,
             order_by,
             state_table: Some(state_table),
             cache_policy: cache_policy.to_protobuf() as _,
-        })
+        }))
     }
 }
 

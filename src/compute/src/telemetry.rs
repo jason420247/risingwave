@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use prost::Message;
+use risingwave_common::telemetry::pb_compatible::TelemetryToProtobuf;
 use risingwave_common::telemetry::report::TelemetryReportCreator;
 use risingwave_common::telemetry::{
-    current_timestamp, SystemData, TelemetryNodeType, TelemetryReport, TelemetryReportBase,
-    TelemetryResult,
+    SystemData, TelemetryNodeType, TelemetryReportBase, TelemetryResult, current_timestamp,
 };
 use serde::{Deserialize, Serialize};
+
+const TELEMETRY_COMPUTE_REPORT_TYPE: &str = "compute";
 
 #[derive(Clone, Copy)]
 pub(crate) struct ComputeTelemetryCreator {}
@@ -30,6 +33,7 @@ impl ComputeTelemetryCreator {
 
 #[async_trait::async_trait]
 impl TelemetryReportCreator for ComputeTelemetryCreator {
+    #[allow(refining_impl_trait)]
     async fn create_report(
         &self,
         tracking_id: String,
@@ -44,7 +48,7 @@ impl TelemetryReportCreator for ComputeTelemetryCreator {
     }
 
     fn report_type(&self) -> &str {
-        "compute"
+        TELEMETRY_COMPUTE_REPORT_TYPE
     }
 }
 
@@ -54,7 +58,14 @@ pub(crate) struct ComputeTelemetryReport {
     base: TelemetryReportBase,
 }
 
-impl TelemetryReport for ComputeTelemetryReport {}
+impl TelemetryToProtobuf for ComputeTelemetryReport {
+    fn to_pb_bytes(self) -> Vec<u8> {
+        let pb_report = risingwave_pb::telemetry::ComputeReport {
+            base: Some(self.base.into()),
+        };
+        pb_report.encode_to_vec()
+    }
+}
 
 impl ComputeTelemetryReport {
     pub(crate) fn new(tracking_id: String, session_id: String, up_time: u64) -> Self {
@@ -66,6 +77,7 @@ impl ComputeTelemetryReport {
                 system_data: SystemData::new(),
                 time_stamp: current_timestamp(),
                 node_type: TelemetryNodeType::Compute,
+                is_test: false,
             },
         }
     }

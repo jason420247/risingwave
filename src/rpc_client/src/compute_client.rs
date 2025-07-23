@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,36 +17,46 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use risingwave_common::config::{MAX_CONNECTION_WINDOW_SIZE, STREAM_WINDOW_SIZE};
-use risingwave_common::monitor::connection::{EndpointExt, TcpConfig};
+use risingwave_common::catalog::DatabaseId;
+use risingwave_common::config::{MAX_CONNECTION_WINDOW_SIZE, RpcClientConfig, STREAM_WINDOW_SIZE};
+use risingwave_common::monitor::{EndpointExt, TcpConfig};
 use risingwave_common::util::addr::HostAddr;
 use risingwave_common::util::tracing::TracingContext;
 use risingwave_pb::batch_plan::{PlanFragment, TaskId, TaskOutputId};
 use risingwave_pb::common::BatchQueryEpoch;
 use risingwave_pb::compute::config_service_client::ConfigServiceClient;
-use risingwave_pb::compute::{ShowConfigRequest, ShowConfigResponse};
+use risingwave_pb::compute::{
+    ResizeCacheRequest, ResizeCacheResponse, ShowConfigRequest, ShowConfigResponse,
+};
 use risingwave_pb::monitor_service::monitor_service_client::MonitorServiceClient;
 use risingwave_pb::monitor_service::{
-    AnalyzeHeapRequest, AnalyzeHeapResponse, HeapProfilingRequest, HeapProfilingResponse,
-    ListHeapProfilingRequest, ListHeapProfilingResponse, ProfilingRequest, ProfilingResponse,
-    StackTraceRequest, StackTraceResponse,
+    AnalyzeHeapRequest, AnalyzeHeapResponse, GetStreamingStatsRequest, GetStreamingStatsResponse,
+    HeapProfilingRequest, HeapProfilingResponse, ListHeapProfilingRequest,
+    ListHeapProfilingResponse, ProfilingRequest, ProfilingResponse, StackTraceRequest,
+    StackTraceResponse,
 };
 use risingwave_pb::plan_common::ExprContext;
 use risingwave_pb::task_service::exchange_service_client::ExchangeServiceClient;
 use risingwave_pb::task_service::task_service_client::TaskServiceClient;
 use risingwave_pb::task_service::{
-    permits, CancelTaskRequest, CancelTaskResponse, CreateTaskRequest, ExecuteRequest,
-    GetDataRequest, GetDataResponse, GetStreamRequest, GetStreamResponse, PbPermits,
-    TaskInfoResponse,
+    CancelTaskRequest, CancelTaskResponse, CreateTaskRequest, ExecuteRequest, FastInsertRequest,
+    FastInsertResponse, GetDataRequest, GetDataResponse, GetStreamRequest, GetStreamResponse,
+    PbPermits, TaskInfoResponse, permits,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::{Channel, Endpoint};
 use tonic::Streaming;
+use tonic::transport::{Channel, Endpoint};
 
-use crate::error::Result;
+use crate::error::{Result, RpcError};
 use crate::{RpcClient, RpcClientPool};
 
+// TODO: this client has too many roles, e.g.
+// - batch MPP task query execution
+// - batch exchange
+// - streaming exchange
+// - general services specific to compute node, like monitoring, profiling, debugging, etc.
+// We should consider splitting them into different clients.
 #[derive(Clone)]
 pub struct ComputeClient {
     pub exchange_client: ExchangeServiceClient<Channel>,
@@ -57,16 +67,16 @@ pub struct ComputeClient {
 }
 
 impl ComputeClient {
-    pub async fn new(addr: HostAddr) -> Result<Self> {
+    pub async fn new(addr: HostAddr, opts: &RpcClientConfig) -> Result<Self> {
         let channel = Endpoint::from_shared(format!("http://{}", &addr))?
             .initial_connection_window_size(MAX_CONNECTION_WINDOW_SIZE)
             .initial_stream_window_size(STREAM_WINDOW_SIZE)
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(opts.connect_timeout_secs))
             .monitored_connect(
                 "grpc-compute-client",
                 TcpConfig {
                     tcp_nodelay: true,
-                    keepalive_duration: None,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -97,7 +107,8 @@ impl ComputeClient {
             .get_data(GetDataRequest {
                 task_output_id: Some(output_id),
             })
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
@@ -107,6 +118,8 @@ impl ComputeClient {
         down_actor_id: u32,
         up_fragment_id: u32,
         down_fragment_id: u32,
+        database_id: DatabaseId,
+        term_id: String,
     ) -> Result<(
         Streaming<GetStreamResponse>,
         mpsc::UnboundedSender<permits::Value>,
@@ -124,6 +137,8 @@ impl ComputeClient {
                     down_actor_id,
                     up_fragment_id,
                     down_fragment_id,
+                    database_id: database_id.database_id,
+                    term_id,
                 })),
             },
         ))
@@ -148,7 +163,8 @@ impl ComputeClient {
                     up_actor_id,
                     down_actor_id
                 )
-            })?
+            })
+            .map_err(RpcError::from_compute_status)?
             .into_inner();
 
         Ok((response_stream, permits_tx))
@@ -171,12 +187,19 @@ impl ComputeClient {
                 tracing_context: TracingContext::from_current_span().to_protobuf(),
                 expr_context: Some(expr_context),
             })
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
     pub async fn execute(&self, req: ExecuteRequest) -> Result<Streaming<GetDataResponse>> {
-        Ok(self.task_client.to_owned().execute(req).await?.into_inner())
+        Ok(self
+            .task_client
+            .to_owned()
+            .execute(req)
+            .await
+            .map_err(RpcError::from_compute_status)?
+            .into_inner())
     }
 
     pub async fn cancel(&self, req: CancelTaskRequest) -> Result<CancelTaskResponse> {
@@ -184,16 +207,38 @@ impl ComputeClient {
             .task_client
             .to_owned()
             .cancel_task(req)
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
-    pub async fn stack_trace(&self) -> Result<StackTraceResponse> {
+    pub async fn fast_insert(&self, req: FastInsertRequest) -> Result<FastInsertResponse> {
+        Ok(self
+            .task_client
+            .to_owned()
+            .fast_insert(req)
+            .await
+            .map_err(RpcError::from_compute_status)?
+            .into_inner())
+    }
+
+    pub async fn stack_trace(&self, req: StackTraceRequest) -> Result<StackTraceResponse> {
         Ok(self
             .monitor_client
             .to_owned()
-            .stack_trace(StackTraceRequest::default())
-            .await?
+            .stack_trace(req)
+            .await
+            .map_err(RpcError::from_compute_status)?
+            .into_inner())
+    }
+
+    pub async fn get_streaming_stats(&self) -> Result<GetStreamingStatsResponse> {
+        Ok(self
+            .monitor_client
+            .to_owned()
+            .get_streaming_stats(GetStreamingStatsRequest::default())
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
@@ -202,7 +247,8 @@ impl ComputeClient {
             .monitor_client
             .to_owned()
             .profiling(ProfilingRequest { sleep_s })
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
@@ -211,7 +257,8 @@ impl ComputeClient {
             .monitor_client
             .to_owned()
             .heap_profiling(HeapProfilingRequest { dir })
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
@@ -220,7 +267,8 @@ impl ComputeClient {
             .monitor_client
             .to_owned()
             .list_heap_profiling(ListHeapProfilingRequest {})
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
@@ -229,7 +277,8 @@ impl ComputeClient {
             .monitor_client
             .to_owned()
             .analyze_heap(AnalyzeHeapRequest { path })
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 
@@ -238,17 +287,28 @@ impl ComputeClient {
             .config_client
             .to_owned()
             .show_config(ShowConfigRequest {})
-            .await?
+            .await
+            .map_err(RpcError::from_compute_status)?
+            .into_inner())
+    }
+
+    pub async fn resize_cache(&self, request: ResizeCacheRequest) -> Result<ResizeCacheResponse> {
+        Ok(self
+            .config_client
+            .to_owned()
+            .resize_cache(request)
+            .await
+            .map_err(RpcError::from_compute_status)?
             .into_inner())
     }
 }
 
 #[async_trait]
 impl RpcClient for ComputeClient {
-    async fn new_client(host_addr: HostAddr) -> Result<Self> {
-        Self::new(host_addr).await
+    async fn new_client(host_addr: HostAddr, opts: &RpcClientConfig) -> Result<Self> {
+        Self::new(host_addr, opts).await
     }
 }
 
 pub type ComputeClientPool = RpcClientPool<ComputeClient>;
-pub type ComputeClientPoolRef = Arc<ComputeClientPool>;
+pub type ComputeClientPoolRef = Arc<ComputeClientPool>; // TODO: no need for `Arc` since clone is cheap and shared

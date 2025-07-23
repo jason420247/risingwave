@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,7 @@ use utils::*;
 mod top_n_cache;
 mod top_n_state;
 use top_n_cache::{TopNCache, TopNCacheTrait};
-mod topn_cache_state;
 use top_n_state::ManagedTopNState;
-use topn_cache_state::CacheKey;
 
 // `TopN` variants
 mod group_top_n;

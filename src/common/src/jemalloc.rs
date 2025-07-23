@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,5 @@ macro_rules! enable_jemalloc {
         #[cfg(unix)]
         #[global_allocator]
         static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-    };
-}
-
-#[macro_export]
-macro_rules! enable_task_local_jemalloc {
-    () => {
-        #[global_allocator]
-        static GLOBAL: task_stats_alloc::TaskLocalAlloc<tikv_jemallocator::Jemalloc> =
-            task_stats_alloc::TaskLocalAlloc(tikv_jemallocator::Jemalloc);
     };
 }

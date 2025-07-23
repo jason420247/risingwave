@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,21 +27,23 @@
 //! - all field should be valued in construction, so the properties' derivation should be finished
 //!   in the `new()` function.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use downcast_rs::{impl_downcast, Downcast};
-use dyn_clone::{self, DynClone};
-use fixedbitset::FixedBitSet;
+use downcast_rs::{Downcast, impl_downcast};
+use dyn_clone::DynClone;
 use itertools::Itertools;
 use paste::paste;
+use petgraph::dot::{Config, Dot};
+use petgraph::graph::Graph;
 use pretty_xmlish::{Pretty, PrettyConfig};
 use risingwave_common::catalog::Schema;
-use risingwave_common::error::{ErrorCode, Result};
-use risingwave_pb::batch_plan::PlanNode as BatchPlanPb;
-use risingwave_pb::stream_plan::StreamNode as StreamPlanPb;
+use risingwave_common::util::recursive::{self, Recurse};
+use risingwave_pb::batch_plan::PlanNode as PbBatchPlan;
+use risingwave_pb::stream_plan::StreamNode as PbStreamPlan;
 use serde::Serialize;
 use smallvec::SmallVec;
 
@@ -49,7 +51,13 @@ use self::batch::BatchPlanRef;
 use self::generic::{GenericPlanRef, PhysicalPlanRef};
 use self::stream::StreamPlanRef;
 use self::utils::Distill;
-use super::property::{Distribution, FunctionalDependencySet, Order};
+use super::property::{
+    Distribution, FunctionalDependencySet, MonotonicityMap, Order, WatermarkColumns,
+};
+use crate::error::{ErrorCode, Result};
+use crate::optimizer::ExpressionSimplifyRewriter;
+use crate::session::current::notice_to_user;
+use crate::utils::{PrettySerde, build_graph_from_pretty};
 
 /// A marker trait for different conventions, used for enforcing type safety.
 ///
@@ -437,7 +445,7 @@ impl PlanRef {
                     .map(|mut c| Condition {
                         conjunctions: c
                             .conjunctions
-                            .extract_if(|e| {
+                            .extract_if(.., |e| {
                                 // If predicates contain now, impure or correlated input ref, don't push through share operator.
                                 // The predicate with now() function is regarded as a temporal filter predicate, which will be transformed to a temporal filter operator and can not do the OR operation with other predicates.
                                 let mut finder = ExprCorrelatedIdFinder::default();
@@ -450,8 +458,27 @@ impl PlanRef {
                     })
                     .reduce(|a, b| a.or(b))
                     .unwrap();
+
+                // rewrite the *entire* predicate for `LogicalShare`
+                // before pushing down to whatever plan node(s)
+                // ps: the reason here contains a "special" optimization
+                // rather than directly apply explicit rule in stream or
+                // batch plan optimization, is because predicate push down
+                // will *instantly* push down all predicates, and rule(s)
+                // can not be applied in the middle.
+                // thus we need some on-the-fly (in the middle) rewrite
+                // technique to help with this kind of optimization.
+                let mut expr_rewriter = ExpressionSimplifyRewriter {};
+                let mut new_predicate = Condition::true_cond();
+
+                for c in merge_predicate.conjunctions {
+                    let c = Condition::with_expr(expr_rewriter.rewrite_cond(c));
+                    // rebuild the conjunctions
+                    new_predicate = new_predicate.and(c);
+                }
+
                 let input: PlanRef = logical_share.input();
-                let input = input.predicate_pushdown(merge_predicate, ctx);
+                let input = input.predicate_pushdown(new_predicate, ctx);
                 logical_share.replace_input(input);
             }
             LogicalFilter::create(self.clone(), predicate)
@@ -495,6 +522,7 @@ impl PredicatePushdown for PlanRef {
             &LogicalFilter::new(self.clone(), predicate_clone).into(),
             &res,
         );
+
         res
     }
 }
@@ -583,8 +611,12 @@ impl StreamPlanRef for PlanRef {
         self.plan_base().emit_on_window_close()
     }
 
-    fn watermark_columns(&self) -> &FixedBitSet {
+    fn watermark_columns(&self) -> &WatermarkColumns {
         self.plan_base().watermark_columns()
+    }
+
+    fn columns_monotonicity(&self) -> &MonotonicityMap {
+        self.plan_base().columns_monotonicity()
     }
 }
 
@@ -600,13 +632,10 @@ impl BatchPlanRef for PlanRef {
 /// other places. We will reset expression display id to 0 and clone the whole plan to reset the
 /// schema.
 pub fn reorganize_elements_id(plan: PlanRef) -> PlanRef {
-    let old_expr_display_id = plan.ctx().get_expr_display_id();
-    let old_plan_node_id = plan.ctx().get_plan_node_id();
-    plan.ctx().set_expr_display_id(0);
-    plan.ctx().set_plan_node_id(0);
+    let backup = plan.ctx().backup_elem_ids();
+    plan.ctx().reset_elem_ids();
     let plan = PlanCloner::clone_whole_plan(plan);
-    plan.ctx().set_expr_display_id(old_expr_display_id);
-    plan.ctx().set_plan_node_id(old_plan_node_id);
+    plan.ctx().restore_elem_ids(backup);
     plan
 }
 
@@ -614,8 +643,23 @@ pub trait Explain {
     /// Write explain the whole plan tree.
     fn explain<'a>(&self) -> Pretty<'a>;
 
+    /// Write explain the whole plan tree with node id.
+    fn explain_with_id<'a>(&self) -> Pretty<'a>;
+
     /// Explain the plan node and return a string.
     fn explain_to_string(&self) -> String;
+
+    /// Explain the plan node and return a json string.
+    fn explain_to_json(&self) -> String;
+
+    /// Explain the plan node and return a xml string.
+    fn explain_to_xml(&self) -> String;
+
+    /// Explain the plan node and return a yaml string.
+    fn explain_to_yaml(&self) -> String;
+
+    /// Explain the plan node and return a dot format string.
+    fn explain_to_dot(&self) -> String;
 }
 
 impl Explain for PlanRef {
@@ -629,6 +673,21 @@ impl Explain for PlanRef {
         Pretty::Record(node)
     }
 
+    /// Write explain the whole plan tree with node id.
+    fn explain_with_id<'a>(&self) -> Pretty<'a> {
+        let node_id = self.id();
+        let mut node = self.distill();
+        // NOTE(kwannoel): Can lead to poor performance if plan is very large,
+        // but we want to show the id first.
+        node.fields
+            .insert(0, ("id".into(), Pretty::display(&node_id.0)));
+        let inputs = self.inputs();
+        for input in inputs.iter().peekable() {
+            node.children.push(input.explain_with_id());
+        }
+        Pretty::Record(node)
+    }
+
     /// Explain the plan node and return a string.
     fn explain_to_string(&self) -> String {
         let plan = reorganize_elements_id(self.clone());
@@ -637,6 +696,41 @@ impl Explain for PlanRef {
         let mut config = pretty_config();
         config.unicode(&mut output, &plan.explain());
         output
+    }
+
+    /// Explain the plan node and return a json string.
+    fn explain_to_json(&self) -> String {
+        let plan = reorganize_elements_id(self.clone());
+        let explain_ir = plan.explain();
+        serde_json::to_string_pretty(&PrettySerde(explain_ir, true))
+            .expect("failed to serialize plan to json")
+    }
+
+    /// Explain the plan node and return a xml string.
+    fn explain_to_xml(&self) -> String {
+        let plan = reorganize_elements_id(self.clone());
+        let explain_ir = plan.explain();
+        quick_xml::se::to_string(&PrettySerde(explain_ir, true))
+            .expect("failed to serialize plan to xml")
+    }
+
+    /// Explain the plan node and return a yaml string.
+    fn explain_to_yaml(&self) -> String {
+        let plan = reorganize_elements_id(self.clone());
+        let explain_ir = plan.explain();
+        serde_yaml::to_string(&PrettySerde(explain_ir, true))
+            .expect("failed to serialize plan to yaml")
+    }
+
+    /// Explain the plan node and return a dot format string.
+    fn explain_to_dot(&self) -> String {
+        let plan = reorganize_elements_id(self.clone());
+        let explain_ir = plan.explain_with_id();
+        let mut graph = Graph::<String, String>::new();
+        let mut nodes = HashMap::new();
+        build_graph_from_pretty(&explain_ir, &mut graph, &mut nodes, None);
+        let dot = Dot::with_config(&graph, &[Config::EdgeNoLabel]);
+        dot.to_string()
     }
 }
 
@@ -673,70 +767,94 @@ impl dyn PlanNode {
     }
 }
 
+/// Recursion depth threshold for plan node visitor to send notice to user.
+pub const PLAN_DEPTH_THRESHOLD: usize = 30;
+/// Notice message for plan node visitor to send to user when the depth threshold is reached.
+pub const PLAN_TOO_DEEP_NOTICE: &str = "The plan is too deep. \
+Consider simplifying or splitting the query if you encounter any issues.";
+
 impl dyn PlanNode {
     /// Serialize the plan node and its children to a stream plan proto.
     ///
-    /// Note that [`StreamTableScan`] has its own implementation of `to_stream_prost`. We have a
-    /// hook inside to do some ad-hoc thing for [`StreamTableScan`].
-    pub fn to_stream_prost(&self, state: &mut BuildFragmentGraphState) -> StreamPlanPb {
-        use stream::prelude::*;
+    /// Note that some operators has their own implementation of `to_stream_prost`. We have a
+    /// hook inside to do some ad-hoc things.
+    pub fn to_stream_prost(
+        &self,
+        state: &mut BuildFragmentGraphState,
+    ) -> SchedulerResult<PbStreamPlan> {
+        recursive::tracker!().recurse(|t| {
+            if t.depth_reaches(PLAN_DEPTH_THRESHOLD) {
+                notice_to_user(PLAN_TOO_DEEP_NOTICE);
+            }
 
-        if let Some(stream_table_scan) = self.as_stream_table_scan() {
-            return stream_table_scan.adhoc_to_stream_prost(state);
-        }
-        if let Some(stream_cdc_table_scan) = self.as_stream_cdc_table_scan() {
-            return stream_cdc_table_scan.adhoc_to_stream_prost(state);
-        }
-        if let Some(stream_share) = self.as_stream_share() {
-            return stream_share.adhoc_to_stream_prost(state);
-        }
+            use stream::prelude::*;
 
-        let node = Some(self.to_stream_prost_body(state));
-        let input = self
-            .inputs()
-            .into_iter()
-            .map(|plan| plan.to_stream_prost(state))
-            .collect();
-        // TODO: support pk_indices and operator_id
-        StreamPlanPb {
-            input,
-            identity: self.explain_myself_to_string(),
-            node_body: node,
-            operator_id: self.id().0 as _,
-            stream_key: self
-                .stream_key()
-                .unwrap_or_default()
-                .iter()
-                .map(|x| *x as u32)
-                .collect(),
-            fields: self.schema().to_prost(),
-            append_only: self.plan_base().append_only(),
-        }
+            if let Some(stream_table_scan) = self.as_stream_table_scan() {
+                return stream_table_scan.adhoc_to_stream_prost(state);
+            }
+            if let Some(stream_cdc_table_scan) = self.as_stream_cdc_table_scan() {
+                return stream_cdc_table_scan.adhoc_to_stream_prost(state);
+            }
+            if let Some(stream_source_scan) = self.as_stream_source_scan() {
+                return stream_source_scan.adhoc_to_stream_prost(state);
+            }
+            if let Some(stream_share) = self.as_stream_share() {
+                return stream_share.adhoc_to_stream_prost(state);
+            }
+
+            let node = Some(self.try_to_stream_prost_body(state)?);
+            let input = self
+                .inputs()
+                .into_iter()
+                .map(|plan| plan.to_stream_prost(state))
+                .try_collect()?;
+            // TODO: support pk_indices and operator_id
+            Ok(PbStreamPlan {
+                input,
+                identity: self.explain_myself_to_string(),
+                node_body: node,
+                operator_id: self.id().0 as _,
+                stream_key: self
+                    .stream_key()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|x| *x as u32)
+                    .collect(),
+                fields: self.schema().to_prost(),
+                append_only: self.plan_base().append_only(),
+            })
+        })
     }
 
     /// Serialize the plan node and its children to a batch plan proto.
-    pub fn to_batch_prost(&self) -> BatchPlanPb {
+    pub fn to_batch_prost(&self) -> SchedulerResult<PbBatchPlan> {
         self.to_batch_prost_identity(true)
     }
 
     /// Serialize the plan node and its children to a batch plan proto without the identity field
     /// (for testing).
-    pub fn to_batch_prost_identity(&self, identity: bool) -> BatchPlanPb {
-        let node_body = Some(self.to_batch_prost_body());
-        let children = self
-            .inputs()
-            .into_iter()
-            .map(|plan| plan.to_batch_prost_identity(identity))
-            .collect();
-        BatchPlanPb {
-            children,
-            identity: if identity {
-                self.explain_myself_to_string()
-            } else {
-                "".into()
-            },
-            node_body,
-        }
+    pub fn to_batch_prost_identity(&self, identity: bool) -> SchedulerResult<PbBatchPlan> {
+        recursive::tracker!().recurse(|t| {
+            if t.depth_reaches(PLAN_DEPTH_THRESHOLD) {
+                notice_to_user(PLAN_TOO_DEEP_NOTICE);
+            }
+
+            let node_body = Some(self.try_to_batch_prost_body()?);
+            let children = self
+                .inputs()
+                .into_iter()
+                .map(|plan| plan.to_batch_prost_identity(identity))
+                .try_collect()?;
+            Ok(PbBatchPlan {
+                children,
+                identity: if identity {
+                    self.explain_myself_to_string()
+                } else {
+                    "".into()
+                },
+                node_body,
+            })
+        })
     }
 
     pub fn explain_myself_to_string(&self) -> String {
@@ -782,6 +900,7 @@ mod batch_hash_join;
 mod batch_hop_window;
 mod batch_insert;
 mod batch_limit;
+mod batch_log_seq_scan;
 mod batch_lookup_join;
 mod batch_max_one_row;
 mod batch_nested_loop_join;
@@ -802,6 +921,8 @@ mod batch_values;
 mod logical_agg;
 mod logical_apply;
 mod logical_cdc_scan;
+mod logical_changelog;
+mod logical_cte_ref;
 mod logical_dedup;
 mod logical_delete;
 mod logical_except;
@@ -811,6 +932,7 @@ mod logical_hop_window;
 mod logical_insert;
 mod logical_intersect;
 mod logical_join;
+mod logical_kafka_scan;
 mod logical_limit;
 mod logical_max_one_row;
 mod logical_multi_join;
@@ -818,6 +940,7 @@ mod logical_now;
 mod logical_over_window;
 mod logical_project;
 mod logical_project_set;
+mod logical_recursive_union;
 mod logical_scan;
 mod logical_share;
 mod logical_source;
@@ -827,6 +950,8 @@ mod logical_topn;
 mod logical_union;
 mod logical_update;
 mod logical_values;
+mod stream_asof_join;
+mod stream_changelog;
 mod stream_dedup;
 mod stream_delta_join;
 mod stream_dml;
@@ -836,27 +961,45 @@ mod stream_exchange;
 mod stream_expand;
 mod stream_filter;
 mod stream_fs_fetch;
+mod stream_global_approx_percentile;
 mod stream_group_topn;
 mod stream_hash_agg;
 mod stream_hash_join;
 mod stream_hop_window;
+mod stream_join_common;
+mod stream_local_approx_percentile;
 mod stream_materialize;
+mod stream_materialized_exprs;
 mod stream_now;
 mod stream_over_window;
 mod stream_project;
 mod stream_project_set;
 mod stream_row_id_gen;
+mod stream_row_merge;
 mod stream_simple_agg;
 mod stream_sink;
 mod stream_sort;
 mod stream_source;
+mod stream_source_scan;
 mod stream_stateless_simple_agg;
+mod stream_sync_log_store;
 mod stream_table_scan;
 mod stream_topn;
 mod stream_values;
 mod stream_watermark_filter;
 
+mod batch_file_scan;
+mod batch_iceberg_scan;
+mod batch_kafka_scan;
+mod batch_postgres_query;
+
+mod batch_mysql_query;
 mod derive;
+mod logical_file_scan;
+mod logical_iceberg_scan;
+mod logical_postgres_query;
+
+mod logical_mysql_query;
 mod stream_cdc_table_scan;
 mod stream_share;
 mod stream_temporal_join;
@@ -866,17 +1009,23 @@ pub mod utils;
 pub use batch_delete::BatchDelete;
 pub use batch_exchange::BatchExchange;
 pub use batch_expand::BatchExpand;
+pub use batch_file_scan::BatchFileScan;
 pub use batch_filter::BatchFilter;
 pub use batch_group_topn::BatchGroupTopN;
 pub use batch_hash_agg::BatchHashAgg;
 pub use batch_hash_join::BatchHashJoin;
 pub use batch_hop_window::BatchHopWindow;
+pub use batch_iceberg_scan::BatchIcebergScan;
 pub use batch_insert::BatchInsert;
+pub use batch_kafka_scan::BatchKafkaScan;
 pub use batch_limit::BatchLimit;
+pub use batch_log_seq_scan::BatchLogSeqScan;
 pub use batch_lookup_join::BatchLookupJoin;
 pub use batch_max_one_row::BatchMaxOneRow;
+pub use batch_mysql_query::BatchMySqlQuery;
 pub use batch_nested_loop_join::BatchNestedLoopJoin;
 pub use batch_over_window::BatchOverWindow;
+pub use batch_postgres_query::BatchPostgresQuery;
 pub use batch_project::BatchProject;
 pub use batch_project_set::BatchProjectSet;
 pub use batch_seq_scan::BatchSeqScan;
@@ -893,22 +1042,30 @@ pub use batch_values::BatchValues;
 pub use logical_agg::LogicalAgg;
 pub use logical_apply::LogicalApply;
 pub use logical_cdc_scan::LogicalCdcScan;
+pub use logical_changelog::LogicalChangeLog;
+pub use logical_cte_ref::LogicalCteRef;
 pub use logical_dedup::LogicalDedup;
 pub use logical_delete::LogicalDelete;
 pub use logical_except::LogicalExcept;
 pub use logical_expand::LogicalExpand;
+pub use logical_file_scan::LogicalFileScan;
 pub use logical_filter::LogicalFilter;
 pub use logical_hop_window::LogicalHopWindow;
+pub use logical_iceberg_scan::LogicalIcebergScan;
 pub use logical_insert::LogicalInsert;
 pub use logical_intersect::LogicalIntersect;
 pub use logical_join::LogicalJoin;
+pub use logical_kafka_scan::LogicalKafkaScan;
 pub use logical_limit::LogicalLimit;
 pub use logical_max_one_row::LogicalMaxOneRow;
 pub use logical_multi_join::{LogicalMultiJoin, LogicalMultiJoinBuilder};
+pub use logical_mysql_query::LogicalMySqlQuery;
 pub use logical_now::LogicalNow;
 pub use logical_over_window::LogicalOverWindow;
+pub use logical_postgres_query::LogicalPostgresQuery;
 pub use logical_project::LogicalProject;
 pub use logical_project_set::LogicalProjectSet;
+pub use logical_recursive_union::LogicalRecursiveUnion;
 pub use logical_scan::LogicalScan;
 pub use logical_share::LogicalShare;
 pub use logical_source::LogicalSource;
@@ -918,7 +1075,9 @@ pub use logical_topn::LogicalTopN;
 pub use logical_union::LogicalUnion;
 pub use logical_update::LogicalUpdate;
 pub use logical_values::LogicalValues;
+pub use stream_asof_join::StreamAsOfJoin;
 pub use stream_cdc_table_scan::StreamCdcTableScan;
+pub use stream_changelog::StreamChangeLog;
 pub use stream_dedup::StreamDedup;
 pub use stream_delta_join::StreamDeltaJoin;
 pub use stream_dml::StreamDml;
@@ -928,22 +1087,29 @@ pub use stream_exchange::StreamExchange;
 pub use stream_expand::StreamExpand;
 pub use stream_filter::StreamFilter;
 pub use stream_fs_fetch::StreamFsFetch;
+pub use stream_global_approx_percentile::StreamGlobalApproxPercentile;
 pub use stream_group_topn::StreamGroupTopN;
 pub use stream_hash_agg::StreamHashAgg;
 pub use stream_hash_join::StreamHashJoin;
 pub use stream_hop_window::StreamHopWindow;
+use stream_join_common::StreamJoinCommon;
+pub use stream_local_approx_percentile::StreamLocalApproxPercentile;
 pub use stream_materialize::StreamMaterialize;
+pub use stream_materialized_exprs::StreamMaterializedExprs;
 pub use stream_now::StreamNow;
 pub use stream_over_window::StreamOverWindow;
 pub use stream_project::StreamProject;
 pub use stream_project_set::StreamProjectSet;
 pub use stream_row_id_gen::StreamRowIdGen;
+pub use stream_row_merge::StreamRowMerge;
 pub use stream_share::StreamShare;
 pub use stream_simple_agg::StreamSimpleAgg;
-pub use stream_sink::StreamSink;
+pub use stream_sink::{IcebergPartitionInfo, PartitionComputeInfo, StreamSink};
 pub use stream_sort::StreamEowcSort;
 pub use stream_source::StreamSource;
+pub use stream_source_scan::StreamSourceScan;
 pub use stream_stateless_simple_agg::StreamStatelessSimpleAgg;
+pub use stream_sync_log_store::StreamSyncLogStore;
 pub use stream_table_scan::StreamTableScan;
 pub use stream_temporal_join::StreamTemporalJoin;
 pub use stream_topn::StreamTopN;
@@ -956,6 +1122,7 @@ use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_rewriter::PlanCloner;
 use crate::optimizer::plan_visitor::ExprCorrelatedIdFinder;
+use crate::scheduler::SchedulerResult;
 use crate::stream_fragmenter::BuildFragmentGraphState;
 use crate::utils::{ColIndexMapping, Condition, DynEq, DynHash, Endo, Layer, Visit};
 
@@ -973,7 +1140,7 @@ use crate::utils::{ColIndexMapping, Condition, DynEq, DynHash, Endo, Layer, Visi
 /// See the following implementations for example.
 #[macro_export]
 macro_rules! for_all_plan_nodes {
-    ($macro:ident) => {
+    ($macro:path $(,$rest:tt)*) => {
         $macro! {
               { Logical, Agg }
             , { Logical, Apply }
@@ -1003,6 +1170,14 @@ macro_rules! for_all_plan_nodes {
             , { Logical, Intersect }
             , { Logical, Except }
             , { Logical, MaxOneRow }
+            , { Logical, KafkaScan }
+            , { Logical, IcebergScan }
+            , { Logical, RecursiveUnion }
+            , { Logical, CteRef }
+            , { Logical, ChangeLog }
+            , { Logical, FileScan }
+            , { Logical, PostgresQuery }
+            , { Logical, MySqlQuery }
             , { Batch, SimpleAgg }
             , { Batch, HashAgg }
             , { Batch, SortAgg }
@@ -1013,6 +1188,7 @@ macro_rules! for_all_plan_nodes {
             , { Batch, Update }
             , { Batch, SeqScan }
             , { Batch, SysSeqScan }
+            , { Batch, LogSeqScan }
             , { Batch, HashJoin }
             , { Batch, NestedLoopJoin }
             , { Batch, Values }
@@ -1030,12 +1206,18 @@ macro_rules! for_all_plan_nodes {
             , { Batch, Source }
             , { Batch, OverWindow }
             , { Batch, MaxOneRow }
+            , { Batch, KafkaScan }
+            , { Batch, IcebergScan }
+            , { Batch, FileScan }
+            , { Batch, PostgresQuery }
+            , { Batch, MySqlQuery }
             , { Stream, Project }
             , { Stream, Filter }
             , { Stream, TableScan }
             , { Stream, CdcTableScan }
             , { Stream, Sink }
             , { Stream, Source }
+            , { Stream, SourceScan }
             , { Stream, HashJoin }
             , { Stream, Exchange }
             , { Stream, HashAgg }
@@ -1062,6 +1244,14 @@ macro_rules! for_all_plan_nodes {
             , { Stream, EowcSort }
             , { Stream, OverWindow }
             , { Stream, FsFetch }
+            , { Stream, ChangeLog }
+            , { Stream, GlobalApproxPercentile }
+            , { Stream, LocalApproxPercentile }
+            , { Stream, RowMerge }
+            , { Stream, AsOfJoin }
+            , { Stream, SyncLogStore }
+            , { Stream, MaterializedExprs }
+            $(,$rest)*
         }
     };
 }
@@ -1070,121 +1260,67 @@ macro_rules! for_all_plan_nodes {
 #[macro_export]
 macro_rules! for_logical_plan_nodes {
     ($macro:ident) => {
-        $macro! {
-              { Logical, Agg }
-            , { Logical, Apply }
-            , { Logical, Filter }
-            , { Logical, Project }
-            , { Logical, Scan }
-            , { Logical, CdcScan }
-            , { Logical, SysScan }
-            , { Logical, Source }
-            , { Logical, Insert }
-            , { Logical, Delete }
-            , { Logical, Update }
-            , { Logical, Join }
-            , { Logical, Values }
-            , { Logical, Limit }
-            , { Logical, TopN }
-            , { Logical, HopWindow }
-            , { Logical, TableFunction }
-            , { Logical, MultiJoin }
-            , { Logical, Expand }
-            , { Logical, ProjectSet }
-            , { Logical, Union }
-            , { Logical, OverWindow }
-            , { Logical, Share }
-            , { Logical, Now }
-            , { Logical, Dedup }
-            , { Logical, Intersect }
-            , { Logical, Except }
-            , { Logical, MaxOneRow }
+        $crate::for_all_plan_nodes! {
+              $crate::for_logical_plan_nodes, $macro
         }
     };
+    (
+        $( { Logical, $logical_name:ident } ),*
+        , $( { Batch, $batch_name:ident } ),*
+        , $( { Stream, $stream_name:ident } ),*
+        , $macro:ident
+    ) => {
+        $macro! {
+            $( { Logical, $logical_name } ),*
+        }
+    }
 }
 
 /// `for_batch_plan_nodes` includes all plan nodes with batch convention.
 #[macro_export]
 macro_rules! for_batch_plan_nodes {
     ($macro:ident) => {
-        $macro! {
-              { Batch, SimpleAgg }
-            , { Batch, HashAgg }
-            , { Batch, SortAgg }
-            , { Batch, Project }
-            , { Batch, Filter }
-            , { Batch, SeqScan }
-            , { Batch, SysSeqScan }
-            , { Batch, HashJoin }
-            , { Batch, NestedLoopJoin }
-            , { Batch, Values }
-            , { Batch, Limit }
-            , { Batch, Sort }
-            , { Batch, TopN }
-            , { Batch, Exchange }
-            , { Batch, Insert }
-            , { Batch, Delete }
-            , { Batch, Update }
-            , { Batch, HopWindow }
-            , { Batch, TableFunction }
-            , { Batch, Expand }
-            , { Batch, LookupJoin }
-            , { Batch, ProjectSet }
-            , { Batch, Union }
-            , { Batch, GroupTopN }
-            , { Batch, Source }
-            , { Batch, OverWindow }
-            , { Batch, MaxOneRow }
+        $crate::for_all_plan_nodes! {
+              $crate::for_batch_plan_nodes, $macro
         }
     };
+    (
+        $( { Logical, $logical_name:ident } ),*
+        , $( { Batch, $batch_name:ident } ),*
+        , $( { Stream, $stream_name:ident } ),*
+        , $macro:ident
+    ) => {
+        $macro! {
+            $( { Batch, $batch_name } ),*
+        }
+    }
 }
 
 /// `for_stream_plan_nodes` includes all plan nodes with stream convention.
 #[macro_export]
 macro_rules! for_stream_plan_nodes {
     ($macro:ident) => {
-        $macro! {
-              { Stream, Project }
-            , { Stream, Filter }
-            , { Stream, HashJoin }
-            , { Stream, Exchange }
-            , { Stream, TableScan }
-            , { Stream, CdcTableScan }
-            , { Stream, Sink }
-            , { Stream, Source }
-            , { Stream, HashAgg }
-            , { Stream, SimpleAgg }
-            , { Stream, StatelessSimpleAgg }
-            , { Stream, Materialize }
-            , { Stream, TopN }
-            , { Stream, HopWindow }
-            , { Stream, DeltaJoin }
-            , { Stream, Expand }
-            , { Stream, DynamicFilter }
-            , { Stream, ProjectSet }
-            , { Stream, GroupTopN }
-            , { Stream, Union }
-            , { Stream, RowIdGen }
-            , { Stream, Dml }
-            , { Stream, Now }
-            , { Stream, Share }
-            , { Stream, WatermarkFilter }
-            , { Stream, TemporalJoin }
-            , { Stream, Values }
-            , { Stream, Dedup }
-            , { Stream, EowcOverWindow }
-            , { Stream, EowcSort }
-            , { Stream, OverWindow }
-            , { Stream, FsFetch }
+        $crate::for_all_plan_nodes! {
+              $crate::for_stream_plan_nodes, $macro
         }
     };
+    (
+        $( { Logical, $logical_name:ident } ),*
+        , $( { Batch, $batch_name:ident } ),*
+        , $( { Stream, $stream_name:ident } ),*
+        , $macro:ident
+    ) => {
+        $macro! {
+            $( { Stream, $stream_name } ),*
+        }
+    }
 }
 
 /// impl [`PlanNodeType`] fn for each node.
 macro_rules! impl_plan_node_meta {
     ($( { $convention:ident, $name:ident }),*) => {
         paste!{
-            /// each enum value represent a PlanNode struct type, help us to dispatch and downcast
+            /// each enum value represent a `PlanNode` struct type, help us to dispatch and downcast
             #[derive(Copy, Clone, PartialEq, Debug, Hash, Eq, Serialize)]
             pub enum PlanNodeType {
                 $( [<$convention $name>] ),*

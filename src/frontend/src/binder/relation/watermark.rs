@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use itertools::Itertools;
-use risingwave_common::error::ErrorCode;
 use risingwave_common::types::DataType;
 use risingwave_sqlparser::ast::{FunctionArg, TableAlias};
 
 use super::{Binder, Relation, Result};
 use crate::binder::statement::RewriteExprsRecursive;
+use crate::error::ErrorCode;
 use crate::expr::{ExprImpl, InputRef};
 
 const ERROR_1ST_ARG: &str = "The 1st arg of watermark function should be a table name (incl. source, CTE, view) but not complex structure (subquery, join, another table function). Consider using an intermediate CTE or view as workaround.";
@@ -51,10 +51,10 @@ pub(super) fn is_watermark_func(func_name: &str) -> bool {
 impl Binder {
     pub(super) fn bind_watermark(
         &mut self,
-        alias: Option<TableAlias>,
-        args: Vec<FunctionArg>,
+        alias: Option<&TableAlias>,
+        args: &[FunctionArg],
     ) -> Result<BoundWatermark> {
-        let mut args = args.into_iter();
+        let mut args = args.iter();
 
         self.push_context();
 
@@ -63,7 +63,7 @@ impl Binder {
         let time_col = self.bind_column_by_function_args(args.next(), ERROR_2ND_ARG_EXPR)?;
 
         if DataType::window_of(&time_col.data_type).is_none() {
-            return Err(ErrorCode::BindError(ERROR_2ND_ARG_TYPE.to_string()).into());
+            return Err(ErrorCode::BindError(ERROR_2ND_ARG_TYPE.to_owned()).into());
         };
 
         let base_columns = std::mem::take(&mut self.context.columns);
@@ -75,7 +75,7 @@ impl Binder {
             .map(|c| (c.is_hidden, c.field))
             .collect_vec();
 
-        let (_, table_name) = Self::resolve_schema_qualified_name(&self.db_name, table_name)?;
+        let (_, table_name) = Self::resolve_schema_qualified_name(&self.db_name, &table_name)?;
         self.bind_table_to_context(columns, table_name, alias)?;
 
         // Other arguments are validated in `plan_watermark`

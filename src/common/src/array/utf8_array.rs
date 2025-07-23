@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
 
 use std::fmt::{Display, Write};
 
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::{ArrayType, PbArray};
 
 use super::bytes_array::{BytesWriter, PartialBytesWriter};
 use super::{Array, ArrayBuilder, BytesArray, BytesArrayBuilder, DataType};
-use crate::buffer::Bitmap;
-use crate::estimate_size::EstimateSize;
+use crate::bitmap::Bitmap;
 
 /// `Utf8Array` is a collection of Rust Utf8 `str`s. It's a wrapper of `BytesArray`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,8 +39,10 @@ impl Array for Utf8Array {
     type RefItem<'a> = &'a str;
 
     unsafe fn raw_value_at_unchecked(&self, idx: usize) -> Self::RefItem<'_> {
-        let bytes = self.bytes.raw_value_at_unchecked(idx);
-        std::str::from_utf8_unchecked(bytes)
+        unsafe {
+            let bytes = self.bytes.raw_value_at_unchecked(idx);
+            std::str::from_utf8_unchecked(bytes)
+        }
     }
 
     #[inline]
@@ -112,10 +114,6 @@ impl Utf8Array {
         }
         builder.finish()
     }
-
-    pub(super) fn data(&self) -> &[u8] {
-        self.bytes.data()
-    }
 }
 
 /// `Utf8ArrayBuilder` use `&str` to build an `Utf8Array`.
@@ -127,15 +125,20 @@ pub struct Utf8ArrayBuilder {
 impl ArrayBuilder for Utf8ArrayBuilder {
     type ArrayType = Utf8Array;
 
-    fn new(capacity: usize) -> Self {
+    /// Creates a new `Utf8ArrayBuilder`.
+    ///
+    /// `item_capacity` is the number of items to pre-allocate. The size of the preallocated
+    /// buffer of offsets is the number of items plus one.
+    /// No additional memory is pre-allocated for the data buffer.
+    fn new(item_capacity: usize) -> Self {
         Self {
-            bytes: BytesArrayBuilder::new(capacity),
+            bytes: BytesArrayBuilder::new(item_capacity),
         }
     }
 
-    fn with_type(capacity: usize, ty: DataType) -> Self {
+    fn with_type(item_capacity: usize, ty: DataType) -> Self {
         assert_eq!(ty, DataType::Varchar);
-        Self::new(capacity)
+        Self::new(item_capacity)
     }
 
     #[inline]
@@ -170,6 +173,17 @@ impl Utf8ArrayBuilder {
             bytes: self.bytes.writer(),
         }
     }
+
+    /// Append an element as the `Display` format to the array.
+    pub fn append_display(&mut self, value: Option<impl Display>) {
+        if let Some(s) = value {
+            let mut writer = self.writer().begin();
+            write!(writer, "{}", s).unwrap();
+            writer.finish();
+        } else {
+            self.append_null();
+        }
+    }
 }
 
 pub struct StringWriter<'a> {
@@ -192,7 +206,7 @@ pub struct PartialStringWriter<'a> {
     bytes: PartialBytesWriter<'a>,
 }
 
-impl<'a> PartialStringWriter<'a> {
+impl PartialStringWriter<'_> {
     /// `finish` will be called while the entire record is written.
     /// Exactly one new record was appended and the `builder` can be safely used.
     pub fn finish(self) {
@@ -297,12 +311,6 @@ mod tests {
 
         let array = Utf8Array::from_iter(&input);
         assert_eq!(array.len(), input.len());
-
-        assert_eq!(
-            array.bytes.data().len(),
-            input.iter().map(|s| s.unwrap_or("").len()).sum::<usize>()
-        );
-
         assert_eq!(input, array.iter().collect_vec());
     }
 
@@ -325,8 +333,6 @@ mod tests {
     #[test]
     fn test_utf8_array_hash() {
         use std::hash::BuildHasher;
-
-        use twox_hash::RandomXxHashBuilder64;
 
         use super::super::test_util::{hash_finish, test_hash};
 
@@ -362,7 +368,7 @@ mod tests {
 
         let arrs = vecs.iter().map(Utf8Array::from_iter).collect_vec();
 
-        let hasher_builder = RandomXxHashBuilder64::default();
+        let hasher_builder = twox_hash::xxhash64::RandomState::default();
         let mut states = vec![hasher_builder.build_hasher(); ARR_LEN];
         vecs.iter().for_each(|v| {
             v.iter()

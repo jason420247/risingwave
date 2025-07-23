@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,9 +23,6 @@ public class JniSinkWriterHandler {
     private static final Logger LOG = LoggerFactory.getLogger(JniSinkWriterHandler.class);
 
     public static void runJniSinkWriterThread(long requestRxPtr, long responseTxPtr) {
-        // For jni.rs
-        java.lang.Thread.currentThread()
-                .setContextClassLoader(java.lang.ClassLoader.getSystemClassLoader());
         JniSinkWriterResponseObserver responseObserver =
                 new JniSinkWriterResponseObserver(responseTxPtr);
         SinkWriterStreamObserver sinkWriterStreamObserver =
@@ -47,6 +44,6 @@ public class JniSinkWriterHandler {
         } catch (Throwable t) {
             sinkWriterStreamObserver.onError(t);
         }
-        LOG.info("end of runJniSinkWriterThread");
+        LOG.debug("end of runJniSinkWriterThread");
     }
 }

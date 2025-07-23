@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import java.lang.management.ManagementFactory;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import javax.management.JMException;
@@ -32,22 +33,41 @@ import org.slf4j.LoggerFactory;
 public class DbzSourceUtils {
     static final Logger LOG = LoggerFactory.getLogger(DbzSourceUtils.class);
 
+    public static void createPostgresPublicationInValidate(Map<String, String> properties)
+            throws SQLException {
+        boolean pubAutoCreate =
+                properties.get(DbzConnectorConfig.PG_PUB_CREATE).equalsIgnoreCase("true");
+        var pubName = properties.get(DbzConnectorConfig.PG_PUB_NAME);
+        if (!pubAutoCreate) {
+            LOG.info(
+                    "Postgres publication auto creation is disabled, skip creation for publication {}.",
+                    pubName);
+            return;
+        }
+        createPostgresPublicationInner(properties, pubName);
+    }
+
     /**
      * This method is used to create a publication for the cdc source job or cdc table if it doesn't
      * exist.
      */
-    public static void createPostgresPublicationIfNeeded(
+    public static void createPostgresPublicationInSourceExecutor(
             Map<String, String> properties, long sourceId) throws SQLException {
         boolean pubAutoCreate =
                 properties.get(DbzConnectorConfig.PG_PUB_CREATE).equalsIgnoreCase("true");
+        var pubName = properties.get(DbzConnectorConfig.PG_PUB_NAME);
         if (!pubAutoCreate) {
             LOG.info(
-                    "Postgres publication auto creation is disabled, skip creation for source {}.",
+                    "Postgres publication auto creation is disabled, skip creation for publication {}, sourceId = {}.",
+                    pubName,
                     sourceId);
             return;
         }
+        createPostgresPublicationInner(properties, pubName);
+    }
 
-        var pubName = properties.get(DbzConnectorConfig.PG_PUB_NAME);
+    private static void createPostgresPublicationInner(
+            Map<String, String> properties, String pubName) throws SQLException {
         var dbHost = properties.get(DbzConnectorConfig.HOST);
         var dbPort = properties.get(DbzConnectorConfig.PORT);
         var dbName = properties.get(DbzConnectorConfig.DB_NAME);
@@ -77,16 +97,30 @@ public class DbzSourceUtils {
                             Optional.of(quotePostgres(schemaName) + "." + quotePostgres(tableName));
                 }
 
+                String withClause = "";
+                try {
+                    // Always create with `WITH ( publish_via_partition_root = true )` to ensure the
+                    // CDC of partitioned tables can work correctly.
+                    // `publish_via_partition_root` is not supported before v13. Luckily, before
+                    // v13, user cannot add a partitioned table into a publication either.
+                    if (jdbcConnection.getMetaData().getDatabaseMajorVersion() >= 13) {
+                        withClause = " WITH ( publish_via_partition_root = true )";
+                    }
+                } catch (SQLException e) {
+                    throw ValidatorUtils.internalError(e.getMessage());
+                }
+
                 // create the publication if it doesn't exist
                 String createPublicationSql;
                 if (schemaTableName.isPresent()) {
                     createPublicationSql =
                             String.format(
-                                    "CREATE PUBLICATION %s FOR TABLE %s;",
-                                    quotePostgres(pubName), schemaTableName.get());
+                                    "CREATE PUBLICATION %s FOR TABLE %s%s;",
+                                    quotePostgres(pubName), schemaTableName.get(), withClause);
                 } else {
                     createPublicationSql =
-                            String.format("CREATE PUBLICATION %s", quotePostgres(pubName));
+                            String.format(
+                                    "CREATE PUBLICATION %s%s;", quotePostgres(pubName), withClause);
                 }
                 try (var stmt = jdbcConnection.createStatement()) {
                     LOG.info(
@@ -103,29 +137,38 @@ public class DbzSourceUtils {
         return "\"" + identifier + "\"";
     }
 
-    public static boolean waitForStreamingRunning(SourceTypeE sourceType, String dbServerName) {
+    public static boolean waitForStreamingRunning(
+            SourceTypeE sourceType, String dbServerName, int waitStreamingStartTimeout) {
         // Wait for streaming source of source that supported backfill
         LOG.info("Waiting for streaming source of {} to start", dbServerName);
         if (sourceType == SourceTypeE.MYSQL) {
-            return waitForStreamingRunningInner("mysql", dbServerName);
+            return waitForStreamingRunningInner("mysql", dbServerName, waitStreamingStartTimeout);
         } else if (sourceType == SourceTypeE.POSTGRES) {
-            return waitForStreamingRunningInner("postgres", dbServerName);
+            return waitForStreamingRunningInner(
+                    "postgres", dbServerName, waitStreamingStartTimeout);
+        } else if (sourceType == SourceTypeE.SQL_SERVER) {
+            return waitForStreamingRunningInner(
+                    "sql_server", dbServerName, waitStreamingStartTimeout);
         } else {
             LOG.info("Unsupported backfill source, just return true for {}", dbServerName);
             return true;
         }
     }
 
-    private static boolean waitForStreamingRunningInner(String connector, String dbServerName) {
-        int maxPollCount = 11; // max poll 10 seconds
+    private static boolean waitForStreamingRunningInner(
+            String connector, String dbServerName, int waitStreamingStartTimeout) {
+        int pollCount = 0;
         while (!isStreamingRunning(connector, dbServerName, "streaming")) {
-            maxPollCount--;
-            if (maxPollCount == 0) {
-                LOG.error("Debezium streaming source of {} failed to start", dbServerName);
+            if (pollCount > waitStreamingStartTimeout) {
+                LOG.error(
+                        "Debezium streaming source of {} failed to start in timeout {}",
+                        dbServerName,
+                        waitStreamingStartTimeout);
                 return false;
             }
             try {
                 TimeUnit.SECONDS.sleep(1); // poll interval
+                pollCount++;
             } catch (InterruptedException e) {
                 LOG.warn("Interrupted while waiting for streaming source to start", e);
             }
@@ -147,20 +190,32 @@ public class DbzSourceUtils {
                     mbeanServer.getAttribute(
                             getStreamingMetricsObjectName(connector, server, contextName),
                             "Connected");
-        } catch (JMException ex) {
-            LOG.warn("Failed to get streaming metrics", ex);
+        } catch (JMException _ex) {
+            // ignore the exception, as it is expected when the streaming source
+            // (aka. binlog client) is not ready
         }
         return false;
     }
 
     private static ObjectName getStreamingMetricsObjectName(
             String connector, String server, String context) throws MalformedObjectNameException {
-        return new ObjectName(
-                "debezium."
-                        + connector
-                        + ":type=connector-metrics,context="
-                        + context
-                        + ",server="
-                        + server);
+        if (Objects.equals(connector, "sql_server")) {
+            // TODO: fulfill the task id here, by WKX
+            return new ObjectName(
+                    "debezium."
+                            + connector
+                            + ":type=connector-metrics,task=0,context="
+                            + context
+                            + ",server="
+                            + server);
+        } else {
+            return new ObjectName(
+                    "debezium."
+                            + connector
+                            + ":type=connector-metrics,context="
+                            + context
+                            + ",server="
+                            + server);
+        }
     }
 }

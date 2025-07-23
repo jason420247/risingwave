@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,118 +12,137 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::LazyLock;
-
-use itertools::Itertools;
-use risingwave_common::array::ListValue;
-use risingwave_common::catalog::RW_CATALOG_SCHEMA_NAME;
-use risingwave_common::error::Result;
-use risingwave_common::row::OwnedRow;
-use risingwave_common::types::{DataType, ScalarImpl};
+use risingwave_common::catalog::SecretId;
+use risingwave_common::types::{Fields, JsonbVal, Timestamptz};
+use risingwave_frontend_macro::system_catalog;
 use risingwave_pb::user::grant_privilege::Object;
+use serde_json::{Map as JsonMap, json};
 
-use crate::catalog::system_catalog::{
-    get_acl_items, BuiltinTable, SysCatalogReaderImpl, SystemCatalogColumnsDef,
-};
+use crate::WithOptionsSecResolved;
+use crate::catalog::catalog_service::CatalogReadGuard;
+use crate::catalog::system_catalog::{SysCatalogReaderImpl, get_acl_items};
+use crate::error::Result;
 use crate::handler::create_source::UPSTREAM_SOURCE_KEY;
 
-pub static RW_SOURCES_COLUMNS: LazyLock<Vec<SystemCatalogColumnsDef<'_>>> = LazyLock::new(|| {
-    vec![
-        (DataType::Int32, "id"),
-        (DataType::Varchar, "name"),
-        (DataType::Int32, "schema_id"),
-        (DataType::Int32, "owner"),
-        (DataType::Varchar, "connector"),
-        // [col1, col2]
-        (DataType::List(Box::new(DataType::Varchar)), "columns"),
-        (DataType::Varchar, "format"),
-        (DataType::Varchar, "row_encode"),
-        (DataType::Boolean, "append_only"),
-        (DataType::Int32, "connection_id"),
-        (DataType::Varchar, "definition"),
-        (DataType::Varchar, "acl"),
-        (DataType::Timestamptz, "initialized_at"),
-        (DataType::Timestamptz, "created_at"),
-        (DataType::Varchar, "initialized_at_cluster_version"),
-        (DataType::Varchar, "created_at_cluster_version"),
-    ]
-});
+#[derive(Fields)]
+struct RwSource {
+    #[primary_key]
+    id: i32,
+    name: String,
+    schema_id: i32,
+    owner: i32,
+    connector: String,
+    columns: Vec<String>,
+    format: Option<String>,
+    row_encode: Option<String>,
+    append_only: bool,
+    associated_table_id: Option<i32>,
+    connection_id: Option<i32>,
+    definition: String,
+    acl: Vec<String>,
+    initialized_at: Option<Timestamptz>,
+    created_at: Option<Timestamptz>,
+    initialized_at_cluster_version: Option<String>,
+    created_at_cluster_version: Option<String>,
+    is_shared: bool,
+    // connector properties in json format
+    connector_props: JsonbVal,
+    // format-encode options in json format
+    format_encode_options: JsonbVal,
+}
 
-pub static RW_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
-    name: "rw_sources",
-    schema: RW_CATALOG_SCHEMA_NAME,
-    columns: &RW_SOURCES_COLUMNS,
-    pk: &[0],
-});
+#[system_catalog(table, "rw_catalog.rw_sources")]
+fn read_rw_sources_info(reader: &SysCatalogReaderImpl) -> Result<Vec<RwSource>> {
+    let catalog_reader = reader.catalog_reader.read_guard();
+    let schemas = catalog_reader.iter_schemas(&reader.auth_context.database)?;
+    let user_reader = reader.user_info_reader.read_guard();
+    let users = user_reader.get_all_users();
+    let username_map = user_reader.get_user_name_map();
 
-impl SysCatalogReaderImpl {
-    pub fn read_rw_sources_info(&self) -> Result<Vec<OwnedRow>> {
-        let reader = self.catalog_reader.read_guard();
-        let schemas = reader.iter_schemas(&self.auth_context.database)?;
-        let user_reader = self.user_info_reader.read_guard();
-        let users = user_reader.get_all_users();
-        let username_map = user_reader.get_user_name_map();
+    Ok(schemas
+        .flat_map(|schema| {
+            schema.iter_source().map(|source| {
+                let format_encode_props_with_secrets = WithOptionsSecResolved::new(
+                    source.info.format_encode_options.clone(),
+                    source.info.format_encode_secret_refs.clone(),
+                );
+                RwSource {
+                    id: source.id as i32,
+                    name: source.name.clone(),
+                    schema_id: schema.id() as i32,
+                    owner: source.owner as i32,
+                    connector: source
+                        .with_properties
+                        .get(UPSTREAM_SOURCE_KEY)
+                        .cloned()
+                        .unwrap_or("".to_owned())
+                        .to_uppercase(),
+                    columns: source.columns.iter().map(|c| c.name().into()).collect(),
+                    format: source
+                        .info
+                        .get_format()
+                        .ok()
+                        .map(|format| format.as_str_name().into()),
+                    row_encode: source
+                        .info
+                        .get_row_encode()
+                        .ok()
+                        .map(|row_encode| row_encode.as_str_name().into()),
+                    append_only: source.append_only,
+                    associated_table_id: source.associated_table_id.map(|id| id.table_id as i32),
+                    connection_id: source.connection_id.map(|id| id as i32),
+                    definition: source.create_sql_purified(),
+                    acl: get_acl_items(&Object::SourceId(source.id), false, &users, username_map),
+                    initialized_at: source.initialized_at_epoch.map(|e| e.as_timestamptz()),
+                    created_at: source.created_at_epoch.map(|e| e.as_timestamptz()),
+                    initialized_at_cluster_version: source.initialized_at_cluster_version.clone(),
+                    created_at_cluster_version: source.created_at_cluster_version.clone(),
+                    is_shared: source.info.is_shared(),
 
-        Ok(schemas
-            .flat_map(|schema| {
-                schema
-                    .iter_source()
-                    .filter(|s| s.associated_table_id.is_none())
-                    .map(|source| {
-                        OwnedRow::new(vec![
-                            Some(ScalarImpl::Int32(source.id as i32)),
-                            Some(ScalarImpl::Utf8(source.name.clone().into())),
-                            Some(ScalarImpl::Int32(schema.id() as i32)),
-                            Some(ScalarImpl::Int32(source.owner as i32)),
-                            Some(ScalarImpl::Utf8(
-                                source
-                                    .with_properties
-                                    .get(UPSTREAM_SOURCE_KEY)
-                                    .cloned()
-                                    .unwrap_or("".to_string())
-                                    .to_uppercase()
-                                    .into(),
-                            )),
-                            Some(ScalarImpl::List(ListValue::from_iter(
-                                source.columns.iter().map(|c| c.name()),
-                            ))),
-                            source
-                                .info
-                                .get_format()
-                                .map(|format| Some(ScalarImpl::Utf8(format.as_str_name().into())))
-                                .unwrap_or(None),
-                            source
-                                .info
-                                .get_row_encode()
-                                .map(|row_encode| {
-                                    Some(ScalarImpl::Utf8(row_encode.as_str_name().into()))
-                                })
-                                .unwrap_or(None),
-                            Some(ScalarImpl::Bool(source.append_only)),
-                            source.connection_id.map(|id| ScalarImpl::Int32(id as i32)),
-                            Some(ScalarImpl::Utf8(source.create_sql().into())),
-                            Some(
-                                get_acl_items(
-                                    &Object::SourceId(source.id),
-                                    false,
-                                    &users,
-                                    username_map,
-                                )
-                                .into(),
-                            ),
-                            source.initialized_at_epoch.map(|e| e.as_scalar()),
-                            source.created_at_epoch.map(|e| e.as_scalar()),
-                            source
-                                .initialized_at_cluster_version
-                                .clone()
-                                .map(|v| ScalarImpl::Utf8(v.into())),
-                            source
-                                .created_at_cluster_version
-                                .clone()
-                                .map(|v| ScalarImpl::Utf8(v.into())),
-                        ])
-                    })
+                    connector_props: serialize_props_with_secret(
+                        &catalog_reader,
+                        &reader.auth_context.database,
+                        source.with_properties.clone(),
+                    )
+                    .into(),
+                    format_encode_options: serialize_props_with_secret(
+                        &catalog_reader,
+                        &reader.auth_context.database,
+                        format_encode_props_with_secrets,
+                    )
+                    .into(),
+                }
             })
-            .collect_vec())
+        })
+        .collect())
+}
+
+pub fn serialize_props_with_secret(
+    catalog_reader: &CatalogReadGuard,
+    db_name: &str,
+    props_with_secret: WithOptionsSecResolved,
+) -> jsonbb::Value {
+    let (inner, secret_ref) = props_with_secret.into_parts();
+    // if not secret, {"some key": {"type": "plaintext", "value": "xxxx"}}
+    // if secret, {"some key": {"type": "secret", "value": {"value": "<secret name>"}}}
+    let mut result: JsonMap<String, serde_json::Value> = JsonMap::new();
+
+    for (k, v) in inner {
+        result.insert(k, json!({"type": "plaintext", "value": v}));
     }
+    for (k, v) in secret_ref {
+        let secret = catalog_reader
+            .iter_schemas(db_name)
+            .unwrap()
+            .find_map(|schema| schema.get_secret_by_id(&SecretId(v.secret_id)));
+        let secret_name = secret
+            .map(|s| s.name.to_owned())
+            .unwrap_or("not found".to_owned());
+        result.insert(
+            k,
+            json!({"type": "secret", "value": {"value": secret_name}}),
+        );
+    }
+
+    jsonbb::Value::from(serde_json::Value::Object(result))
 }

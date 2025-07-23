@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 use risingwave_pb::stream_plan::ProjectSetNode;
+use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::stream::prelude::*;
 use super::utils::impl_distill_by_unit;
-use super::{generic, ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
-use crate::expr::{try_derive_watermark, ExprRewriter, ExprVisitor, WatermarkDerivation};
+use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode, generic};
+use crate::expr::{ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::property::{
+    MonotonicityMap, WatermarkColumns, analyze_monotonicity, monotonicity_variants,
+};
 use crate::stream_fragmenter::BuildFragmentGraphState;
 use crate::utils::ColIndexMappingRewriteExt;
 
@@ -29,8 +31,8 @@ use crate::utils::ColIndexMappingRewriteExt;
 pub struct StreamProjectSet {
     pub base: PlanBase<Stream>,
     core: generic::ProjectSet<PlanRef>,
-    /// All the watermark derivations, (input_column_idx, expr_idx). And the
-    /// derivation expression is the project_set's expression itself.
+    /// All the watermark derivations, (`input_column_idx`, `expr_idx`). And the
+    /// derivation expression is the `project_set`'s expression itself.
     watermark_derivations: Vec<(usize, usize)>,
     /// Nondecreasing expression indices. `ProjectSet` can produce watermarks for these
     /// expressions.
@@ -39,6 +41,7 @@ pub struct StreamProjectSet {
 
 impl StreamProjectSet {
     pub fn new(core: generic::ProjectSet<PlanRef>) -> Self {
+        let ctx = core.input.ctx();
         let input = core.input.clone();
         let distribution = core
             .i2o_col_mapping()
@@ -46,23 +49,31 @@ impl StreamProjectSet {
 
         let mut watermark_derivations = vec![];
         let mut nondecreasing_exprs = vec![];
-        let mut watermark_columns = FixedBitSet::with_capacity(core.output_len());
+        let mut out_watermark_columns = WatermarkColumns::new();
         for (expr_idx, expr) in core.select_list.iter().enumerate() {
-            match try_derive_watermark(expr) {
-                WatermarkDerivation::Watermark(input_idx) => {
-                    if input.watermark_columns().contains(input_idx) {
-                        watermark_derivations.push((input_idx, expr_idx));
-                        watermark_columns.insert(expr_idx + 1);
+            let out_expr_idx = expr_idx + 1;
+
+            use monotonicity_variants::*;
+            match analyze_monotonicity(expr) {
+                Inherent(monotonicity) => {
+                    if monotonicity.is_non_decreasing() && !monotonicity.is_constant() {
+                        // TODO(rc): may be we should also derive watermark for constant later
+                        // FIXME(rc): we need to check expr is not table function
+                        // to produce watermarks
+                        nondecreasing_exprs.push(expr_idx);
+                        // each inherently non-decreasing expr creates a new watermark group
+                        out_watermark_columns.insert(out_expr_idx, ctx.next_watermark_group_id());
                     }
                 }
-                WatermarkDerivation::Nondecreasing => {
-                    nondecreasing_exprs.push(expr_idx);
-                    watermark_columns.insert(expr_idx + 1);
+                FollowingInput(input_idx) => {
+                    if let Some(wtmk_group) = input.watermark_columns().get_group(input_idx) {
+                        // to propagate watermarks
+                        watermark_derivations.push((input_idx, expr_idx));
+                        // join an existing watermark group
+                        out_watermark_columns.insert(out_expr_idx, wtmk_group);
+                    }
                 }
-                WatermarkDerivation::Constant => {
-                    // XXX(rc): we can produce one watermark on each recovery for this case.
-                }
-                WatermarkDerivation::None => {}
+                _FollowingInputInversely(_) => {}
             }
         }
 
@@ -73,7 +84,8 @@ impl StreamProjectSet {
             distribution,
             input.append_only(),
             input.emit_on_window_close(),
-            watermark_columns,
+            out_watermark_columns,
+            MonotonicityMap::new(), // TODO: derive monotonicity
         );
         StreamProjectSet {
             base,
@@ -105,7 +117,7 @@ impl StreamNode for StreamProjectSet {
             .iter()
             .map(|(i, o)| (*i as u32, *o as u32))
             .unzip();
-        PbNodeBody::ProjectSet(ProjectSetNode {
+        PbNodeBody::ProjectSet(Box::new(ProjectSetNode {
             select_list: self
                 .core
                 .select_list
@@ -115,7 +127,7 @@ impl StreamNode for StreamProjectSet {
             watermark_input_cols,
             watermark_expr_indices,
             nondecreasing_exprs: self.nondecreasing_exprs.iter().map(|i| *i as _).collect(),
-        })
+        }))
     }
 }
 

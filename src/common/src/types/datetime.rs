@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,22 @@
 use std::error::Error;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::str::FromStr;
 
-use bytes::{Bytes, BytesMut};
-use chrono::{Datelike, Days, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use anyhow::Context;
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::BytesMut;
+use chrono::{
+    DateTime, Datelike, Days, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday,
+};
+use postgres_types::{FromSql, IsNull, ToSql, Type, accepts, to_sql_checked};
+use risingwave_common_estimate_size::ZeroHeapSize;
 use thiserror::Error;
 
-use super::to_binary::ToBinary;
 use super::to_text::ToText;
 use super::{CheckedAdd, DataType, Interval};
 use crate::array::{ArrayError, ArrayResult};
-use crate::estimate_size::ZeroHeapSize;
 
 /// The same as `NaiveDate::from_ymd(1970, 1, 1).num_days_from_ce()`.
 /// Minus this magic number to store the number of days since 1970-01-01.
@@ -38,7 +41,7 @@ const LEAP_DAYS: &[i32] = &[0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const NORMAL_DAYS: &[i32] = &[0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 macro_rules! impl_chrono_wrapper {
-    ($variant_name:ident, $chrono:ty) => {
+    ($variant_name:ident, $chrono:ty, $pg_type:ident) => {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(transparent)]
         pub struct $variant_name(pub $chrono);
@@ -64,63 +67,43 @@ macro_rules! impl_chrono_wrapper {
         }
 
         impl ZeroHeapSize for $variant_name {}
+
+        impl ToSql for $variant_name {
+            accepts!($pg_type);
+
+            to_sql_checked!();
+
+            fn to_sql(
+                &self,
+                ty: &Type,
+                out: &mut BytesMut,
+            ) -> std::result::Result<IsNull, Box<dyn Error + Sync + Send>>
+            where
+                Self: Sized,
+            {
+                self.0.to_sql(ty, out)
+            }
+        }
+
+        impl<'a> FromSql<'a> for $variant_name {
+            fn from_sql(
+                ty: &Type,
+                raw: &'a [u8],
+            ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                let instant = <$chrono>::from_sql(ty, raw)?;
+                Ok(Self::from(instant))
+            }
+
+            fn accepts(ty: &Type) -> bool {
+                matches!(*ty, Type::$pg_type)
+            }
+        }
     };
 }
 
-impl_chrono_wrapper!(Date, NaiveDate);
-impl_chrono_wrapper!(Timestamp, NaiveDateTime);
-impl_chrono_wrapper!(Time, NaiveTime);
-
-impl ToSql for Date {
-    accepts!(DATE);
-
-    to_sql_checked!();
-
-    fn to_sql(
-        &self,
-        ty: &Type,
-        out: &mut BytesMut,
-    ) -> std::result::Result<IsNull, Box<dyn Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        self.0.to_sql(ty, out)
-    }
-}
-
-impl ToSql for Time {
-    accepts!(TIME);
-
-    to_sql_checked!();
-
-    fn to_sql(
-        &self,
-        ty: &Type,
-        out: &mut BytesMut,
-    ) -> std::result::Result<IsNull, Box<dyn Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        self.0.to_sql(ty, out)
-    }
-}
-
-impl ToSql for Timestamp {
-    accepts!(TIMESTAMP);
-
-    to_sql_checked!();
-
-    fn to_sql(
-        &self,
-        ty: &Type,
-        out: &mut BytesMut,
-    ) -> std::result::Result<IsNull, Box<dyn Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        self.0.to_sql(ty, out)
-    }
-}
+impl_chrono_wrapper!(Date, NaiveDate, DATE);
+impl_chrono_wrapper!(Timestamp, NaiveDateTime, TIMESTAMP);
+impl_chrono_wrapper!(Time, NaiveTime, TIME);
 
 /// Parse a date from varchar.
 ///
@@ -185,29 +168,18 @@ impl FromStr for Timestamp {
     type Err = InvalidParamsError;
 
     fn from_str(s: &str) -> Result<Self> {
-        if let Ok(res) = speedate::DateTime::parse_str_rfc3339(s) {
-            if res.time.tz_offset.is_some() {
-                return Err(ErrorKind::ParseTimestamp.into());
-            }
-            Ok(Date::from_ymd_uncheck(
-                res.date.year as i32,
-                res.date.month as u32,
-                res.date.day as u32,
-            )
-            .and_hms_micro_uncheck(
-                res.time.hour as u32,
-                res.time.minute as u32,
-                res.time.second as u32,
-                res.time.microsecond,
-            ))
-        } else {
-            let res =
-                speedate::Date::parse_str_rfc3339(s).map_err(|_| ErrorKind::ParseTimestamp)?;
-            Ok(
-                Date::from_ymd_uncheck(res.year as i32, res.month as u32, res.day as u32)
-                    .and_hms_micro_uncheck(0, 0, 0, 0),
-            )
-        }
+        let dt = s
+            .parse::<jiff::civil::DateTime>()
+            .map_err(|_| ErrorKind::ParseTimestamp)?;
+        Ok(
+            Date::from_ymd_uncheck(dt.year() as i32, dt.month() as u32, dt.day() as u32)
+                .and_hms_nano_uncheck(
+                    dt.hour() as u32,
+                    dt.minute() as u32,
+                    dt.second() as u32,
+                    dt.subsec_nanosecond() as u32,
+                ),
+        )
     }
 }
 
@@ -282,9 +254,13 @@ enum ErrorKind {
     DateTime { secs: i64, nsecs: u32 },
     #[error("Can't cast string to date (expected format is YYYY-MM-DD)")]
     ParseDate,
-    #[error("Can't cast string to time (expected format is HH:MM:SS[.D+{{up to 6 digits}}][Z] or HH:MM)")]
+    #[error(
+        "Can't cast string to time (expected format is HH:MM:SS[.D+{{up to 6 digits}}][Z] or HH:MM)"
+    )]
     ParseTime,
-    #[error("Can't cast string to timestamp (expected format is YYYY-MM-DD HH:MM:SS[.D+{{up to 6 digits}}] or YYYY-MM-DD HH:MM or YYYY-MM-DD or ISO 8601 format)")]
+    #[error(
+        "Can't cast string to timestamp (expected format is YYYY-MM-DD HH:MM:SS[.D+{{up to 9 digits}}] or YYYY-MM-DD HH:MM or YYYY-MM-DD or ISO 8601 format)"
+    )]
     ParseTimestamp,
 }
 
@@ -328,17 +304,15 @@ impl ToText for Date {
     /// ```
     fn write<W: std::fmt::Write>(&self, f: &mut W) -> std::fmt::Result {
         let (ce, year) = self.0.year_ce();
-        if ce {
-            write!(f, "{}", self.0)
-        } else {
-            write!(
-                f,
-                "{:04}-{:02}-{:02} BC",
-                year,
-                self.0.month(),
-                self.0.day()
-            )
-        }
+        let suffix = if ce { "" } else { " BC" };
+        write!(
+            f,
+            "{:04}-{:02}-{:02}{}",
+            year,
+            self.0.month(),
+            self.0.day(),
+            suffix
+        )
     }
 
     fn write_with_type<W: std::fmt::Write>(&self, ty: &DataType, f: &mut W) -> std::fmt::Result {
@@ -364,7 +338,17 @@ impl ToText for Time {
 
 impl ToText for Timestamp {
     fn write<W: std::fmt::Write>(&self, f: &mut W) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        let (ce, year) = self.0.year_ce();
+        let suffix = if ce { "" } else { " BC" };
+        write!(
+            f,
+            "{:04}-{:02}-{:02} {}{}",
+            year,
+            self.0.month(),
+            self.0.day(),
+            self.0.time(),
+            suffix
+        )
     }
 
     fn write_with_type<W: std::fmt::Write>(&self, ty: &DataType, f: &mut W) -> std::fmt::Result {
@@ -375,47 +359,8 @@ impl ToText for Timestamp {
     }
 }
 
-impl ToBinary for Date {
-    fn to_binary_with_type(&self, ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        match ty {
-            super::DataType::Date => {
-                let mut output = BytesMut::new();
-                self.0.to_sql(&Type::ANY, &mut output).unwrap();
-                Ok(Some(output.freeze()))
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl ToBinary for Time {
-    fn to_binary_with_type(&self, ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        match ty {
-            super::DataType::Time => {
-                let mut output = BytesMut::new();
-                self.0.to_sql(&Type::ANY, &mut output).unwrap();
-                Ok(Some(output.freeze()))
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl ToBinary for Timestamp {
-    fn to_binary_with_type(&self, ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        match ty {
-            super::DataType::Timestamp => {
-                let mut output = BytesMut::new();
-                self.0.to_sql(&Type::ANY, &mut output).unwrap();
-                Ok(Some(output.freeze()))
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 impl Date {
-    pub fn with_days(days: i32) -> Result<Self> {
+    pub fn with_days_since_ce(days: i32) -> Result<Self> {
         Ok(Date::new(
             NaiveDate::from_num_days_from_ce_opt(days)
                 .ok_or_else(|| InvalidParamsError::date(days))?,
@@ -438,6 +383,14 @@ impl Date {
             .num_days_from_ce()
     }
 
+    pub fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Date> {
+        let days = cur
+            .read_i32::<BigEndian>()
+            .context("failed to read i32 from Date buffer")?;
+
+        Ok(Date::with_days_since_ce(days)?)
+    }
+
     pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
         output
             .write(&(self.0.num_days_from_ce()).to_be_bytes())
@@ -449,7 +402,7 @@ impl Date {
     }
 
     pub fn from_num_days_from_ce_uncheck(days: i32) -> Self {
-        Self::with_days(days).unwrap()
+        Self::with_days_since_ce(days).unwrap()
     }
 
     pub fn and_hms_uncheck(self, hour: u32, min: u32, sec: u32) -> Timestamp {
@@ -462,6 +415,13 @@ impl Date {
                 .and_time(Time::from_hms_micro_uncheck(hour, min, sec, micro).0),
         )
     }
+
+    pub fn and_hms_nano_uncheck(self, hour: u32, min: u32, sec: u32, nano: u32) -> Timestamp {
+        Timestamp::new(
+            self.0
+                .and_time(Time::from_hms_nano_uncheck(hour, min, sec, nano).0),
+        )
+    }
 }
 
 impl Time {
@@ -470,6 +430,14 @@ impl Time {
             NaiveTime::from_num_seconds_from_midnight_opt(secs, nano)
                 .ok_or_else(|| InvalidParamsError::time(secs, nano))?,
         ))
+    }
+
+    pub fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Time> {
+        let nano = cur
+            .read_u64::<BigEndian>()
+            .context("failed to read u64 from Time buffer")?;
+
+        Ok(Time::with_nano(nano)?)
     }
 
     pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
@@ -485,19 +453,19 @@ impl Time {
     pub fn with_nano(nano: u64) -> Result<Self> {
         let secs = (nano / 1_000_000_000) as u32;
         let nano = (nano % 1_000_000_000) as u32;
-        Self::with_secs_nano(secs, nano).map_err(Into::into)
+        Self::with_secs_nano(secs, nano)
     }
 
     pub fn with_micro(micro: u64) -> Result<Self> {
         let secs = (micro / 1_000_000) as u32;
         let nano = ((micro % 1_000_000) * 1_000) as u32;
-        Self::with_secs_nano(secs, nano).map_err(Into::into)
+        Self::with_secs_nano(secs, nano)
     }
 
     pub fn with_milli(milli: u32) -> Result<Self> {
         let secs = milli / 1_000;
         let nano = (milli % 1_000) * 1_000_000;
-        Self::with_secs_nano(secs, nano).map_err(Into::into)
+        Self::with_secs_nano(secs, nano)
     }
 
     pub fn from_hms_uncheck(hour: u32, min: u32, sec: u32) -> Self {
@@ -517,23 +485,90 @@ impl Time {
     }
 }
 
+// The first 64 bits of protobuf encoding for `Timestamp` type has 2 possible meanings.
+// * When the highest 2 bits are `11` or `00` (i.e. values ranging from `0b1100...00` to `0b0011..11`),
+//   it is *microseconds* since 1970-01-01 midnight. 2^62 microseconds covers 146235 years.
+// * When the highest 2 bits are `10` or `01`, we flip the second bit to get values from `0b1100...00` to `0b0011..11` again.
+//   It is *seconds* since 1970-01-01 midnight. It is then followed by another 32 bits as nanoseconds within a second.
+// Since timestamp is negative when it is less than 1970-1-1, you need to take both cases into account(`11+00`` or `01+10``).
+enum FirstI64 {
+    V0 { usecs: i64 },
+    V1 { secs: i64 },
+}
+impl FirstI64 {
+    pub fn to_protobuf(&self) -> i64 {
+        match self {
+            FirstI64::V0 { usecs } => *usecs,
+            FirstI64::V1 { secs } => secs ^ (0b01 << 62),
+        }
+    }
+
+    pub fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<FirstI64> {
+        let value = cur
+            .read_i64::<BigEndian>()
+            .context("failed to read i64 from Time buffer")?;
+        if Self::is_v1_format_state(value) {
+            let secs = value ^ (0b01 << 62);
+            Ok(FirstI64::V1 { secs })
+        } else {
+            Ok(FirstI64::V0 { usecs: value })
+        }
+    }
+
+    fn is_v1_format_state(value: i64) -> bool {
+        let state = (value >> 62) & 0b11;
+        state == 0b10 || state == 0b01
+    }
+}
+
 impl Timestamp {
     pub fn with_secs_nsecs(secs: i64, nsecs: u32) -> Result<Self> {
         Ok(Timestamp::new({
-            NaiveDateTime::from_timestamp_opt(secs, nsecs)
+            DateTime::from_timestamp(secs, nsecs)
+                .map(|t| t.naive_utc())
                 .ok_or_else(|| InvalidParamsError::datetime(secs, nsecs))?
         }))
     }
 
-    /// Although `Timestamp` takes 12 bytes, we drop 4 bytes in protobuf encoding.
+    pub fn from_protobuf(cur: &mut Cursor<&[u8]>) -> ArrayResult<Timestamp> {
+        match FirstI64::from_protobuf(cur)? {
+            FirstI64::V0 { usecs } => Ok(Timestamp::with_micros(usecs)?),
+            FirstI64::V1 { secs } => {
+                let nsecs = cur
+                    .read_u32::<BigEndian>()
+                    .context("failed to read u32 from Time buffer")?;
+                Ok(Timestamp::with_secs_nsecs(secs, nsecs)?)
+            }
+        }
+    }
+
+    // Since timestamp secs is much smaller than i64, we use the highest 2 bit to store the format information, which is compatible with the old format.
+    // New format: secs(i64) + nsecs(u32)
+    // Old format: micros(i64)
     pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
-        output
-            .write(&(self.0.timestamp_micros()).to_be_bytes())
-            .map_err(Into::into)
+        let timestamp_size = output
+            .write(
+                &(FirstI64::V1 {
+                    secs: self.0.and_utc().timestamp(),
+                }
+                .to_protobuf())
+                .to_be_bytes(),
+            )
+            .map_err(Into::<ArrayError>::into)?;
+        let timestamp_subsec_nanos_size = output
+            .write(&(self.0.and_utc().timestamp_subsec_nanos()).to_be_bytes())
+            .map_err(Into::<ArrayError>::into)?;
+        Ok(timestamp_subsec_nanos_size + timestamp_size)
     }
 
     pub fn get_timestamp_nanos(&self) -> i64 {
-        self.0.timestamp_nanos_opt().unwrap()
+        self.0.and_utc().timestamp_nanos_opt().unwrap()
+    }
+
+    pub fn with_millis(timestamp_millis: i64) -> Result<Self> {
+        let secs = timestamp_millis.div_euclid(1_000);
+        let nsecs = timestamp_millis.rem_euclid(1_000) * 1_000_000;
+        Self::with_secs_nsecs(secs, nsecs as u32)
     }
 
     pub fn with_micros(timestamp_micros: i64) -> Result<Self> {
@@ -543,7 +578,7 @@ impl Timestamp {
     }
 
     pub fn from_timestamp_uncheck(secs: i64, nsecs: u32) -> Self {
-        Self::new(NaiveDateTime::from_timestamp_opt(secs, nsecs).unwrap())
+        Self::new(DateTime::from_timestamp(secs, nsecs).unwrap().naive_utc())
     }
 
     /// Truncate the timestamp to the precision of microseconds.
@@ -823,10 +858,10 @@ mod tests {
             Timestamp::from_str("2022-08-03 10:34:02").unwrap()
         );
         let ts = Timestamp::from_str("0001-11-15 07:35:40.999999").unwrap();
-        assert_eq!(ts.0.timestamp_micros(), -62108094259000001);
+        assert_eq!(ts.0.and_utc().timestamp_micros(), -62108094259000001);
 
         let ts = Timestamp::from_str("1969-12-31 23:59:59.999999").unwrap();
-        assert_eq!(ts.0.timestamp_micros(), -1);
+        assert_eq!(ts.0.and_utc().timestamp_micros(), -1);
 
         // invalid datetime
         Date::from_str("1999-01-08AA").unwrap_err();

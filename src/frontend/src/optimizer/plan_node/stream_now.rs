@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,48 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use fixedbitset::FixedBitSet;
 use pretty_xmlish::XmlNode;
-use risingwave_common::catalog::{Field, Schema};
-use risingwave_common::types::DataType;
+use risingwave_common::types::Datum;
+use risingwave_common::util::value_encoding::DatumToProtoExt;
+use risingwave_pb::stream_plan::now_node::PbMode as PbNowMode;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
-use risingwave_pb::stream_plan::NowNode;
+use risingwave_pb::stream_plan::{PbNowModeGenerateSeries, PbNowModeUpdateCurrent, PbNowNode};
 
+use super::generic::{GenericPlanNode, Mode};
 use super::stream::prelude::*;
-use super::utils::{childless_record, Distill, TableCatalogBuilder};
-use super::{ExprRewritable, LogicalNow, PlanBase, StreamNode};
+use super::utils::{Distill, TableCatalogBuilder, childless_record};
+use super::{ExprRewritable, PlanBase, StreamNode, generic};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::utils::column_names_pretty;
-use crate::optimizer::property::{Distribution, FunctionalDependencySet};
+use crate::optimizer::property::{Distribution, Monotonicity, MonotonicityMap, WatermarkColumns};
 use crate::stream_fragmenter::BuildFragmentGraphState;
-use crate::OptimizerContextRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamNow {
     pub base: PlanBase<Stream>,
+    core: generic::Now,
 }
 
 impl StreamNow {
-    pub fn new(_logical: LogicalNow, ctx: OptimizerContextRef) -> Self {
-        let schema = Schema::new(vec![Field {
-            data_type: DataType::Timestamptz,
-            name: String::from("now"),
-            sub_fields: vec![],
-            type_name: String::default(),
-        }]);
-        let mut watermark_columns = FixedBitSet::with_capacity(1);
-        watermark_columns.set(0, true);
-        let base = PlanBase::new_stream(
-            ctx,
-            schema,
-            Some(vec![]),
-            FunctionalDependencySet::default(),
+    pub fn new(core: generic::Now) -> Self {
+        let mut watermark_columns = WatermarkColumns::new();
+        watermark_columns.insert(0, core.ctx().next_watermark_group_id()); // `StreamNow` generates watermark messages
+
+        let mut columns_monotonicity = MonotonicityMap::new();
+        columns_monotonicity.insert(0, Monotonicity::NonDecreasing);
+
+        let base = PlanBase::new_stream_with_core(
+            &core,
             Distribution::Single,
-            false,
-            false, // TODO(rc): derive EOWC property from input
+            core.mode.is_generate_series(), // append only
+            core.mode.is_generate_series(), // emit on window close
             watermark_columns,
+            columns_monotonicity,
         );
-        Self { base }
+        Self { base, core }
     }
 }
 
@@ -75,8 +72,7 @@ impl StreamNode for StreamNow {
     fn to_stream_prost_body(&self, state: &mut BuildFragmentGraphState) -> NodeBody {
         let schema = self.base.schema();
         let dist_keys = self.base.distribution().dist_column_indices().to_vec();
-        let mut internal_table_catalog_builder =
-            TableCatalogBuilder::new(self.base.ctx().with_options().internal_table_subset());
+        let mut internal_table_catalog_builder = TableCatalogBuilder::default();
         schema.fields().iter().for_each(|field| {
             internal_table_catalog_builder.add_column(field);
         });
@@ -84,9 +80,19 @@ impl StreamNode for StreamNow {
         let table_catalog = internal_table_catalog_builder
             .build(dist_keys, 0)
             .with_id(state.gen_table_id_wrapped());
-        NodeBody::Now(NowNode {
+        NodeBody::Now(Box::new(PbNowNode {
             state_table: Some(table_catalog.to_internal_table_prost()),
-        })
+            mode: Some(match &self.core.mode {
+                Mode::UpdateCurrent => PbNowMode::UpdateCurrent(PbNowModeUpdateCurrent {}),
+                Mode::GenerateSeries {
+                    start_timestamp,
+                    interval,
+                } => PbNowMode::GenerateSeries(PbNowModeGenerateSeries {
+                    start_timestamp: Some(Datum::Some((*start_timestamp).into()).to_protobuf()),
+                    interval: Some(Datum::Some((*interval).into()).to_protobuf()),
+                }),
+            }),
+        }))
     }
 }
 

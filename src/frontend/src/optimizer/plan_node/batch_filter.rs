@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::error::Result;
-use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::FilterNode;
+use risingwave_pb::batch_plan::plan_node::NodeBody;
 
 use super::batch::prelude::*;
 use super::utils::impl_distill_by_unit;
-use super::{generic, ExprRewritable, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch};
+use super::{ExprRewritable, PlanRef, PlanTreeNodeUnary, ToBatchPb, ToDistributedBatch, generic};
+use crate::error::Result;
 use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::{PlanBase, ToLocalBatch};
@@ -44,6 +44,12 @@ impl BatchFilter {
 
     pub fn predicate(&self) -> &Condition {
         &self.core.predicate
+    }
+
+    pub fn clone_with_predicate(&self, predicate: Condition) -> Self {
+        let mut core = self.core.clone();
+        core.predicate = predicate;
+        Self::new(core)
     }
 }
 impl_distill_by_unit!(BatchFilter, core, "BatchFilter");

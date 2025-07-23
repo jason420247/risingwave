@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use risingwave_pb::common::WorkerType;
 use risingwave_pb::monitor_service::ProfilingResponse;
 use risingwave_rpc_client::ComputeClientPool;
 use thiserror_ext::AsReport;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncWriteExt;
 
 use crate::CtlContext;
@@ -33,9 +33,13 @@ pub async fn cpu_profile(context: &CtlContext, sleep_s: u64) -> anyhow::Result<(
         .into_iter()
         .filter(|w| w.r#type() == WorkerType::ComputeNode);
 
-    let clients = ComputeClientPool::default();
+    let clients = ComputeClientPool::adhoc();
 
-    let profile_root_path = PathBuf::from(&std::env::var("PREFIX_PROFILING")?);
+    let profile_root_path = std::env::var("PREFIX_PROFILING").unwrap_or_else(|_| {
+        tracing::info!("PREFIX_PROFILING is not set, using current directory");
+        "./".to_owned()
+    });
+    let profile_root_path = PathBuf::from(&profile_root_path);
     let dir_name = Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
     let dir_path = profile_root_path.join(dir_name);
     create_dir_all(&dir_path).await?;
@@ -92,7 +96,7 @@ pub async fn heap_profile(context: &CtlContext, dir: Option<String>) -> anyhow::
         .into_iter()
         .filter(|w| w.r#type() == WorkerType::ComputeNode);
 
-    let clients = ComputeClientPool::default();
+    let clients = ComputeClientPool::adhoc();
 
     let mut profile_futs = vec![];
 

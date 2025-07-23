@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,59 +16,52 @@
 #![feature(coroutines)]
 
 use std::collections::{HashMap, HashSet};
-use std::marker::PhantomData;
 use std::str::FromStr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use futures::stream::StreamExt;
 use futures_async_stream::try_stream;
 use itertools::Itertools;
-use risingwave_batch::executor::{Executor as BatchExecutor, RowSeqScanExecutor, ScanRange};
-use risingwave_common::array::{Array, ArrayBuilder, DataChunk, Op, StreamChunk, Utf8ArrayBuilder};
+use risingwave_batch_executors::{Executor as BatchExecutor, RowSeqScanExecutor, ScanRange};
+use risingwave_common::array::{
+    Array, ArrayBuilder, DataChunk, DataChunkTestExt, Op, StreamChunk, Utf8ArrayBuilder,
+};
 use risingwave_common::catalog::{ColumnDesc, ColumnId, ConflictBehavior, Field, Schema, TableId};
 use risingwave_common::types::{Datum, JsonbVal};
+use risingwave_common::util::epoch::{EpochExt, test_epoch};
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_connector::source::cdc::external::mock_external_table::MockExternalTableReader;
-use risingwave_connector::source::cdc::external::{
-    DebeziumOffset, DebeziumSourceOffset, ExternalTableReaderImpl, MySqlOffset, SchemaTableName,
-};
-use risingwave_connector::source::cdc::{CdcSplitBase, DebeziumCdcSplit, MySqlCdcSplit};
 use risingwave_connector::source::SplitImpl;
-use risingwave_hummock_sdk::to_committed_batch_query_epoch;
+use risingwave_connector::source::cdc::DebeziumCdcSplit;
+use risingwave_connector::source::cdc::external::{
+    CdcTableType, DebeziumOffset, DebeziumSourceOffset, ExternalTableConfig, SchemaTableName,
+};
+use risingwave_hummock_sdk::test_batch_query_epoch;
 use risingwave_storage::memory::MemoryStateStore;
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
+use risingwave_storage::table::batch_table::BatchTable;
 use risingwave_stream::common::table::state_table::StateTable;
+use risingwave_stream::common::table::test_utils::gen_pbtable;
 use risingwave_stream::error::StreamResult;
 use risingwave_stream::executor::monitor::StreamingMetrics;
 use risingwave_stream::executor::test_utils::MockSource;
 use risingwave_stream::executor::{
-    expect_first_barrier, ActorContext, AddMutation, Barrier, BoxedExecutor as StreamBoxedExecutor,
-    BoxedMessageStream, CdcBackfillExecutor, Executor, ExecutorInfo, ExternalStorageTable,
-    MaterializeExecutor, Message, Mutation, PkIndices, PkIndicesRef, StreamExecutorError,
+    ActorContext, AddMutation, Barrier, BoxedMessageStream, CdcBackfillExecutor, CdcScanOptions,
+    Execute, Executor as StreamExecutor, ExecutorInfo, ExternalStorageTable, MaterializeExecutor,
+    Message, Mutation, StreamExecutorError, expect_first_barrier,
 };
 
 // mock upstream binlog offset starting from "1.binlog, pos=0"
 pub struct MockOffsetGenExecutor {
-    upstream: Option<StreamBoxedExecutor>,
-
-    schema: Schema,
-
-    pk_indices: PkIndices,
-
-    identity: String,
+    upstream: Option<StreamExecutor>,
 
     start_offset: u32,
 }
 
 impl MockOffsetGenExecutor {
-    pub fn new(upstream: StreamBoxedExecutor, schema: Schema, pk_indices: PkIndices) -> Self {
+    pub fn new(upstream: StreamExecutor) -> Self {
         Self {
             upstream: Some(upstream),
-            schema,
-            pk_indices,
-            identity: "MockOffsetGenExecutor".to_string(),
             start_offset: 0,
         }
     }
@@ -80,11 +73,13 @@ impl MockOffsetGenExecutor {
             source_offset: DebeziumSourceOffset {
                 last_snapshot_record: None,
                 snapshot: None,
-                file: Some("1.binlog".to_string()),
+                file: Some("1.binlog".to_owned()),
                 pos: Some(start_offset as _),
                 lsn: None,
                 txid: None,
                 tx_usec: None,
+                change_lsn: None,
+                commit_lsn: None,
             },
             is_heartbeat: false,
         };
@@ -131,21 +126,9 @@ impl MockOffsetGenExecutor {
     }
 }
 
-impl Executor for MockOffsetGenExecutor {
+impl Execute for MockOffsetGenExecutor {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.execute_inner().boxed()
-    }
-
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    fn pk_indices(&self) -> PkIndicesRef<'_> {
-        &self.pk_indices
-    }
-
-    fn identity(&self) -> &str {
-        &self.identity
     }
 }
 
@@ -154,52 +137,54 @@ async fn test_cdc_backfill() -> StreamResult<()> {
     use risingwave_common::types::DataType;
     let memory_state_store = MemoryStateStore::new();
 
-    let table_id = TableId::new(1002);
-    let schema = Schema::new(vec![
-        Field::unnamed(DataType::Jsonb),   // payload
-        Field::unnamed(DataType::Varchar), // _rw_offset
-    ]);
-    let column_ids = vec![0.into(), 1.into()];
-
-    let pk_indices = vec![0];
-
-    let (mut tx, source) = MockSource::channel(schema.clone(), pk_indices.clone());
-    let _actor_ctx = ActorContext::create(0x3a3a3a);
+    let (mut tx, source) = MockSource::channel();
+    let source = source.into_executor(
+        Schema::new(vec![
+            Field::unnamed(DataType::Jsonb), // payload
+        ]),
+        vec![0],
+    );
 
     // mock upstream offset (start from "1.binlog, pos=0") for ingested chunks
-    let mock_offset_executor =
-        MockOffsetGenExecutor::new(Box::new(source), schema.clone(), pk_indices.clone());
+    let mock_offset_executor = StreamExecutor::new(
+        ExecutorInfo::new(
+            Schema::new(vec![
+                Field::unnamed(DataType::Jsonb),   // payload
+                Field::unnamed(DataType::Varchar), // _rw_offset
+            ]),
+            vec![0],
+            "MockOffsetGenExecutor".to_owned(),
+            0,
+        ),
+        MockOffsetGenExecutor::new(source).boxed(),
+    );
 
-    let binlog_file = String::from("1.binlog");
-    // mock binlog watermarks for backfill
-    // initial low watermark: 1.binlog, pos=2 and expected behaviors:
-    // - ignore events before (1.binlog, pos=2);
-    // - apply events in the range of (1.binlog, pos=2, 1.binlog, pos=4) to the snapshot
-    let binlog_watermarks = vec![
-        MySqlOffset::new(binlog_file.clone(), 2), // binlog low watermark
-        MySqlOffset::new(binlog_file.clone(), 4),
-        MySqlOffset::new(binlog_file.clone(), 6),
-        MySqlOffset::new(binlog_file.clone(), 8),
-        MySqlOffset::new(binlog_file.clone(), 10),
-    ];
-
-    let table_name = SchemaTableName::new("mock_table".to_string(), "public".to_string());
+    let table_name = SchemaTableName {
+        schema_name: "public".to_owned(),
+        table_name: "mock_table".to_owned(),
+    };
     let table_schema = Schema::new(vec![
         Field::with_name(DataType::Int64, "id"), // primary key
         Field::with_name(DataType::Float64, "price"),
     ]);
+    let table_pk_indices = vec![0];
+    let table_pk_order_types = vec![OrderType::ascending()];
+    let config = ExternalTableConfig::default();
+
     let external_table = ExternalStorageTable::new(
-        table_id,
+        TableId::new(1234),
         table_name,
-        ExternalTableReaderImpl::Mock(MockExternalTableReader::new(binlog_watermarks)),
+        "mydb".to_owned(),
+        config,
+        CdcTableType::Mock,
         table_schema.clone(),
-        vec![OrderType::ascending()],
-        pk_indices,
-        vec![0, 1],
+        table_pk_order_types,
+        table_pk_indices.clone(),
     );
 
     let actor_id = 0x1a;
 
+    // create state table
     let state_schema = Schema::new(vec![
         Field::with_name(DataType::Varchar, "split_id"),
         Field::with_name(DataType::Int64, "id"), // pk
@@ -216,39 +201,58 @@ async fn test_cdc_backfill() -> StreamResult<()> {
         ColumnDesc::unnamed(ColumnId::from(4), state_schema[4].data_type.clone()),
     ];
 
-    let state_table = StateTable::new_without_distribution(
+    let state_table = StateTable::from_table_catalog(
+        &gen_pbtable(
+            TableId::from(0x42),
+            column_descs,
+            vec![OrderType::ascending()],
+            vec![0],
+            0,
+        ),
         memory_state_store.clone(),
-        TableId::from(0x42),
-        column_descs.clone(),
-        vec![OrderType::ascending()],
-        vec![0_usize],
+        None,
     )
     .await;
-    let info = ExecutorInfo {
-        schema: table_schema.clone(),
-        pk_indices: vec![0],
-        identity: "CdcBackfillExecutor".to_string(),
-    };
-    let cdc_backfill = CdcBackfillExecutor::new(
-        ActorContext::create(actor_id),
-        info,
-        external_table,
-        Box::new(mock_offset_executor),
-        vec![0, 1],
-        None,
-        Arc::new(StreamingMetrics::unused()),
-        state_table,
-        4, // 4 rows in a snapshot chunk
+
+    let output_columns = vec![
+        ColumnDesc::named("id", ColumnId::new(1), DataType::Int64), // primary key
+        ColumnDesc::named("price", ColumnId::new(2), DataType::Float64),
+    ];
+
+    let cdc_backfill = StreamExecutor::new(
+        ExecutorInfo::new(
+            table_schema.clone(),
+            table_pk_indices,
+            "CdcBackfillExecutor".to_owned(),
+            0,
+        ),
+        CdcBackfillExecutor::new(
+            ActorContext::for_test(actor_id),
+            external_table,
+            mock_offset_executor,
+            vec![0, 1],
+            output_columns,
+            None,
+            Arc::new(StreamingMetrics::unused()),
+            state_table,
+            Some(4), // limit a snapshot chunk to have <= 4 rows by rate limit
+            CdcScanOptions {
+                disable_backfill: false,
+                snapshot_interval: 1,
+                snapshot_batch_size: 4,
+            },
+        )
+        .boxed(),
     );
 
     // Create a `MaterializeExecutor` to write the changes to storage.
+    let materialize_table_id = TableId::new(5678);
     let mut materialize = MaterializeExecutor::for_test(
-        Box::new(cdc_backfill),
+        cdc_backfill,
         memory_state_store.clone(),
-        table_id,
+        materialize_table_id,
         vec![ColumnOrder::new(0, OrderType::ascending())],
-        column_ids.clone(),
-        4,
+        vec![0.into(), 1.into()],
         Arc::new(AtomicU64::new(0)),
         ConflictBehavior::Overwrite,
     )
@@ -256,9 +260,10 @@ async fn test_cdc_backfill() -> StreamResult<()> {
     .boxed()
     .execute();
 
+    // construct upstream chunks
     let chunk1_payload = vec![
         r#"{ "payload": { "before": null, "after": { "id": 1, "price": 10.01}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
-        r#"{ "payload": { "before": null, "after": { "id": 2, "price": 2.02}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
+        r#"{ "payload": { "before": null, "after": { "id": 2, "price": 22.22}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
         r#"{ "payload": { "before": null, "after": { "id": 3, "price": 3.03}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
         r#"{ "payload": { "before": null, "after": { "id": 4, "price": 4.04}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
         r#"{ "payload": { "before": null, "after": { "id": 5, "price": 5.05}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
@@ -266,6 +271,7 @@ async fn test_cdc_backfill() -> StreamResult<()> {
     ];
 
     let chunk2_payload = vec![
+        r#"{ "payload": { "before": null, "after": { "id": 1, "price": 11.11}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
         r#"{ "payload": { "before": null, "after": { "id": 6, "price": 10.08}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
         r#"{ "payload": { "before": null, "after": { "id": 199, "price": 40.5}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
         r#"{ "payload": { "before": null, "after": { "id": 978, "price": 72.6}, "source": { "version": "1.9.7.Final", "connector": "mysql", "name": "RW_CDC_1002"}, "op": "r", "ts_ms": 1695277757017, "transaction": null } }"#,
@@ -290,21 +296,11 @@ async fn test_cdc_backfill() -> StreamResult<()> {
     let stream_chunk2 = create_stream_chunk(chunk2_datums, &chunk_schema);
 
     // The first barrier
-    let curr_epoch = 11;
+    let mut curr_epoch = test_epoch(11);
     let mut splits = HashMap::new();
     splits.insert(
         actor_id,
-        vec![SplitImpl::MysqlCdc(DebeziumCdcSplit {
-            mysql_split: Some(MySqlCdcSplit {
-                inner: CdcSplitBase {
-                    split_id: 0,
-                    start_offset: None,
-                    snapshot_done: false,
-                },
-            }),
-            pg_split: None,
-            _phantom: PhantomData,
-        })],
+        vec![SplitImpl::MysqlCdc(DebeziumCdcSplit::new(0, None, None))],
     );
     let init_barrier =
         Barrier::new_test_barrier(curr_epoch).with_mutation(Mutation::Add(AddMutation {
@@ -312,6 +308,8 @@ async fn test_cdc_backfill() -> StreamResult<()> {
             added_actors: HashSet::new(),
             splits,
             pause: false,
+            subscriptions_to_add: vec![],
+            backfill_nodes_to_pause: Default::default(),
         }));
 
     tx.send_barrier(init_barrier);
@@ -331,18 +329,31 @@ async fn test_cdc_backfill() -> StreamResult<()> {
 
     // ingest data and barrier
     let interval = Duration::from_millis(10);
+
+    // send a dummy barrier to trigger the backfill, since
+    // cdc backfill will wait for a barrier before start
+    curr_epoch.inc_epoch();
+    tx.push_barrier(curr_epoch, false);
+
+    // first chunk
     tx.push_chunk(stream_chunk1);
 
     tokio::time::sleep(interval).await;
-    tx.push_barrier(curr_epoch + 1, false);
 
+    // barrier to trigger emit buffered events
+    curr_epoch.inc_epoch();
+    tx.push_barrier(curr_epoch, false);
+
+    // second chunk
     tx.push_chunk(stream_chunk2);
 
     tokio::time::sleep(interval).await;
-    tx.push_barrier(curr_epoch + 2, false);
+    curr_epoch.inc_epoch();
+    tx.push_barrier(curr_epoch, false);
 
     tokio::time::sleep(interval).await;
-    tx.push_barrier(curr_epoch + 3, true);
+    curr_epoch.inc_epoch();
+    tx.push_barrier(curr_epoch, true);
 
     // scan the final result of the mv table
     let column_descs = vec![
@@ -351,9 +362,9 @@ async fn test_cdc_backfill() -> StreamResult<()> {
     ];
     let value_indices = (0..column_descs.len()).collect_vec();
     // Since we have not polled `Materialize`, we cannot scan anything from this table
-    let table = StorageTable::for_test(
+    let table = BatchTable::for_test(
         memory_state_store.clone(),
-        table_id,
+        materialize_table_id,
         column_descs.clone(),
         vec![OrderType::ascending()],
         vec![0],
@@ -364,15 +375,32 @@ async fn test_cdc_backfill() -> StreamResult<()> {
         table.clone(),
         vec![ScanRange::full()],
         true,
-        to_committed_batch_query_epoch(u64::MAX),
+        test_batch_query_epoch(),
         1024,
-        "RowSeqExecutor2".to_string(),
+        "RowSeqExecutor2".to_owned(),
+        None,
         None,
         None,
     ));
+
+    // check result
     let mut stream = scan.execute();
     while let Some(message) = stream.next().await {
-        println!("[scan] chunk: {:#?}", message.unwrap());
+        let chunk = message.expect("scan a chunk");
+        let expect = DataChunk::from_pretty(
+            "I F
+                1 11.11
+                2 22.22
+                3 3.03
+                4 4.04
+                5 5.05
+                6 10.08
+                8 1.0008
+                134 41.7
+                199 40.5
+                978 72.6",
+        );
+        assert_eq!(expect, chunk);
     }
 
     mview_handle.await.unwrap()?;

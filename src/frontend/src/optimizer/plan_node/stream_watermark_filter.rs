@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{Field, FieldDisplay};
 use risingwave_common::types::DataType;
@@ -22,13 +20,12 @@ use risingwave_pb::catalog::WatermarkDesc;
 use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::stream::prelude::*;
-use super::stream::StreamPlanRef;
-use super::utils::{childless_record, watermark_pretty, Distill, TableCatalogBuilder};
+use super::utils::{Distill, TableCatalogBuilder, childless_record, watermark_pretty};
 use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
+use crate::TableCatalog;
 use crate::expr::{ExprDisplay, ExprImpl};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::stream_fragmenter::BuildFragmentGraphState;
-use crate::{TableCatalog, WithOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamWatermarkFilter {
@@ -39,9 +36,13 @@ pub struct StreamWatermarkFilter {
 
 impl StreamWatermarkFilter {
     pub fn new(input: PlanRef, watermark_descs: Vec<WatermarkDesc>) -> Self {
+        let ctx = input.ctx();
         let mut watermark_columns = input.watermark_columns().clone();
         for i in &watermark_descs {
-            watermark_columns.insert(i.get_watermark_idx() as usize)
+            watermark_columns.insert(
+                i.get_watermark_idx() as usize,
+                ctx.next_watermark_group_id(), // each watermark descriptor creates a new watermark group
+            );
         }
         let base = PlanBase::new_stream(
             input.ctx(),
@@ -52,6 +53,8 @@ impl StreamWatermarkFilter {
             input.append_only(),
             false, // TODO(rc): decide EOWC property
             watermark_columns,
+            // watermark filter preserves input order and hence monotonicity
+            input.columns_monotonicity().clone(),
         );
         Self::with_base(base, input, watermark_descs)
     }
@@ -91,11 +94,11 @@ impl Distill for StreamWatermarkFilter {
                 Pretty::childless_record("Desc", fields)
             })
             .collect();
-        let display_output_watermarks =
+        let display_output_watermark_groups =
             watermark_pretty(self.base.watermark_columns(), input_schema).unwrap();
         let fields = vec![
             ("watermark_descs", Pretty::Array(display_watermark_descs)),
-            ("output_watermarks", display_output_watermarks),
+            ("output_watermarks", display_output_watermark_groups),
         ];
         childless_record("StreamWatermarkFilter", fields)
     }
@@ -114,19 +117,15 @@ impl PlanTreeNodeUnary for StreamWatermarkFilter {
 impl_plan_tree_node_for_unary! {StreamWatermarkFilter}
 
 pub fn infer_internal_table_catalog(watermark_type: DataType) -> TableCatalog {
-    let mut builder = TableCatalogBuilder::new(WithOptions::new(HashMap::default()));
+    let mut builder = TableCatalogBuilder::default();
 
     let key = Field {
         data_type: DataType::Int16,
-        name: "vnode".to_string(),
-        sub_fields: vec![],
-        type_name: "".to_string(),
+        name: "vnode".to_owned(),
     };
     let value = Field {
         data_type: watermark_type,
-        name: "offset".to_string(),
-        sub_fields: vec![],
-        type_name: "".to_string(),
+        name: "offset".to_owned(),
     };
 
     let ordered_col_idx = builder.add_column(&key);
@@ -149,12 +148,14 @@ impl StreamNode for StreamWatermarkFilter {
 
         let table = infer_internal_table_catalog(watermark_type);
 
-        PbNodeBody::WatermarkFilter(WatermarkFilterNode {
+        PbNodeBody::WatermarkFilter(Box::new(WatermarkFilterNode {
             watermark_descs: self.watermark_descs.clone(),
-            tables: vec![table
-                .with_id(state.gen_table_id_wrapped())
-                .to_internal_table_prost()],
-        })
+            tables: vec![
+                table
+                    .with_id(state.gen_table_id_wrapped())
+                    .to_internal_table_prost(),
+            ],
+        }))
     }
 }
 

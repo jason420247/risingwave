@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,9 +42,7 @@ pub async fn update_check(info: Arc<ExecutorInfo>, input: impl MessageStream) {
                 {
                     panic!(
                         "update check failed on `{}`: expect U+ after  U-:\n first row: {:?}\nsecond row: {:?}",
-                        info.identity,
-                        row1,
-                        row2,
+                        info.identity, row1, row2,
                     )
                 }
             }
@@ -56,18 +54,18 @@ pub async fn update_check(info: Arc<ExecutorInfo>, input: impl MessageStream) {
 
 #[cfg(test)]
 mod tests {
-    use futures::{pin_mut, StreamExt};
-    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
+    use futures::{StreamExt, pin_mut};
     use risingwave_common::array::StreamChunk;
+    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
 
     use super::*;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::Executor;
 
     #[should_panic]
     #[tokio::test]
     async fn test_not_next_to_each_other() {
-        let (mut tx, source) = MockSource::channel(Default::default(), vec![]);
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(Default::default(), vec![]);
         tx.push_chunk(StreamChunk::from_pretty(
             "     I
             U-  114
@@ -76,7 +74,7 @@ mod tests {
             U+  810",
         ));
 
-        let checked = update_check(source.info().into(), source.boxed().execute());
+        let checked = update_check(source.info().clone().into(), source.execute());
         pin_mut!(checked);
 
         checked.next().await.unwrap().unwrap(); // should panic
@@ -85,13 +83,14 @@ mod tests {
     #[should_panic]
     #[tokio::test]
     async fn test_first_one_update_insert() {
-        let (mut tx, source) = MockSource::channel(Default::default(), vec![]);
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(Default::default(), vec![]);
         tx.push_chunk(StreamChunk::from_pretty(
             "     I
             U+  114",
         ));
 
-        let checked = update_check(source.info().into(), source.boxed().execute());
+        let checked = update_check(source.info().clone().into(), source.execute());
         pin_mut!(checked);
 
         checked.next().await.unwrap().unwrap(); // should panic
@@ -100,7 +99,8 @@ mod tests {
     #[should_panic]
     #[tokio::test]
     async fn test_last_one_update_delete() {
-        let (mut tx, source) = MockSource::channel(Default::default(), vec![]);
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(Default::default(), vec![]);
         tx.push_chunk(StreamChunk::from_pretty(
             "        I
             U-     114
@@ -108,7 +108,7 @@ mod tests {
             U- 1919810",
         ));
 
-        let checked = update_check(source.info().into(), source.boxed().execute());
+        let checked = update_check(source.info().clone().into(), source.execute());
         pin_mut!(checked);
 
         checked.next().await.unwrap().unwrap(); // should panic
@@ -116,10 +116,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_chunk() {
-        let (mut tx, source) = MockSource::channel(Default::default(), vec![]);
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(Default::default(), vec![]);
         tx.push_chunk(StreamChunk::default());
 
-        let checked = update_check(source.info().into(), source.boxed().execute());
+        let checked = update_check(source.info().clone().into(), source.execute());
         pin_mut!(checked);
 
         checked.next().await.unwrap().unwrap();

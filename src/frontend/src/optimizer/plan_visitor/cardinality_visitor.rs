@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -67,6 +67,23 @@ impl PlanVisitor for CardinalityVisitor {
         plan.rows().len().into()
     }
 
+    fn visit_logical_share(&mut self, plan: &plan_node::LogicalShare) -> Cardinality {
+        self.visit(plan.input())
+    }
+
+    fn visit_logical_dedup(&mut self, plan: &plan_node::LogicalDedup) -> Cardinality {
+        let input = self.visit(plan.input());
+        if plan.dedup_cols().is_empty() {
+            input.min(1)
+        } else {
+            input
+        }
+    }
+
+    fn visit_logical_over_window(&mut self, plan: &super::LogicalOverWindow) -> Self::Result {
+        self.visit(plan.input())
+    }
+
     fn visit_logical_agg(&mut self, plan: &plan_node::LogicalAgg) -> Cardinality {
         let input = self.visit(plan.input());
 
@@ -92,12 +109,22 @@ impl PlanVisitor for CardinalityVisitor {
     fn visit_logical_top_n(&mut self, plan: &plan_node::LogicalTopN) -> Cardinality {
         let input = self.visit(plan.input());
 
-        match plan.limit_attr() {
+        let each_group = match plan.limit_attr() {
             TopNLimit::Simple(limit) => input.sub(plan.offset() as usize).min(limit as usize),
             TopNLimit::WithTies(limit) => {
                 assert_eq!(plan.offset(), 0, "ties with offset is not supported yet");
                 input.min((limit as usize)..)
             }
+        };
+
+        if plan.group_key().is_empty() {
+            each_group
+        } else {
+            let group_number = input.min(1..);
+            each_group
+                .mul(group_number)
+                // the output cardinality will never be more than the input, thus `.min(input)`
+                .min(input)
         }
     }
 
@@ -126,11 +153,7 @@ impl PlanVisitor for CardinalityVisitor {
             .map(|input| self.visit(input))
             .fold(Cardinality::unknown(), std::ops::Add::add);
 
-        if plan.all() {
-            all
-        } else {
-            all.min(1..)
-        }
+        if plan.all() { all } else { all.min(1..) }
     }
 
     fn visit_logical_join(&mut self, plan: &plan_node::LogicalJoin) -> Cardinality {
@@ -153,12 +176,27 @@ impl PlanVisitor for CardinalityVisitor {
             JoinType::RightSemi | JoinType::RightAnti => right.min(0..),
 
             // TODO: refine the cardinality of full outer join
-            JoinType::FullOuter => Cardinality::unknown(),
+            JoinType::FullOuter => {
+                if left.is_at_most(1) && right.is_at_most(1) {
+                    Cardinality::new(0, 1)
+                } else {
+                    Cardinality::unknown()
+                }
+            }
+
+            // For each row from one side, we match `0..=1` rows from the other side.
+            JoinType::AsofInner => left.mul(right.min(0..=1)),
+            // For each row from left side, we match exactly 1 row from the right side or a `NULL` row`.
+            JoinType::AsofLeftOuter => left,
         }
     }
 
-    fn visit_logical_now(&mut self, _plan: &plan_node::LogicalNow) -> Cardinality {
-        1.into()
+    fn visit_logical_now(&mut self, plan: &plan_node::LogicalNow) -> Cardinality {
+        if plan.max_one_row() {
+            1.into()
+        } else {
+            Cardinality::unknown()
+        }
     }
 
     fn visit_logical_expand(&mut self, plan: &plan_node::LogicalExpand) -> Cardinality {

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::convert::Into;
 use std::sync::Arc;
 
 use risingwave_common::util::tracing::TracingContext;
 use risingwave_pb::batch_plan::TaskOutputId;
 use risingwave_pb::task_service::task_service_server::TaskService;
 use risingwave_pb::task_service::{
-    CancelTaskRequest, CancelTaskResponse, CreateTaskRequest, ExecuteRequest, GetDataResponse,
-    TaskInfoResponse,
+    CancelTaskRequest, CancelTaskResponse, CreateTaskRequest, ExecuteRequest, FastInsertRequest,
+    FastInsertResponse, GetDataResponse, TaskInfoResponse, fast_insert_response,
 };
+use risingwave_storage::dispatch_state_store;
 use thiserror_ext::AsReport;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::error::BatchError;
+use crate::executor::FastInsertExecutor;
 use crate::rpc::service::exchange::GrpcExchangeWriter;
 use crate::task::{
-    BatchEnvironment, BatchManager, BatchTaskExecution, ComputeNodeContext, StateReporter, TaskId,
+    BatchEnvironment, BatchManager, BatchTaskExecution, ComputeNodeContext, StateReporter,
     TASK_STATUS_BUFFER_SIZE,
 };
-
-const LOCAL_EXECUTE_BUFFER_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub struct BatchServiceImpl {
@@ -54,7 +54,6 @@ impl TaskService for BatchServiceImpl {
     type CreateTaskStream = ReceiverStream<TaskInfoResponseResult>;
     type ExecuteStream = ReceiverStream<GetDataResponseResult>;
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn create_task(
         &self,
         request: Request<CreateTaskRequest>,
@@ -75,10 +74,7 @@ impl TaskService for BatchServiceImpl {
                 task_id.as_ref().expect("no task id found"),
                 plan.expect("no plan found").clone(),
                 epoch.expect("no epoch found"),
-                ComputeNodeContext::new(
-                    self.env.clone(),
-                    TaskId::from(task_id.as_ref().expect("no task id found")),
-                ),
+                ComputeNodeContext::create(self.env.clone()),
                 state_reporter,
                 TracingContext::from_protobuf(&tracing_context),
                 expr_context.expect("no expression context found"),
@@ -100,7 +96,6 @@ impl TaskService for BatchServiceImpl {
         }
     }
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn cancel_task(
         &self,
         req: Request<CancelTaskRequest>,
@@ -112,7 +107,6 @@ impl TaskService for BatchServiceImpl {
         Ok(Response::new(CancelTaskResponse { status: None }))
     }
 
-    #[cfg_attr(coverage, coverage(off))]
     async fn execute(
         &self,
         req: Request<ExecuteRequest>,
@@ -121,6 +115,30 @@ impl TaskService for BatchServiceImpl {
         let env = self.env.clone();
         let mgr = self.mgr.clone();
         BatchServiceImpl::get_execute_stream(env, mgr, req).await
+    }
+
+    async fn fast_insert(
+        &self,
+        request: Request<FastInsertRequest>,
+    ) -> Result<Response<FastInsertResponse>, Status> {
+        let req = request.into_inner();
+        let res = self.do_fast_insert(req).await;
+        match res {
+            Ok(_) => Ok(Response::new(FastInsertResponse {
+                status: fast_insert_response::Status::Succeeded.into(),
+                error_message: "".to_owned(),
+            })),
+            Err(e) => match e {
+                BatchError::Dml(e) => Ok(Response::new(FastInsertResponse {
+                    status: fast_insert_response::Status::DmlFailed.into(),
+                    error_message: format!("{}", e.as_report()),
+                })),
+                _ => {
+                    error!(error = %e.as_report(), "failed to fast insert");
+                    Err(e.into())
+                }
+            },
+        }
     }
 }
 
@@ -144,15 +162,14 @@ impl BatchServiceImpl {
         let tracing_context = TracingContext::from_protobuf(&tracing_context);
         let expr_context = expr_context.expect("no expression context found");
 
-        let context = ComputeNodeContext::new_for_local(env.clone());
+        let context = ComputeNodeContext::create(env.clone());
         trace!(
             "local execute request: plan:{:?} with task id:{:?}",
-            plan,
-            task_id
+            plan, task_id
         );
         let task = BatchTaskExecution::new(&task_id, plan, context, epoch, mgr.runtime())?;
         let task = Arc::new(task);
-        let (tx, rx) = tokio::sync::mpsc::channel(LOCAL_EXECUTE_BUFFER_SIZE);
+        let (tx, rx) = tokio::sync::mpsc::channel(mgr.config().developer.local_execute_buffer_size);
         if let Err(e) = task
             .clone()
             .async_execute(None, tracing_context, expr_context)
@@ -188,5 +205,34 @@ impl BatchServiceImpl {
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn do_fast_insert(&self, insert_req: FastInsertRequest) -> Result<(), BatchError> {
+        let table_id = insert_req.table_id;
+        let wait_for_persistence = insert_req.wait_for_persistence;
+        let (executor, data_chunk) =
+            FastInsertExecutor::build(self.env.dml_manager_ref(), insert_req)?;
+        let epoch = executor
+            .do_execute(data_chunk, wait_for_persistence)
+            .await?;
+        if wait_for_persistence {
+            dispatch_state_store!(self.env.state_store(), store, {
+                use risingwave_common::catalog::TableId;
+                use risingwave_hummock_sdk::HummockReadEpoch;
+                use risingwave_storage::StateStore;
+                use risingwave_storage::store::TryWaitEpochOptions;
+
+                store
+                    .try_wait_epoch(
+                        HummockReadEpoch::Committed(epoch.0),
+                        TryWaitEpochOptions {
+                            table_id: TableId::new(table_id),
+                        },
+                    )
+                    .await
+                    .map_err(BatchError::from)?;
+            });
+        }
+        Ok(())
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use anyhow::Context;
+use risingwave_common::session_config::SessionConfig;
 use risingwave_common::system_param::reader::SystemParamsReader;
+use risingwave_common::util::cluster_limit::ClusterLimit;
+use risingwave_hummock_sdk::HummockVersionId;
 use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
 use risingwave_pb::backup_service::MetaSnapshotMetadata;
 use risingwave_pb::catalog::Table;
@@ -23,16 +27,21 @@ use risingwave_pb::ddl_service::DdlProgress;
 use risingwave_pb::hummock::write_limits::WriteLimit;
 use risingwave_pb::hummock::{
     BranchedObject, CompactTaskAssignment, CompactTaskProgress, CompactionGroupInfo,
-    HummockSnapshot,
 };
 use risingwave_pb::meta::cancel_creating_jobs_request::PbJobs;
+use risingwave_pb::meta::list_actor_splits_response::ActorSplit;
 use risingwave_pb::meta::list_actor_states_response::ActorState;
-use risingwave_pb::meta::list_fragment_distribution_response::FragmentDistribution;
-use risingwave_pb::meta::list_table_fragment_states_response::TableFragmentState;
+use risingwave_pb::meta::list_iceberg_tables_response::IcebergTable;
+use risingwave_pb::meta::list_object_dependencies_response::PbObjectDependencies;
+use risingwave_pb::meta::list_rate_limits_response::RateLimitInfo;
+use risingwave_pb::meta::list_streaming_job_states_response::StreamingJobState;
 use risingwave_pb::meta::list_table_fragments_response::TableFragmentInfo;
-use risingwave_pb::meta::EventLog;
+use risingwave_pb::meta::{EventLog, FragmentDistribution, PbThrottleTarget, RecoveryStatus};
+use risingwave_pb::secret::PbSecretRef;
 use risingwave_rpc_client::error::Result;
 use risingwave_rpc_client::{HummockMetaClient, MetaClient};
+
+use crate::catalog::{DatabaseId, SinkId};
 
 /// A wrapper around the `MetaClient` that only provides a minor set of meta rpc.
 /// Most of the rpc to meta are delegated by other separate structs like `CatalogWriter`,
@@ -41,13 +50,13 @@ use risingwave_rpc_client::{HummockMetaClient, MetaClient};
 /// in this trait so that the mocking can be simplified.
 #[async_trait::async_trait]
 pub trait FrontendMetaClient: Send + Sync {
-    async fn pin_snapshot(&self) -> Result<HummockSnapshot>;
+    async fn try_unregister(&self);
 
-    async fn get_snapshot(&self) -> Result<HummockSnapshot>;
-
-    async fn flush(&self, checkpoint: bool) -> Result<HummockSnapshot>;
+    async fn flush(&self, database_id: DatabaseId) -> Result<HummockVersionId>;
 
     async fn wait(&self) -> Result<()>;
+
+    async fn recover(&self) -> Result<()>;
 
     async fn cancel_creating_jobs(&self, jobs: PbJobs) -> Result<Vec<u32>>;
 
@@ -56,19 +65,19 @@ pub trait FrontendMetaClient: Send + Sync {
         table_ids: &[u32],
     ) -> Result<HashMap<u32, TableFragmentInfo>>;
 
-    async fn list_table_fragment_states(&self) -> Result<Vec<TableFragmentState>>;
+    async fn list_streaming_job_states(&self) -> Result<Vec<StreamingJobState>>;
 
     async fn list_fragment_distribution(&self) -> Result<Vec<FragmentDistribution>>;
 
+    async fn list_creating_fragment_distribution(&self) -> Result<Vec<FragmentDistribution>>;
+
     async fn list_actor_states(&self) -> Result<Vec<ActorState>>;
 
-    async fn unpin_snapshot(&self) -> Result<()>;
+    async fn list_actor_splits(&self) -> Result<Vec<ActorSplit>>;
 
-    async fn unpin_snapshot_before(&self, epoch: u64) -> Result<()>;
+    async fn list_object_dependencies(&self) -> Result<Vec<PbObjectDependencies>>;
 
     async fn list_meta_snapshots(&self) -> Result<Vec<MetaSnapshotMetadata>>;
-
-    async fn get_system_params(&self) -> Result<SystemParamsReader>;
 
     async fn set_system_param(
         &self,
@@ -76,15 +85,20 @@ pub trait FrontendMetaClient: Send + Sync {
         value: Option<String>,
     ) -> Result<Option<SystemParamsReader>>;
 
-    async fn list_ddl_progress(&self) -> Result<Vec<DdlProgress>>;
+    async fn get_session_params(&self) -> Result<SessionConfig>;
 
-    async fn get_tables(&self, table_ids: &[u32]) -> Result<HashMap<u32, Table>>;
+    async fn set_session_param(&self, param: String, value: Option<String>) -> Result<String>;
 
-    /// Returns vector of (worker_id, min_pinned_version_id)
+    async fn get_ddl_progress(&self) -> Result<Vec<DdlProgress>>;
+
+    async fn get_tables(
+        &self,
+        table_ids: &[u32],
+        include_dropped_table: bool,
+    ) -> Result<HashMap<u32, Table>>;
+
+    /// Returns vector of (`worker_id`, `min_pinned_version_id`)
     async fn list_hummock_pinned_versions(&self) -> Result<Vec<(u32, u64)>>;
-
-    /// Returns vector of (worker_id, min_pinned_snapshot_id)
-    async fn list_hummock_pinned_snapshots(&self) -> Result<Vec<(u32, u64)>>;
 
     async fn get_hummock_current_version(&self) -> Result<HummockVersion>;
 
@@ -106,26 +120,67 @@ pub trait FrontendMetaClient: Send + Sync {
     async fn list_all_nodes(&self) -> Result<Vec<WorkerNode>>;
 
     async fn list_compact_task_progress(&self) -> Result<Vec<CompactTaskProgress>>;
+
+    async fn apply_throttle(
+        &self,
+        kind: PbThrottleTarget,
+        id: u32,
+        rate_limit: Option<u32>,
+    ) -> Result<()>;
+
+    async fn get_cluster_recovery_status(&self) -> Result<RecoveryStatus>;
+
+    async fn get_cluster_limits(&self) -> Result<Vec<ClusterLimit>>;
+
+    async fn list_rate_limits(&self) -> Result<Vec<RateLimitInfo>>;
+
+    async fn get_meta_store_endpoint(&self) -> Result<String>;
+
+    async fn alter_sink_props(
+        &self,
+        sink_id: u32,
+        changed_props: BTreeMap<String, String>,
+        changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        connector_conn_ref: Option<u32>,
+    ) -> Result<()>;
+
+    async fn alter_source_connector_props(
+        &self,
+        source_id: u32,
+        changed_props: BTreeMap<String, String>,
+        changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        connector_conn_ref: Option<u32>,
+    ) -> Result<()>;
+
+    async fn list_hosted_iceberg_tables(&self) -> Result<Vec<IcebergTable>>;
+
+    async fn get_fragment_by_id(&self, fragment_id: u32) -> Result<Option<FragmentDistribution>>;
+
+    fn worker_id(&self) -> u32;
+
+    async fn set_sync_log_store_aligned(&self, job_id: u32, aligned: bool) -> Result<()>;
+
+    async fn compact_iceberg_table(&self, sink_id: SinkId) -> Result<u64>;
 }
 
 pub struct FrontendMetaClientImpl(pub MetaClient);
 
 #[async_trait::async_trait]
 impl FrontendMetaClient for FrontendMetaClientImpl {
-    async fn pin_snapshot(&self) -> Result<HummockSnapshot> {
-        self.0.pin_snapshot().await
+    async fn try_unregister(&self) {
+        self.0.try_unregister().await;
     }
 
-    async fn get_snapshot(&self) -> Result<HummockSnapshot> {
-        self.0.get_snapshot().await
-    }
-
-    async fn flush(&self, checkpoint: bool) -> Result<HummockSnapshot> {
-        self.0.flush(checkpoint).await
+    async fn flush(&self, database_id: DatabaseId) -> Result<HummockVersionId> {
+        self.0.flush(database_id).await
     }
 
     async fn wait(&self) -> Result<()> {
         self.0.wait().await
+    }
+
+    async fn recover(&self) -> Result<()> {
+        self.0.recover().await
     }
 
     async fn cancel_creating_jobs(&self, infos: PbJobs) -> Result<Vec<u32>> {
@@ -139,33 +194,33 @@ impl FrontendMetaClient for FrontendMetaClientImpl {
         self.0.list_table_fragments(table_ids).await
     }
 
-    async fn list_table_fragment_states(&self) -> Result<Vec<TableFragmentState>> {
-        self.0.list_table_fragment_states().await
+    async fn list_streaming_job_states(&self) -> Result<Vec<StreamingJobState>> {
+        self.0.list_streaming_job_states().await
     }
 
     async fn list_fragment_distribution(&self) -> Result<Vec<FragmentDistribution>> {
         self.0.list_fragment_distributions().await
     }
 
+    async fn list_creating_fragment_distribution(&self) -> Result<Vec<FragmentDistribution>> {
+        self.0.list_creating_fragment_distribution().await
+    }
+
     async fn list_actor_states(&self) -> Result<Vec<ActorState>> {
         self.0.list_actor_states().await
     }
 
-    async fn unpin_snapshot(&self) -> Result<()> {
-        self.0.unpin_snapshot().await
+    async fn list_actor_splits(&self) -> Result<Vec<ActorSplit>> {
+        self.0.list_actor_splits().await
     }
 
-    async fn unpin_snapshot_before(&self, epoch: u64) -> Result<()> {
-        self.0.unpin_snapshot_before(epoch).await
+    async fn list_object_dependencies(&self) -> Result<Vec<PbObjectDependencies>> {
+        self.0.list_object_dependencies().await
     }
 
     async fn list_meta_snapshots(&self) -> Result<Vec<MetaSnapshotMetadata>> {
         let manifest = self.0.get_meta_snapshot_manifest().await?;
         Ok(manifest.snapshot_metadata)
-    }
-
-    async fn get_system_params(&self) -> Result<SystemParamsReader> {
-        self.0.get_system_params().await
     }
 
     async fn set_system_param(
@@ -176,13 +231,28 @@ impl FrontendMetaClient for FrontendMetaClientImpl {
         self.0.set_system_param(param, value).await
     }
 
-    async fn list_ddl_progress(&self) -> Result<Vec<DdlProgress>> {
+    async fn get_session_params(&self) -> Result<SessionConfig> {
+        let session_config: SessionConfig =
+            serde_json::from_str(&self.0.get_session_params().await?)
+                .context("failed to parse session config")?;
+        Ok(session_config)
+    }
+
+    async fn set_session_param(&self, param: String, value: Option<String>) -> Result<String> {
+        self.0.set_session_param(param, value).await
+    }
+
+    async fn get_ddl_progress(&self) -> Result<Vec<DdlProgress>> {
         let ddl_progress = self.0.get_ddl_progress().await?;
         Ok(ddl_progress)
     }
 
-    async fn get_tables(&self, table_ids: &[u32]) -> Result<HashMap<u32, Table>> {
-        let tables = self.0.get_tables(table_ids).await?;
+    async fn get_tables(
+        &self,
+        table_ids: &[u32],
+        include_dropped_tables: bool,
+    ) -> Result<HashMap<u32, Table>> {
+        let tables = self.0.get_tables(table_ids, include_dropped_tables).await?;
         Ok(tables)
     }
 
@@ -201,21 +271,6 @@ impl FrontendMetaClient for FrontendMetaClientImpl {
         Ok(ret)
     }
 
-    async fn list_hummock_pinned_snapshots(&self) -> Result<Vec<(u32, u64)>> {
-        let pinned_snapshots = self
-            .0
-            .risectl_get_pinned_snapshots_summary()
-            .await?
-            .summary
-            .unwrap()
-            .pinned_snapshots;
-        let ret = pinned_snapshots
-            .into_iter()
-            .map(|s| (s.context_id, s.minimal_pinned_snapshot))
-            .collect();
-        Ok(ret)
-    }
-
     async fn get_hummock_current_version(&self) -> Result<HummockVersion> {
         self.0.get_current_version().await
     }
@@ -229,7 +284,9 @@ impl FrontendMetaClient for FrontendMetaClientImpl {
 
     async fn list_version_deltas(&self) -> Result<Vec<HummockVersionDelta>> {
         // FIXME #8612: there can be lots of version deltas, so better to fetch them by pages and refactor `SysRowSeqScanExecutor` to yield multiple chunks.
-        self.0.list_version_deltas(0, u32::MAX, u64::MAX).await
+        self.0
+            .list_version_deltas(HummockVersionId::new(0), u32::MAX, u64::MAX)
+            .await
     }
 
     async fn list_branched_objects(&self) -> Result<Vec<BranchedObject>> {
@@ -262,5 +319,87 @@ impl FrontendMetaClient for FrontendMetaClientImpl {
 
     async fn list_compact_task_progress(&self) -> Result<Vec<CompactTaskProgress>> {
         self.0.list_compact_task_progress().await
+    }
+
+    async fn apply_throttle(
+        &self,
+        kind: PbThrottleTarget,
+        id: u32,
+        rate_limit: Option<u32>,
+    ) -> Result<()> {
+        self.0
+            .apply_throttle(kind, id, rate_limit)
+            .await
+            .map(|_| ())
+    }
+
+    async fn get_cluster_recovery_status(&self) -> Result<RecoveryStatus> {
+        self.0.get_cluster_recovery_status().await
+    }
+
+    async fn get_cluster_limits(&self) -> Result<Vec<ClusterLimit>> {
+        self.0.get_cluster_limits().await
+    }
+
+    async fn list_rate_limits(&self) -> Result<Vec<RateLimitInfo>> {
+        self.0.list_rate_limits().await
+    }
+
+    async fn get_meta_store_endpoint(&self) -> Result<String> {
+        self.0.get_meta_store_endpoint().await
+    }
+
+    async fn alter_sink_props(
+        &self,
+        sink_id: u32,
+        changed_props: BTreeMap<String, String>,
+        changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        connector_conn_ref: Option<u32>,
+    ) -> Result<()> {
+        self.0
+            .alter_sink_props(
+                sink_id,
+                changed_props,
+                changed_secret_refs,
+                connector_conn_ref,
+            )
+            .await
+    }
+
+    async fn alter_source_connector_props(
+        &self,
+        source_id: u32,
+        changed_props: BTreeMap<String, String>,
+        changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        connector_conn_ref: Option<u32>,
+    ) -> Result<()> {
+        self.0
+            .alter_source_connector_props(
+                source_id,
+                changed_props,
+                changed_secret_refs,
+                connector_conn_ref,
+            )
+            .await
+    }
+
+    async fn list_hosted_iceberg_tables(&self) -> Result<Vec<IcebergTable>> {
+        self.0.list_hosted_iceberg_tables().await
+    }
+
+    async fn get_fragment_by_id(&self, fragment_id: u32) -> Result<Option<FragmentDistribution>> {
+        self.0.get_fragment_by_id(fragment_id).await
+    }
+
+    fn worker_id(&self) -> u32 {
+        self.0.worker_id()
+    }
+
+    async fn set_sync_log_store_aligned(&self, job_id: u32, aligned: bool) -> Result<()> {
+        self.0.set_sync_log_store_aligned(job_id, aligned).await
+    }
+
+    async fn compact_iceberg_table(&self, sink_id: SinkId) -> Result<u64> {
+        self.0.compact_iceberg_table(sink_id).await
     }
 }

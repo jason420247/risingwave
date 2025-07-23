@@ -2,17 +2,15 @@
 
 Welcome to an overview of the developer documentations of RisingWave!
 
-## Design Docs
+## Developer Docs
 
-The [design docs](https://github.com/risingwavelabs/risingwave/blob/main/docs/README.md) covers some high-level ideas of how we built RisingWave.
+To learn how to develop RisingWave, and access high-level design docs, see the [RisingWave Developer Guide](https://risingwavelabs.github.io/risingwave/).
 
 ## Crate Docs
 
 Here are the rustdocs of the core crates in RisingWave. You can read them to understand the implementation details of RisingWave.
 
 <!-- Not all crates are listed here. For example, binary crates and test crates are not included. -->
-
-There's also a [Dash](https://kapeli.com/dash) docset feed containing all crate docs including dependencies, which might be handy for developing RisingWave: [subscribe here](dash-feed://https%3A%2F%2Frisingwavelabs.github.io%2Frisingwave%2FRisingWave.xml)
 
 ### Core Components
 
@@ -30,9 +28,9 @@ There's also a [Dash](https://kapeli.com/dash) docset feed containing all crate 
   - [risingwave_hummock_sdk](risingwave_hummock_sdk/index.html)
   - [risingwave_object_store](risingwave_object_store/index.html)
 
-### Source and Connector
+### DML and Connectors (Source and Sink)
 
-- [risingwave_source](risingwave_source/index.html)
+- [risingwave_dml](risingwave_dml/index.html)
 - [risingwave_connector](risingwave_connector/index.html)
 
 ### Common

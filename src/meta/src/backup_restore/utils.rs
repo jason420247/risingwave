@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,80 +13,80 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use etcd_client::ConnectOptions;
-use risingwave_backup::error::BackupResult;
+use risingwave_backup::error::{BackupError, BackupResult};
 use risingwave_backup::storage::{MetaSnapshotStorageRef, ObjectStoreMetaSnapshotStorage};
-use risingwave_common::config::{MetaBackend, ObjectStoreConfig};
+use risingwave_common::config::{MetaBackend, MetaStoreConfig, ObjectStoreConfig};
 use risingwave_object_store::object::build_remote_object_store;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 
+use crate::MetaStoreBackend;
 use crate::backup_restore::RestoreOpts;
 use crate::controller::SqlMetaStore;
-use crate::storage::{EtcdMetaStore, MemStore, WrappedEtcdClient as EtcdClient};
-use crate::MetaStoreBackend;
-
-#[derive(Clone)]
-pub enum MetaStoreBackendImpl {
-    Etcd(EtcdMetaStore),
-    Mem(MemStore),
-    #[expect(dead_code, reason = "WIP")]
-    Sql(SqlMetaStore),
-}
-
-#[macro_export]
-macro_rules! dispatch_meta_store {
-    ($impl:expr, $store:ident, $body:tt) => {{
-        match $impl {
-            MetaStoreBackendImpl::Etcd($store) => $body,
-            MetaStoreBackendImpl::Mem($store) => $body,
-            MetaStoreBackendImpl::Sql(_) => panic!("not supported"),
-        }
-    }};
-}
 
 // Code is copied from src/meta/src/rpc/server.rs. TODO #6482: extract method.
-pub async fn get_meta_store(opts: RestoreOpts) -> BackupResult<MetaStoreBackendImpl> {
+pub async fn get_meta_store(opts: RestoreOpts) -> BackupResult<SqlMetaStore> {
     let meta_store_backend = match opts.meta_store_type {
-        MetaBackend::Etcd => MetaStoreBackend::Etcd {
-            endpoints: opts
-                .etcd_endpoints
-                .split(',')
-                .map(|x| x.to_string())
-                .collect(),
-            credentials: match opts.etcd_auth {
-                true => Some((opts.etcd_username, opts.etcd_password)),
-                false => None,
-            },
-        },
         MetaBackend::Mem => MetaStoreBackend::Mem,
+        MetaBackend::Sql => MetaStoreBackend::Sql {
+            endpoint: opts.sql_endpoint,
+            config: MetaStoreConfig::default(),
+        },
+        MetaBackend::Sqlite => MetaStoreBackend::Sql {
+            endpoint: format!("sqlite://{}?mode=rwc", opts.sql_endpoint),
+            config: MetaStoreConfig::default(),
+        },
+        MetaBackend::Postgres => MetaStoreBackend::Sql {
+            endpoint: format!(
+                "postgres://{}:{}@{}/{}{}",
+                opts.sql_username,
+                opts.sql_password,
+                opts.sql_endpoint,
+                opts.sql_database,
+                if let Some(params) = &opts.sql_url_params
+                    && !params.is_empty()
+                {
+                    format!("?{}", params)
+                } else {
+                    "".to_owned()
+                }
+            ),
+            config: MetaStoreConfig::default(),
+        },
+        MetaBackend::Mysql => MetaStoreBackend::Sql {
+            endpoint: format!(
+                "mysql://{}:{}@{}/{}{}",
+                opts.sql_username,
+                opts.sql_password,
+                opts.sql_endpoint,
+                opts.sql_database,
+                if let Some(params) = &opts.sql_url_params
+                    && !params.is_empty()
+                {
+                    format!("?{}", params)
+                } else {
+                    "".to_owned()
+                }
+            ),
+            config: MetaStoreConfig::default(),
+        },
     };
-    match meta_store_backend {
-        MetaStoreBackend::Etcd {
-            endpoints,
-            credentials,
-        } => {
-            let mut options = ConnectOptions::default()
-                .with_keep_alive(Duration::from_secs(3), Duration::from_secs(5));
-            if let Some((username, password)) = &credentials {
-                options = options.with_user(username, password)
-            }
-            let client = EtcdClient::connect(endpoints, Some(options), credentials.is_some())
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to connect etcd {}", e))?;
-            Ok(MetaStoreBackendImpl::Etcd(EtcdMetaStore::new(client)))
-        }
-        MetaStoreBackend::Mem => Ok(MetaStoreBackendImpl::Mem(MemStore::new())),
-    }
+
+    SqlMetaStore::connect(meta_store_backend)
+        .await
+        .map_err(|e| BackupError::MetaStorage(e.into()))
 }
 
 pub async fn get_backup_store(opts: RestoreOpts) -> BackupResult<MetaSnapshotStorageRef> {
+    let mut config = ObjectStoreConfig::default();
+    config.retry.read_attempt_timeout_ms = opts.read_attempt_timeout_ms;
+    config.retry.read_retry_attempts = opts.read_retry_attempts as usize;
+
     let object_store = build_remote_object_store(
         &opts.backup_storage_url,
         Arc::new(ObjectStoreMetrics::unused()),
         "Meta Backup",
-        ObjectStoreConfig::default(),
+        Arc::new(config),
     )
     .await;
     let backup_store =

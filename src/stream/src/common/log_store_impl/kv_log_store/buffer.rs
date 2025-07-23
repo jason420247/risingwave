@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,28 +16,31 @@ use std::collections::VecDeque;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
+use await_tree::InstrumentAwait;
 use parking_lot::{Mutex, MutexGuard};
 use risingwave_common::array::StreamChunk;
-use risingwave_common::buffer::Bitmap;
+use risingwave_common::bitmap::Bitmap;
 use risingwave_connector::sink::log_store::{ChunkId, LogStoreResult, TruncateOffset};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::Notify;
 
-use crate::common::log_store_impl::kv_log_store::{ReaderTruncationOffsetType, SeqIdType};
+use crate::common::log_store_impl::kv_log_store::{
+    KvLogStoreMetrics, ReaderTruncationOffsetType, SeqId,
+};
 
 #[derive(Clone)]
 pub(crate) enum LogStoreBufferItem {
     StreamChunk {
         chunk: StreamChunk,
-        start_seq_id: SeqIdType,
-        end_seq_id: SeqIdType,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
         flushed: bool,
         chunk_id: ChunkId,
     },
 
     Flushed {
         vnode_bitmap: Bitmap,
-        start_seq_id: SeqIdType,
-        end_seq_id: SeqIdType,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
         chunk_id: ChunkId,
     },
 
@@ -45,8 +48,6 @@ pub(crate) enum LogStoreBufferItem {
         is_checkpoint: bool,
         next_epoch: u64,
     },
-
-    UpdateVnodes(Arc<Bitmap>),
 }
 
 struct LogStoreBufferInner {
@@ -56,13 +57,49 @@ struct LogStoreBufferInner {
     consumed_queue: VecDeque<(u64, LogStoreBufferItem)>,
     row_count: usize,
     max_row_count: usize,
+    chunk_size: usize,
 
     truncation_list: VecDeque<ReaderTruncationOffsetType>,
 
     next_chunk_id: ChunkId,
+
+    metrics: KvLogStoreMetrics,
 }
 
 impl LogStoreBufferInner {
+    fn update_unconsumed_buffer_metrics(&self) {
+        let mut epoch_count = 0;
+        let mut row_count = 0;
+        for (_, item) in &self.unconsumed_queue {
+            match item {
+                LogStoreBufferItem::StreamChunk { chunk, .. } => {
+                    row_count += chunk.cardinality();
+                }
+                LogStoreBufferItem::Flushed {
+                    start_seq_id,
+                    end_seq_id,
+                    ..
+                } => {
+                    row_count += (end_seq_id - start_seq_id) as usize;
+                }
+                LogStoreBufferItem::Barrier { .. } => {
+                    epoch_count += 1;
+                }
+            }
+        }
+        self.metrics.buffer_unconsumed_epoch_count.set(epoch_count);
+        self.metrics.buffer_unconsumed_row_count.set(row_count as _);
+        self.metrics
+            .buffer_unconsumed_item_count
+            .set(self.unconsumed_queue.len() as _);
+        self.metrics.buffer_unconsumed_min_epoch.set(
+            self.unconsumed_queue
+                .front()
+                .map(|(epoch, _)| *epoch)
+                .unwrap_or_default() as _,
+        );
+    }
+
     fn can_add_stream_chunk(&self) -> bool {
         self.row_count < self.max_row_count
     }
@@ -75,14 +112,15 @@ impl LogStoreBufferInner {
             self.next_chunk_id = 0;
         }
         self.unconsumed_queue.push_front((epoch, item));
+        self.update_unconsumed_buffer_metrics();
     }
 
     pub(crate) fn try_add_stream_chunk(
         &mut self,
         epoch: u64,
         chunk: StreamChunk,
-        start_seq_id: SeqIdType,
-        end_seq_id: SeqIdType,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
     ) -> Option<StreamChunk> {
         if !self.can_add_stream_chunk() {
             Some(chunk)
@@ -100,6 +138,7 @@ impl LogStoreBufferInner {
                     chunk_id,
                 },
             ));
+            self.update_unconsumed_buffer_metrics();
             None
         }
     }
@@ -107,6 +146,7 @@ impl LogStoreBufferInner {
     fn pop_item(&mut self) -> Option<(u64, LogStoreBufferItem)> {
         if let Some((epoch, item)) = self.unconsumed_queue.pop_back() {
             self.consumed_queue.push_front((epoch, item.clone()));
+            self.update_unconsumed_buffer_metrics();
             Some((epoch, item))
         } else {
             None
@@ -116,18 +156,22 @@ impl LogStoreBufferInner {
     fn add_flushed(
         &mut self,
         epoch: u64,
-        start_seq_id: SeqIdType,
-        end_seq_id: SeqIdType,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
         new_vnode_bitmap: Bitmap,
     ) {
+        let curr_chunk_size = (end_seq_id - start_seq_id + 1) as usize;
         if let Some((
             item_epoch,
             LogStoreBufferItem::Flushed {
+                start_seq_id: prev_start_seq_id,
                 end_seq_id: prev_end_seq_id,
                 vnode_bitmap,
                 ..
             },
         )) = self.unconsumed_queue.front_mut()
+            && let prev_chunk_size = (*prev_end_seq_id - *prev_start_seq_id + 1) as usize
+            && curr_chunk_size + prev_chunk_size <= self.chunk_size
         {
             assert!(
                 *prev_end_seq_id < start_seq_id,
@@ -154,12 +198,35 @@ impl LogStoreBufferInner {
                 },
             );
         }
+        self.update_unconsumed_buffer_metrics();
     }
 
-    fn rewind(&mut self) {
-        while let Some((epoch, item)) = self.consumed_queue.pop_front() {
-            self.unconsumed_queue.push_back((epoch, item))
+    fn add_truncate_offset(&mut self, (epoch, seq_id): ReaderTruncationOffsetType) {
+        if let Some((prev_epoch, prev_seq_id)) = self.truncation_list.back_mut()
+            && *prev_epoch == epoch
+        {
+            *prev_seq_id = seq_id;
+        } else {
+            self.truncation_list.push_back((epoch, seq_id));
         }
+    }
+
+    fn rewind(&mut self, log_store_rewind_start_epoch: Option<u64>) {
+        let rewind_start_epoch = log_store_rewind_start_epoch.unwrap_or(0);
+        while let Some((epoch, item)) = self.consumed_queue.pop_front() {
+            if epoch > rewind_start_epoch {
+                self.unconsumed_queue.push_back((epoch, item));
+            }
+        }
+        self.update_unconsumed_buffer_metrics();
+    }
+
+    fn clear(&mut self) {
+        self.consumed_queue.clear();
+        self.unconsumed_queue.clear();
+        self.next_chunk_id = 0;
+        self.truncation_list.clear();
+        self.row_count = 0;
     }
 }
 
@@ -187,28 +254,16 @@ impl<T> SharedMutex<T> {
 }
 
 pub(crate) struct LogStoreBufferSender {
-    init_epoch_tx: Option<oneshot::Sender<u64>>,
     buffer: SharedMutex<LogStoreBufferInner>,
     update_notify: Arc<Notify>,
 }
 
 impl LogStoreBufferSender {
-    pub(crate) fn init(&mut self, epoch: u64) {
-        if let Err(e) = self
-            .init_epoch_tx
-            .take()
-            .expect("should be Some in first init")
-            .send(epoch)
-        {
-            error!("unable to send init epoch: {}", e);
-        }
-    }
-
     pub(crate) fn add_flushed(
         &self,
         epoch: u64,
-        start_seq_id: SeqIdType,
-        end_seq_id: SeqIdType,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
         vnode_bitmap: Bitmap,
     ) {
         self.buffer
@@ -221,8 +276,8 @@ impl LogStoreBufferSender {
         &self,
         epoch: u64,
         chunk: StreamChunk,
-        start_seq_id: SeqIdType,
-        end_seq_id: SeqIdType,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
     ) -> Option<StreamChunk> {
         let ret = self
             .buffer
@@ -246,13 +301,6 @@ impl LogStoreBufferSender {
         self.update_notify.notify_waiters();
     }
 
-    pub(crate) fn update_vnode(&self, epoch: u64, vnode: Arc<Bitmap>) {
-        self.buffer
-            .inner()
-            .add_item(epoch, LogStoreBufferItem::UpdateVnodes(vnode));
-        self.update_notify.notify_waiters();
-    }
-
     pub(crate) fn pop_truncation(&self, curr_epoch: u64) -> Option<ReaderTruncationOffsetType> {
         let mut inner = self.buffer.inner();
         let mut ret = None;
@@ -266,7 +314,7 @@ impl LogStoreBufferSender {
 
     pub(crate) fn flush_all_unflushed(
         &mut self,
-        mut flush_fn: impl FnMut(&StreamChunk, u64, SeqIdType, SeqIdType) -> LogStoreResult<()>,
+        mut flush_fn: impl FnMut(&StreamChunk, u64, SeqId, SeqId) -> LogStoreResult<()>,
     ) -> LogStoreResult<()> {
         let mut inner_guard = self.buffer.inner();
         let inner = inner_guard.deref_mut();
@@ -285,7 +333,7 @@ impl LogStoreBufferSender {
             {
                 if *flushed {
                     // Since we iterate from new data to old data, when we meet a flushed data, the
-                    // rest should all be flushed.
+                    // rest should have been flushed.
                     break;
                 }
                 flush_fn(chunk, *epoch, *start_seq_id, *end_seq_id)?;
@@ -294,32 +342,24 @@ impl LogStoreBufferSender {
         }
         Ok(())
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.buffer.inner().clear();
+    }
 }
 
 pub(crate) struct LogStoreBufferReceiver {
-    init_epoch_rx: Option<oneshot::Receiver<u64>>,
     buffer: SharedMutex<LogStoreBufferInner>,
     update_notify: Arc<Notify>,
 }
 
 impl LogStoreBufferReceiver {
-    pub(crate) async fn init(&mut self) -> u64 {
-        self.init_epoch_rx
-            .take()
-            .expect("should be Some in first init")
-            .await
-            .expect("should get the first epoch")
-    }
-
     pub(crate) async fn next_item(&self) -> (u64, LogStoreBufferItem) {
         let notified = self.update_notify.notified();
-        if let Some(item) = {
-            let opt = self.buffer.inner().pop_item();
-            opt
-        } {
+        if let Some(item) = { self.buffer.inner().pop_item() } {
             item
         } else {
-            notified.await;
+            notified.instrument_await("Wait For New Buffer Item").await;
             self.buffer
                 .inner()
                 .pop_item()
@@ -327,7 +367,7 @@ impl LogStoreBufferReceiver {
         }
     }
 
-    pub(crate) fn truncate(&mut self, offset: TruncateOffset) {
+    pub(crate) fn truncate_buffer(&mut self, offset: TruncateOffset) {
         let mut inner = self.buffer.inner();
         let mut latest_offset: Option<ReaderTruncationOffsetType> = None;
         while let Some((epoch, item)) = inner.consumed_queue.back() {
@@ -382,48 +422,45 @@ impl LogStoreBufferReceiver {
                         break;
                     }
                 }
-                LogStoreBufferItem::UpdateVnodes(_) => {
-                    inner.consumed_queue.pop_back();
-                }
             }
         }
-        if let Some((epoch, seq_id)) = latest_offset {
-            if let Some((prev_epoch, ref mut prev_seq_id)) = inner.truncation_list.back_mut()
-                && *prev_epoch == epoch
-            {
-                *prev_seq_id = seq_id;
-            } else {
-                inner.truncation_list.push_back((epoch, seq_id));
-            }
+        if let Some(offset) = latest_offset {
+            inner.add_truncate_offset(offset);
         }
     }
 
-    pub(crate) fn rewind(&self) {
-        self.buffer.inner().rewind()
+    pub(crate) fn truncate_historical(&mut self, epoch: u64) {
+        let mut inner = self.buffer.inner();
+        inner.add_truncate_offset((epoch, None));
+    }
+
+    pub(crate) fn rewind(&self, log_store_rewind_start_epoch: Option<u64>) {
+        self.buffer.inner().rewind(log_store_rewind_start_epoch)
     }
 }
 
 pub(crate) fn new_log_store_buffer(
     max_row_count: usize,
+    chunk_size: usize,
+    metrics: KvLogStoreMetrics,
 ) -> (LogStoreBufferSender, LogStoreBufferReceiver) {
     let buffer = SharedMutex::new(LogStoreBufferInner {
         unconsumed_queue: VecDeque::new(),
         consumed_queue: VecDeque::new(),
         row_count: 0,
         max_row_count,
+        chunk_size,
         truncation_list: VecDeque::new(),
         next_chunk_id: 0,
+        metrics,
     });
     let update_notify = Arc::new(Notify::new());
-    let (init_epoch_tx, init_epoch_rx) = oneshot::channel();
     let tx = LogStoreBufferSender {
-        init_epoch_tx: Some(init_epoch_tx),
         buffer: buffer.clone(),
         update_notify: update_notify.clone(),
     };
 
     let rx = LogStoreBufferReceiver {
-        init_epoch_rx: Some(init_epoch_rx),
         buffer,
         update_notify,
     };

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::LazyLock;
+
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::macros::{
-    find_format_arg_expr, find_format_args, is_format_macro, macro_backtrace,
+    FormatArgsStorage, find_format_arg_expr, is_format_macro, macro_backtrace,
 };
+use clippy_utils::paths::{PathLookup, PathNS};
 use clippy_utils::ty::implements_trait;
-use clippy_utils::{is_in_cfg_test, is_in_test_function, is_trait_method, match_function_call};
+use clippy_utils::{is_in_cfg_test, is_in_test_function, is_trait_method};
 use rustc_ast::FormatArgsPiece;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
+
+use crate::utils::path::def_path_lookup;
 
 declare_tool_lint! {
     /// ### What it does
@@ -54,12 +59,45 @@ declare_tool_lint! {
 }
 
 #[derive(Default)]
-pub struct FormatError;
+pub struct FormatError {
+    format_args: FormatArgsStorage,
+}
+
+impl FormatError {
+    pub fn new(format_args: FormatArgsStorage) -> Self {
+        Self { format_args }
+    }
+}
 
 impl_lint_pass!(FormatError => [FORMAT_ERROR]);
 
-const TRACING_FIELD_DEBUG: [&str; 3] = ["tracing_core", "field", "debug"];
-const TRACING_FIELD_DISPLAY: [&str; 3] = ["tracing_core", "field", "display"];
+def_path_lookup!(TRACING_FIELD_DEBUG, Value, "tracing_core::field::debug");
+def_path_lookup!(TRACING_FIELD_DISPLAY, Value, "tracing_core::field::display");
+def_path_lookup!(TRACING_EVENT, Macro, "tracing::event");
+def_path_lookup!(ANYHOW_ANYHOW, Macro, "anyhow::anyhow");
+def_path_lookup!(ANYHOW_ERROR, Type, "anyhow::Error");
+def_path_lookup!(THISERROR_IMPL_ERROR, Macro, "thiserror_impl::Error");
+def_path_lookup!(
+    THISERROR_EXT_REPORT_REPORT,
+    Type,
+    "thiserror_ext::report::Report"
+);
+
+fn match_function_call<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'_>,
+    path_lookup: &PathLookup,
+) -> Option<&'tcx [Expr<'tcx>]> {
+    if let ExprKind::Call(path_expr, args) = expr.kind
+        && let ExprKind::Path(qpath) = path_expr.kind
+        && let Some(def_id) = cx.qpath_res(&qpath, path_expr.hir_id).opt_def_id()
+        && path_lookup.matches(cx, def_id)
+    {
+        return Some(args);
+    }
+
+    None
+}
 
 impl<'tcx> LateLintPass<'tcx> for FormatError {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
@@ -73,21 +111,42 @@ impl<'tcx> LateLintPass<'tcx> for FormatError {
             .or_else(|| match_function_call(cx, expr, &TRACING_FIELD_DISPLAY))
             && let [arg_expr, ..] = args
         {
-            check_fmt_arg(cx, arg_expr);
+            check_fmt_arg_in_tracing_event(cx, arg_expr);
         }
 
-        // `{}`, `{:?}` in format macros.
+        // Indirect `{}`, `{:?}` from other macros.
+        let in_tracing_event_macro = macro_backtrace(expr.span)
+            .any(|macro_call| TRACING_EVENT.matches(cx, macro_call.def_id));
+        let in_anyhow_macro = macro_backtrace(expr.span)
+            .any(|macro_call| ANYHOW_ANYHOW.matches(cx, macro_call.def_id));
+        let in_thiserror_macro = macro_backtrace(expr.span)
+            .any(|macro_call| THISERROR_IMPL_ERROR.matches(cx, macro_call.def_id));
+
         for macro_call in macro_backtrace(expr.span) {
             if is_format_macro(cx, macro_call.def_id)
-                && let Some(format_args) = find_format_args(cx, expr, macro_call.expn)
+                && let Some(format_args) = self.format_args.get(cx, expr, macro_call.expn)
             {
                 for piece in &format_args.template {
                     if let FormatArgsPiece::Placeholder(placeholder) = piece
                         && let Ok(index) = placeholder.argument.index
                         && let Some(arg) = format_args.arguments.all_args().get(index)
-                        && let Ok(arg_expr) = find_format_arg_expr(expr, arg)
+                        && let Some(arg_expr) = find_format_arg_expr(expr, arg)
                     {
-                        check_fmt_arg(cx, arg_expr);
+                        if in_tracing_event_macro {
+                            check_fmt_arg_in_tracing_event(cx, arg_expr);
+                        } else if in_anyhow_macro {
+                            if format_args.template.len() == 1 {
+                                check_fmt_arg_in_anyhow_error(cx, arg_expr);
+                            } else {
+                                check_fmt_arg_in_anyhow_context(cx, arg_expr);
+                            }
+                        } else if in_thiserror_macro {
+                            // Allow formatting error in `#[error("...")]` attribute from `thiserror::Error`,
+                            // because it can be normalized by `thiserror_ext::Report` when formatting.
+                            continue;
+                        } else {
+                            check_fmt_arg(cx, arg_expr);
+                        }
                     }
                 }
             }
@@ -103,12 +162,52 @@ impl<'tcx> LateLintPass<'tcx> for FormatError {
 }
 
 fn check_fmt_arg(cx: &LateContext<'_>, arg_expr: &Expr<'_>) {
-    check_arg(
+    check_fmt_arg_with_help(
         cx,
         arg_expr,
-        arg_expr.span,
         "consider importing `thiserror_ext::AsReport` and using `.as_report()` instead",
+    )
+}
+
+fn check_fmt_arg_in_tracing_event(cx: &LateContext<'_>, arg_expr: &Expr<'_>) {
+    // TODO: replace `<error>` with the actual code snippet.
+    check_fmt_arg_with_help(
+        cx,
+        arg_expr,
+        "consider importing `thiserror_ext::AsReport` and recording the error as a field \
+        with `error = %<error>.as_report()` instead",
     );
+}
+
+fn check_fmt_arg_in_anyhow_error(cx: &LateContext<'_>, arg_expr: &Expr<'_>) {
+    check_fmt_arg_with_help(
+        cx,
+        arg_expr,
+        (
+            "consider directly wrapping the error with `anyhow::anyhow!(..)` instead of formatting it",
+            "consider removing the redundant wrapping of `anyhow::anyhow!(..)`",
+            "consider directly wrapping the error with `anyhow::anyhow!(..)` instead of formatting its report",
+        ),
+    );
+}
+
+fn check_fmt_arg_in_anyhow_context(cx: &LateContext<'_>, arg_expr: &Expr<'_>) {
+    check_fmt_arg_with_help(
+        cx,
+        arg_expr,
+        (
+            "consider using `anyhow::Context::(with_)context` to \
+        attach additional message to the error and make it an error source instead",
+            "consider using `.context(..)` to \
+        attach additional message to the error and make it an error source instead",
+            "consider using `anyhow::Context::(with_)context` to \
+        attach additional message to the error and make it an error source instead",
+        ),
+    );
+}
+
+fn check_fmt_arg_with_help(cx: &LateContext<'_>, arg_expr: &Expr<'_>, help: impl Help + 'static) {
+    check_arg(cx, arg_expr, arg_expr.span, help);
 }
 
 fn check_to_string_call(cx: &LateContext<'_>, receiver: &Expr<'_>, to_string_span: Span) {
@@ -120,27 +219,69 @@ fn check_to_string_call(cx: &LateContext<'_>, receiver: &Expr<'_>, to_string_spa
     );
 }
 
-fn check_arg(cx: &LateContext<'_>, arg_expr: &Expr<'_>, span: Span, help: &str) {
+fn check_arg(cx: &LateContext<'_>, arg_expr: &Expr<'_>, span: Span, help: impl Help + 'static) {
     let Some(error_trait_id) = cx.tcx.get_diagnostic_item(sym::Error) else {
         return;
     };
 
     let ty = cx.typeck_results().expr_ty(arg_expr).peel_refs();
 
-    if implements_trait(cx, ty, error_trait_id, &[]) {
-        if let Some(span) = core::iter::successors(Some(span), |s| s.parent_callsite())
-            .find(|s| s.can_be_used_for_suggestions())
-        {
-            // TODO: applicable suggestions
-            span_lint_and_help(
-                cx,
-                FORMAT_ERROR,
-                span,
-                "should not format error directly",
-                None,
-                help,
-            );
+    let help = if implements_trait(cx, ty, error_trait_id, &[]) {
+        help.normal_help()
+    } else if ANYHOW_ERROR.matches_ty(cx, ty) {
+        help.anyhow_help()
+    } else if THISERROR_EXT_REPORT_REPORT.matches_ty(cx, ty) {
+        if let Some(help) = help.report_help() {
+            help
+        } else {
+            return;
         }
+    } else {
+        return;
+    };
+
+    if let Some(span) = core::iter::successors(Some(span), |s| s.parent_callsite())
+        .find(|s| s.can_be_used_for_suggestions())
+    {
+        // TODO: applicable suggestions
+        span_lint_and_help(
+            cx,
+            FORMAT_ERROR,
+            span,
+            "should not format error directly",
+            None,
+            help,
+        );
+    }
+}
+
+trait Help {
+    fn normal_help(&self) -> &'static str;
+    fn anyhow_help(&self) -> &'static str {
+        self.normal_help()
+    }
+    fn report_help(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+impl Help for &'static str {
+    fn normal_help(&self) -> &'static str {
+        self
+    }
+}
+
+impl Help for (&'static str, &'static str, &'static str) {
+    fn normal_help(&self) -> &'static str {
+        self.0
+    }
+
+    fn anyhow_help(&self) -> &'static str {
+        self.1
+    }
+
+    fn report_help(&self) -> Option<&'static str> {
+        Some(self.2)
     }
 }
 

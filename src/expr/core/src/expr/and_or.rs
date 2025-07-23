@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -142,9 +142,6 @@ fn or(l: Option<bool>, r: Option<bool>) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::DataChunk;
-    use risingwave_common::test_prelude::DataChunkTestExt;
-
     use super::*;
     use crate::expr::build_from_pretty;
 

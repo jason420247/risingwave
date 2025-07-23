@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,28 +13,29 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use risingwave_common::system_param::LICENSE_KEY_KEY;
+use risingwave_meta::controller::system_param::SystemParamsControllerRef;
 use risingwave_pb::meta::system_params_service_server::SystemParamsService;
 use risingwave_pb::meta::{
     GetSystemParamsRequest, GetSystemParamsResponse, SetSystemParamRequest, SetSystemParamResponse,
 };
 use tonic::{Request, Response, Status};
 
-use crate::controller::system_param::SystemParamsControllerRef;
-use crate::manager::SystemParamsManagerRef;
-
 pub struct SystemParamsServiceImpl {
-    system_params_manager: SystemParamsManagerRef,
-    system_params_controller: Option<SystemParamsControllerRef>,
+    system_params_manager: SystemParamsControllerRef,
+
+    /// Whether the license key is managed by license key file, i.e., `--license-key-path` is set.
+    managed_license_key: bool,
 }
 
 impl SystemParamsServiceImpl {
     pub fn new(
-        system_params_manager: SystemParamsManagerRef,
-        system_params_controller: Option<SystemParamsControllerRef>,
+        system_params_manager: SystemParamsControllerRef,
+        managed_license_key: bool,
     ) -> Self {
         Self {
             system_params_manager,
-            system_params_controller,
+            managed_license_key,
         }
     }
 }
@@ -45,11 +46,7 @@ impl SystemParamsService for SystemParamsServiceImpl {
         &self,
         _request: Request<GetSystemParamsRequest>,
     ) -> Result<Response<GetSystemParamsResponse>, Status> {
-        let params = if let Some(ctl) = &self.system_params_controller {
-            ctl.get_pb_params().await
-        } else {
-            self.system_params_manager.get_pb_params().await
-        };
+        let params = self.system_params_manager.get_pb_params().await;
 
         Ok(Response::new(GetSystemParamsResponse {
             params: Some(params),
@@ -61,13 +58,21 @@ impl SystemParamsService for SystemParamsServiceImpl {
         request: Request<SetSystemParamRequest>,
     ) -> Result<Response<SetSystemParamResponse>, Status> {
         let req = request.into_inner();
-        let params = if let Some(ctl) = &self.system_params_controller {
-            ctl.set_param(&req.param, req.value).await?
-        } else {
-            self.system_params_manager
-                .set_param(&req.param, req.value)
-                .await?
-        };
+
+        // When license key path is specified, license key from system parameters can be easily
+        // overwritten. So we simply reject this case.
+        if self.managed_license_key && req.param == LICENSE_KEY_KEY {
+            return Err(Status::permission_denied(
+                "cannot alter license key manually when \
+                argument `--license-key-path` (or env var `RW_LICENSE_KEY_PATH`) is set, \
+                please update the license key file instead",
+            ));
+        }
+
+        let params = self
+            .system_params_manager
+            .set_param(&req.param, req.value)
+            .await?;
 
         Ok(Response::new(SetSystemParamResponse {
             params: Some(params),

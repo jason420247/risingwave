@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,8 @@
 use std::task::{Context, Poll};
 
 use futures::Future;
-use hyper::Body;
 use risingwave_common::util::tracing::TracingContext;
+use tonic::body::BoxBody;
 use tower::{Layer, Service};
 use tracing::Instrument;
 
@@ -49,9 +49,9 @@ pub struct TracingExtract<S> {
     inner: S,
 }
 
-impl<S> Service<hyper::Request<Body>> for TracingExtract<S>
+impl<S> Service<http::Request<BoxBody>> for TracingExtract<S>
 where
-    S: Service<hyper::Request<Body>> + Clone + Send + 'static,
+    S: Service<http::Request<BoxBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     type Error = S::Error;
@@ -63,7 +63,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: hyper::Request<Body>) -> Self::Future {
+    fn call(&mut self, req: http::Request<BoxBody>) -> Self::Future {
         // This is necessary because tonic internally uses `tower::buffer::Buffer`.
         // See https://github.com/tower-rs/tower/issues/547#issuecomment-767629149
         // for details on why this is necessary
@@ -71,17 +71,19 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         async move {
-            let span =
-                if let Some(tracing_context) = TracingContext::from_http_headers(req.headers()) {
+            let span = match TracingContext::from_http_headers(req.headers()) {
+                Some(tracing_context) => {
                     let span = tracing::info_span!(
                         "grpc_serve",
                         "otel.name" = req.uri().path(),
                         uri = %req.uri()
                     );
                     tracing_context.attach(span)
-                } else {
+                }
+                _ => {
                     tracing::Span::none() // if there's no parent span, disable tracing for this request
-                };
+                }
+            };
 
             inner.call(req).instrument(span).await
         }

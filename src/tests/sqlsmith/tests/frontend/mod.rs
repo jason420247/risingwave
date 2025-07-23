@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,12 +22,14 @@ use risingwave_frontend::handler::HandlerArgs;
 use risingwave_frontend::session::SessionImpl;
 use risingwave_frontend::test_utils::LocalFrontend;
 use risingwave_frontend::{
-    handler, Binder, FrontendOpts, OptimizerContext, OptimizerContextRef, Planner,
+    Binder, FrontendOpts, OptimizerContext, OptimizerContextRef, Planner, handler,
 };
 use risingwave_sqlparser::ast::Statement;
+use risingwave_sqlsmith::config::Configuration;
 use risingwave_sqlsmith::{
-    is_permissible_error, mview_sql_gen, parse_create_table_statements, parse_sql, sql_gen, Table,
+    Table, is_permissible_error, mview_sql_gen, parse_create_table_statements, parse_sql, sql_gen,
 };
+use thiserror_ext::AsReport;
 use tokio::runtime::Runtime;
 
 type Result<T> = std::result::Result<T, Failed>;
@@ -48,7 +50,7 @@ async fn handle(session: Arc<SessionImpl>, stmt: Statement, sql: Arc<str>) -> Re
     let result = handler::handle(session.clone(), stmt, sql, vec![])
         .await
         .map(|_| ())
-        .map_err(|e| format!("Error Reason:\n{}", e).into());
+        .map_err(|e| format!("Error Reason:\n{}", e.as_report()).into());
     validate_result(result)
 }
 
@@ -103,7 +105,12 @@ async fn create_tables(
 
     // Generate some mviews
     for i in 0..20 {
-        let (sql, table) = mview_sql_gen(rng, tables.clone(), &format!("m{}", i));
+        let (sql, table) = mview_sql_gen(
+            rng,
+            tables.clone(),
+            &format!("m{}", i),
+            &Configuration::default(),
+        );
         let sql: Arc<str> = Arc::from(sql);
         reproduce_failing_queries(&setup_sql, &sql);
         setup_sql.push_str(&format!("{};", &sql));
@@ -153,12 +160,17 @@ async fn test_stream_query(
     if let Ok(x) = env::var("RW_RANDOM_SEED_SQLSMITH")
         && x == "true"
     {
-        rng = SmallRng::from_entropy();
+        rng = SmallRng::from_os_rng();
     } else {
         rng = SmallRng::seed_from_u64(seed);
     }
 
-    let (sql, table) = mview_sql_gen(&mut rng, tables.clone(), "stream_query");
+    let (sql, table) = mview_sql_gen(
+        &mut rng,
+        tables.clone(),
+        "stream_query",
+        &Configuration::default(),
+    );
     let sql: Arc<str> = Arc::from(sql);
     reproduce_failing_queries(setup_sql, &sql);
     // The generated SQL must be parsable.
@@ -183,22 +195,26 @@ fn run_batch_query(
     let mut binder = Binder::new(&session);
     let bound = binder
         .bind(stmt)
-        .map_err(|e| Failed::from(format!("Failed to bind:\nReason:\n{}", e)))?;
-    let mut planner = Planner::new(context);
-    let mut logical_plan = planner
-        .plan(bound)
-        .map_err(|e| Failed::from(format!("Failed to generate logical plan:\nReason:\n{}", e)))?;
-    let batch_plan = logical_plan
-        .gen_batch_plan()
-        .map_err(|e| Failed::from(format!("Failed to generate batch plan:\nReason:\n{}", e)))?;
-    logical_plan
-        .gen_batch_distributed_plan(batch_plan)
-        .map_err(|e| {
-            Failed::from(format!(
-                "Failed to generate batch distributed plan:\nReason:\n{}",
-                e
-            ))
-        })?;
+        .map_err(|e| Failed::from(format!("Failed to bind:\nReason:\n{}", e.as_report())))?;
+    let mut planner = Planner::new_for_batch(context);
+    let plan_root = planner.plan(bound).map_err(|e| {
+        Failed::from(format!(
+            "Failed to generate logical plan:\nReason:\n{}",
+            e.as_report()
+        ))
+    })?;
+    let batch_plan = plan_root.gen_batch_plan().map_err(|e| {
+        Failed::from(format!(
+            "Failed to generate batch plan:\nReason:\n{}",
+            e.as_report()
+        ))
+    })?;
+    batch_plan.gen_batch_distributed_plan().map_err(|e| {
+        Failed::from(format!(
+            "Failed to generate batch distributed plan:\nReason:\n{}",
+            e.as_report()
+        ))
+    })?;
     Ok(())
 }
 
@@ -212,12 +228,12 @@ fn test_batch_query(
     if let Ok(x) = env::var("RW_RANDOM_SEED_SQLSMITH")
         && x == "true"
     {
-        rng = SmallRng::from_entropy();
+        rng = SmallRng::from_os_rng();
     } else {
         rng = SmallRng::seed_from_u64(seed);
     }
 
-    let sql: Arc<str> = Arc::from(sql_gen(&mut rng, tables));
+    let sql: Arc<str> = Arc::from(sql_gen(&mut rng, tables, &Configuration::default()));
     reproduce_failing_queries(setup_sql, &sql);
 
     // The generated SQL must be parsable.
@@ -257,7 +273,7 @@ async fn setup_sqlsmith_with_seed_inner(seed: u64) -> Result<SqlsmithEnv> {
     if let Ok(x) = env::var("RW_RANDOM_SEED_SQLSMITH")
         && x == "true"
     {
-        rng = SmallRng::from_entropy();
+        rng = SmallRng::from_os_rng();
     } else {
         rng = SmallRng::seed_from_u64(seed);
     }

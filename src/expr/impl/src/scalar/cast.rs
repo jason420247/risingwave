@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,15 @@ use std::sync::Arc;
 
 use futures_util::FutureExt;
 use itertools::Itertools;
-use risingwave_common::array::{ArrayImpl, DataChunk, ListRef, ListValue, StructRef, StructValue};
+use risingwave_common::array::{
+    ArrayImpl, DataChunk, ListRef, ListValue, StructRef, StructValue, VectorVal,
+};
 use risingwave_common::cast;
 use risingwave_common::row::OwnedRow;
-use risingwave_common::types::{Int256, IntoOrdered, JsonbRef, ToText, F64};
+use risingwave_common::types::{DataType, F64, Int256, JsonbRef, MapRef, MapValue, ToText};
 use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_expr::expr::{build_func, Context, ExpressionBoxExt, InputRefExpression};
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::expr::{Context, ExpressionBoxExt, InputRefExpression, build_func};
+use risingwave_expr::{ExprError, Result, function};
 use risingwave_pb::expr::expr_node::PbType;
 use thiserror_ext::AsReport;
 
@@ -79,7 +81,6 @@ pub fn jsonb_to_bool(v: JsonbRef<'_>) -> Result<bool> {
 pub fn jsonb_to_number<T: TryFrom<F64>>(v: JsonbRef<'_>) -> Result<T> {
     v.as_number()
         .map_err(|e| ExprError::Parse(e.into()))?
-        .into_ordered()
         .try_into()
         .map_err(|_| ExprError::NumericOutOfRange)
 }
@@ -87,6 +88,8 @@ pub fn jsonb_to_number<T: TryFrom<F64>>(v: JsonbRef<'_>) -> Result<T> {
 #[function("cast(int4) -> int2")]
 #[function("cast(int8) -> int2")]
 #[function("cast(int8) -> int4")]
+#[function("cast(int8) -> serial")]
+#[function("cast(serial) -> int8")]
 #[function("cast(float4) -> int2")]
 #[function("cast(float8) -> int2")]
 #[function("cast(float4) -> int4")]
@@ -147,8 +150,8 @@ pub fn int_to_bool(input: i32) -> bool {
     input != 0
 }
 
-// For most of the types, cast them to varchar is similar to return their text format.
-// So we use this function to cast type to varchar.
+/// For most of the types, cast them to varchar is the same as their pgwire "TEXT" format.
+/// So we use `ToText` to cast type to varchar.
 #[function("cast(*int) -> varchar")]
 #[function("cast(decimal) -> varchar")]
 #[function("cast(*float) -> varchar")]
@@ -160,6 +163,7 @@ pub fn int_to_bool(input: i32) -> bool {
 #[function("cast(jsonb) -> varchar")]
 #[function("cast(bytea) -> varchar")]
 #[function("cast(anyarray) -> varchar")]
+#[function("cast(vector) -> varchar")]
 pub fn general_to_text(elem: impl ToText, mut writer: &mut impl Write) {
     elem.write(&mut writer).unwrap();
 }
@@ -177,7 +181,7 @@ pub fn bool_to_varchar(input: bool, writer: &mut impl Write) {
         .unwrap();
 }
 
-/// `bool_out` is different from `general_to_string<bool>` to produce a single char. `PostgreSQL`
+/// `bool_out` is different from `cast(boolean) -> varchar` to produce a single char. `PostgreSQL`
 /// uses different variants of bool-to-string in different situations.
 #[function("bool_out(boolean) -> varchar")]
 pub fn bool_out(input: bool, writer: &mut impl Write) {
@@ -189,18 +193,26 @@ pub fn str_to_bytea(elem: &str) -> Result<Box<[u8]>> {
     cast::str_to_bytea(elem).map_err(|err| ExprError::Parse(err.into()))
 }
 
-#[function("cast(varchar) -> anyarray", type_infer = "panic")]
+#[function("cast(varchar) -> anyarray", type_infer = "unreachable")]
 fn str_to_list(input: &str, ctx: &Context) -> Result<ListValue> {
     ListValue::from_str(input, &ctx.return_type).map_err(|err| ExprError::Parse(err.into()))
 }
 
+#[function("cast(varchar) -> vector", type_infer = "unreachable")]
+fn str_to_vector(input: &str, ctx: &Context) -> Result<VectorVal> {
+    let DataType::Vector(size) = &ctx.return_type else {
+        unreachable!()
+    };
+    VectorVal::from_text(input, *size).map_err(|err| ExprError::Parse(err.into()))
+}
+
 /// Cast array with `source_elem_type` into array with `target_elem_type` by casting each element.
-#[function("cast(anyarray) -> anyarray", type_infer = "panic")]
+#[function("cast(anyarray) -> anyarray", type_infer = "unreachable")]
 fn list_cast(input: ListRef<'_>, ctx: &Context) -> Result<ListValue> {
     let cast = build_func(
         PbType::Cast,
-        ctx.return_type.as_list().clone(),
-        vec![InputRefExpression::new(ctx.arg_types[0].as_list().clone(), 0).boxed()],
+        ctx.return_type.as_list_element_type().clone(),
+        vec![InputRefExpression::new(ctx.arg_types[0].as_list_element_type().clone(), 0).boxed()],
     )
     .unwrap();
     let items = Arc::new(ArrayImpl::from(input.to_owned()));
@@ -213,7 +225,7 @@ fn list_cast(input: ListRef<'_>, ctx: &Context) -> Result<ListValue> {
 }
 
 /// Cast struct of `source_elem_type` to `target_elem_type` by casting each element.
-#[function("cast(struct) -> struct", type_infer = "panic")]
+#[function("cast(struct) -> struct", type_infer = "unreachable")]
 fn struct_cast(input: StructRef<'_>, ctx: &Context) -> Result<StructValue> {
     let fields = (input.iter_fields_ref())
         .zip_eq_fast(ctx.arg_types[0].as_struct().types())
@@ -241,14 +253,23 @@ fn struct_cast(input: StructRef<'_>, ctx: &Context) -> Result<StructValue> {
     Ok(StructValue::new(fields))
 }
 
+/// Cast array with `source_elem_type` into array with `target_elem_type` by casting each element.
+#[function("cast(anymap) -> anymap", type_infer = "unreachable")]
+fn map_cast(map: MapRef<'_>, ctx: &Context) -> Result<MapValue> {
+    let new_ctx = Context {
+        arg_types: vec![ctx.arg_types[0].clone().as_map().clone().into_list()],
+        return_type: ctx.return_type.as_map().clone().into_list(),
+        variadic: ctx.variadic,
+    };
+    list_cast(map.into_inner(), &new_ctx).map(MapValue::from_entries)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDateTime;
-    use itertools::Itertools;
     use risingwave_common::array::*;
     use risingwave_common::types::*;
     use risingwave_expr::expr::build_from_pretty;
-    use risingwave_pb::expr::expr_node::PbType;
 
     use super::*;
 
@@ -301,6 +322,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::from_str("int[]").unwrap(),
+            variadic: false,
         };
         assert_eq!(
             str_to_list("{}", &ctx).unwrap(),
@@ -313,6 +335,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::from_str("int[]").unwrap(),
+            variadic: false,
         };
         assert_eq!(str_to_list("{1, 2, 3}", &ctx).unwrap(), list123);
 
@@ -321,6 +344,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::from_str("int[][]").unwrap(),
+            variadic: false,
         };
         assert_eq!(str_to_list("{{1, 2, 3}}", &ctx).unwrap(), nested_list123);
 
@@ -333,6 +357,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::from_str("int[][][]").unwrap(),
+            variadic: false,
         };
         assert_eq!(
             str_to_list("{{{1, 2, 3}}, {{44, 55, 66}}}", &ctx).unwrap(),
@@ -343,6 +368,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::from_str("int[][]").unwrap()],
             return_type: DataType::from_str("varchar[][]").unwrap(),
+            variadic: false,
         };
         let double_nested_varchar_list123_445566 = ListValue::from_iter([
             list_cast(nested_list123.as_scalar_ref(), &ctx).unwrap(),
@@ -353,6 +379,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::from_str("varchar[][][]").unwrap(),
+            variadic: false,
         };
         assert_eq!(
             str_to_list("{{{1, 2, 3}}, {{44, 55, 66}}}", &ctx).unwrap(),
@@ -366,6 +393,7 @@ mod tests {
         let ctx = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::from_str("int[]").unwrap(),
+            variadic: false,
         };
         assert!(str_to_list("{{}", &ctx).is_err());
         assert!(str_to_list("{}}", &ctx).is_err());
@@ -384,6 +412,7 @@ mod tests {
                 ("a", DataType::Int32),
                 ("b", DataType::Int32),
             ])),
+            variadic: false,
         };
         assert_eq!(
             struct_cast(
@@ -419,6 +448,7 @@ mod tests {
         let ctx_str_to_int16 = Context {
             arg_types: vec![DataType::Varchar],
             return_type: DataType::Int16,
+            variadic: false,
         };
         test_str_to_int16::<I16Array, _>(|x| str_parse(x, &ctx_str_to_int16).unwrap()).await;
     }
@@ -508,10 +538,9 @@ mod tests {
         }
 
         for i in 0..input.len() {
-            let row = OwnedRow::new(vec![input[i]
-                .as_ref()
-                .cloned()
-                .map(|str| str.to_scalar_value())]);
+            let row = OwnedRow::new(vec![
+                input[i].as_ref().cloned().map(|str| str.to_scalar_value()),
+            ]);
             let result = expr.eval_row(&row).await.unwrap();
             let expected = target[i].as_ref().cloned().map(|x| x.to_scalar_value());
             assert_eq!(result, expected);

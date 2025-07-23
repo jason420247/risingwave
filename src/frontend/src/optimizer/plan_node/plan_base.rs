@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,13 +13,10 @@
 // limitations under the License.
 
 use educe::Educe;
-use fixedbitset::FixedBitSet;
-use risingwave_common::catalog::Schema;
 
 use super::generic::GenericPlanNode;
 use super::*;
-use crate::optimizer::optimizer_context::OptimizerContextRef;
-use crate::optimizer::property::{Distribution, FunctionalDependencySet, Order};
+use crate::optimizer::property::{Distribution, WatermarkColumns};
 
 /// No extra fields for logical plan nodes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -33,7 +30,7 @@ mod physical_common {
     /// Common extra fields for physical plan nodes.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct PhysicalCommonExtra {
-        /// The distribution property of the PlanNode's output, store an `Distribution::any()` here
+        /// The distribution property of the `PlanNode`'s output, store an `Distribution::any()` here
         /// will not affect correctness, but insert unnecessary exchange in plan
         pub dist: Distribution,
     }
@@ -54,14 +51,16 @@ pub struct StreamExtra {
     /// Common fields for physical plan nodes.
     physical: PhysicalCommonExtra,
 
-    /// The append-only property of the PlanNode's output is a stream-only property. Append-only
+    /// The append-only property of the `PlanNode`'s output is a stream-only property. Append-only
     /// means the stream contains only insert operation.
     append_only: bool,
     /// Whether the output is emitted on window close.
     emit_on_window_close: bool,
-    /// The watermark column indices of the PlanNode's output. There could be watermark output from
+    /// The watermark column indices of the `PlanNode`'s output. There could be watermark output from
     /// this stream operator.
-    watermark_columns: FixedBitSet,
+    watermark_columns: WatermarkColumns,
+    /// The monotonicity of columns in the output.
+    columns_monotonicity: MonotonicityMap,
 }
 
 impl GetPhysicalCommon for StreamExtra {
@@ -80,7 +79,7 @@ pub struct BatchExtra {
     /// Common fields for physical plan nodes.
     physical: PhysicalCommonExtra,
 
-    /// The order property of the PlanNode's output, store an `&Order::any()` here will not affect
+    /// The order property of the `PlanNode`'s output, store an `&Order::any()` here will not affect
     /// correctness, but insert unnecessary sort in plan
     order: Order,
 }
@@ -117,7 +116,7 @@ pub struct PlanBase<C: ConventionMarker> {
     ctx: OptimizerContextRef,
 
     schema: Schema,
-    /// the pk indices of the PlanNode's output, a empty stream key vec means there is no stream key
+    /// the pk indices of the `PlanNode`'s output, a empty stream key vec means there is no stream key
     // TODO: this is actually a logical and stream only property.
     // - For logical nodes, this is `None` in most time expect for the phase after `logical_rewrite_for_stream`.
     // - For stream nodes, this is always `Some`.
@@ -168,8 +167,12 @@ impl stream::StreamPlanRef for PlanBase<Stream> {
         self.extra.emit_on_window_close
     }
 
-    fn watermark_columns(&self) -> &FixedBitSet {
+    fn watermark_columns(&self) -> &WatermarkColumns {
         &self.extra.watermark_columns
+    }
+
+    fn columns_monotonicity(&self) -> &MonotonicityMap {
+        &self.extra.columns_monotonicity
     }
 }
 
@@ -224,10 +227,10 @@ impl PlanBase<Stream> {
         dist: Distribution,
         append_only: bool,
         emit_on_window_close: bool,
-        watermark_columns: FixedBitSet,
+        watermark_columns: WatermarkColumns,
+        columns_monotonicity: MonotonicityMap,
     ) -> Self {
         let id = ctx.next_plan_node_id();
-        assert_eq!(watermark_columns.len(), schema.len());
         Self {
             id,
             ctx,
@@ -239,6 +242,7 @@ impl PlanBase<Stream> {
                 append_only,
                 emit_on_window_close,
                 watermark_columns,
+                columns_monotonicity,
             },
         }
     }
@@ -248,7 +252,8 @@ impl PlanBase<Stream> {
         dist: Distribution,
         append_only: bool,
         emit_on_window_close: bool,
-        watermark_columns: FixedBitSet,
+        watermark_columns: WatermarkColumns,
+        columns_monotonicity: MonotonicityMap,
     ) -> Self {
         Self::new_stream(
             core.ctx(),
@@ -259,6 +264,7 @@ impl PlanBase<Stream> {
             append_only,
             emit_on_window_close,
             watermark_columns,
+            columns_monotonicity,
         )
     }
 }
@@ -382,8 +388,12 @@ impl<'a> PlanBaseRef<'a> {
         dispatch_plan_base!(self, [Stream, Batch], PhysicalPlanRef::distribution)
     }
 
-    pub(super) fn watermark_columns(self) -> &'a FixedBitSet {
+    pub(super) fn watermark_columns(self) -> &'a WatermarkColumns {
         dispatch_plan_base!(self, [Stream], StreamPlanRef::watermark_columns)
+    }
+
+    pub(super) fn columns_monotonicity(self) -> &'a MonotonicityMap {
+        dispatch_plan_base!(self, [Stream], StreamPlanRef::columns_monotonicity)
     }
 
     pub(super) fn order(self) -> &'a Order {
@@ -428,8 +438,12 @@ impl StreamPlanRef for PlanBaseRef<'_> {
         dispatch_plan_base!(self, [Stream], StreamPlanRef::emit_on_window_close)
     }
 
-    fn watermark_columns(&self) -> &FixedBitSet {
+    fn watermark_columns(&self) -> &WatermarkColumns {
         (*self).watermark_columns()
+    }
+
+    fn columns_monotonicity(&self) -> &MonotonicityMap {
+        (*self).columns_monotonicity()
     }
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use super::{ExecuteContext, Task};
 use crate::MinioConfig;
+use crate::util::stylized_risedev_subcmd;
 
 pub struct MinioService {
     config: MinioConfig,
@@ -53,6 +54,17 @@ impl MinioService {
             // https://github.com/risingwavelabs/risingwave/pull/3012
             // https://docs.min.io/minio/baremetal/installation/deploy-minio-single-node-single-drive.html#id3
             .env("MINIO_CI_CD", "1");
+        if config.api_requests_max > 0 {
+            // Rate limit minio
+            cmd.env(
+                "MINIO_API_REQUESTS_MAX",
+                config.api_requests_max.to_string(),
+            );
+        }
+        if !config.api_requests_deadline.is_empty() {
+            // Rate limit minio
+            cmd.env("MINIO_API_REQUESTS_DEADLINE", &config.api_requests_deadline);
+        }
 
         let provide_prometheus = config.provide_prometheus.as_ref().unwrap();
         match provide_prometheus.len() {
@@ -65,7 +77,7 @@ impl MinioService {
                 );
             }
             other_length => {
-                return Err(anyhow!("expected 0 or 1 prometheus, get {}", other_length))
+                return Err(anyhow!("expected 0 or 1 prometheus, get {}", other_length));
             }
         }
 
@@ -80,7 +92,11 @@ impl Task for MinioService {
 
         let path = self.minio_path()?;
         if !path.exists() {
-            return Err(anyhow!("minio binary not found in {:?}\nDid you enable minio feature in `./risedev configure`?", path));
+            return Err(anyhow!(
+                "minio binary not found in {:?}\nDid you enable minio feature in `{}`?",
+                path,
+                stylized_risedev_subcmd("configure")
+            ));
         }
 
         let mut cmd = self.minio()?;

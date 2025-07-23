@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,9 @@
 
 use crate::expr::{ExprImpl, ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_expr_visitor::InputRefCounter;
-use crate::optimizer::plan_node::{generic, PlanTreeNodeUnary, StreamProject};
-use crate::optimizer::{BoxedRule, PlanRef, Rule};
+use crate::optimizer::plan_node::{PlanTreeNodeUnary, StreamProject, generic};
+use crate::optimizer::rule::Rule;
+use crate::optimizer::{BoxedRule, PlanRef};
 use crate::utils::Substitute;
 
 /// Merge contiguous [`StreamProject`] nodes.
@@ -47,7 +48,15 @@ impl Rule for StreamProjectMergeRule {
             .map(|expr| subst.rewrite_expr(expr))
             .collect();
         let logical_project = generic::Project::new(exprs, inner_project.input());
-        Some(StreamProject::new(logical_project).into())
+
+        // If either of the projects has the hint, we should keep it.
+        let noop_update_hint = outer_project.noop_update_hint() || inner_project.noop_update_hint();
+
+        Some(
+            StreamProject::new(logical_project)
+                .with_noop_update_hint(noop_update_hint)
+                .into(),
+        )
     }
 }
 

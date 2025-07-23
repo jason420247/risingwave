@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use futures::future::BoxFuture;
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures::FutureExt;
+use futures::future::BoxFuture;
 #[cfg(target_os = "macos")]
 use libc::F_NOCACHE;
 use tempfile::TempDir;
@@ -84,7 +84,9 @@ fn gen_test_payload() -> Vec<u8> {
     ret
 }
 
-fn gen_tokio_files(path: &Path) -> impl IntoIterator<Item = impl Future<Output = tokio::fs::File>> {
+fn gen_tokio_files(
+    path: &Path,
+) -> impl IntoIterator<Item = impl Future<Output = tokio::fs::File> + use<>> + use<> {
     let path = path.to_path_buf();
     (0..BENCH_SIZE).map(move |i| {
         let file_path = path.join(format!("{}.txt", i));
@@ -94,6 +96,7 @@ fn gen_tokio_files(path: &Path) -> impl IntoIterator<Item = impl Future<Output =
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .custom_flags(F_NOCACHE)
                 .open(file_path)
                 .await
@@ -104,6 +107,7 @@ fn gen_tokio_files(path: &Path) -> impl IntoIterator<Item = impl Future<Output =
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(file_path)
                 .await
                 .unwrap();
@@ -197,7 +201,7 @@ fn criterion_tokio(c: &mut Criterion) {
     });
 }
 
-fn gen_std_files(path: &Path) -> impl IntoIterator<Item = std::fs::File> {
+fn gen_std_files(path: &Path) -> impl IntoIterator<Item = std::fs::File> + use<> {
     let path = path.to_path_buf();
     (0..BENCH_SIZE).map(move |i| {
         let file_path = path.join(format!("{}.txt", i));
@@ -215,6 +219,7 @@ fn gen_std_files(path: &Path) -> impl IntoIterator<Item = std::fs::File> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(file_path)
             .unwrap();
         ret

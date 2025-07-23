@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,57 +12,91 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::error::{ErrorCode, RwError};
-use thiserror::Error;
+use std::sync::Arc;
 
-#[derive(Error, Debug)]
-pub enum ConnectorError {
-    #[error("Parse error: {0}")]
-    Parse(&'static str),
+use risingwave_common::array::ArrayError;
+use risingwave_common::error::def_anyhow_newtype;
+use risingwave_pb::PbFieldNotFound;
+use risingwave_rpc_client::error::RpcError;
 
-    #[error("Invalid parameter {name}: {reason}")]
-    InvalidParam { name: &'static str, reason: String },
+use crate::enforce_secret::EnforceSecretError;
+use crate::parser::AccessError;
+use crate::schema::InvalidOptionError;
+use crate::schema::schema_registry::{ConcurrentRequestError, WireFormatError};
+use crate::sink::SinkError;
+use crate::source::mqtt::MqttError;
+use crate::source::nats::NatsJetStreamError;
 
-    #[error("Kafka error: {0}")]
-    Kafka(#[from] rdkafka::error::KafkaError),
+def_anyhow_newtype! {
+    pub ConnectorError,
 
-    #[error("Config error: {0}")]
-    Config(
-        #[source]
-        #[backtrace]
-        anyhow::Error,
-    ),
+    // Common errors
+    std::io::Error => transparent,
+    Arc<ConnectorError> => transparent,
 
-    #[error("Connection error: {0}")]
-    Connection(
-        #[source]
-        #[backtrace]
-        anyhow::Error,
-    ),
+    // Fine-grained connector errors
+    AccessError => transparent,
+    WireFormatError => transparent,
+    ConcurrentRequestError => transparent,
+    InvalidOptionError => transparent,
+    SinkError => transparent,
+    PbFieldNotFound => transparent,
 
-    #[error("MySQL error: {0}")]
-    MySql(#[from] mysql_async::Error),
+    // TODO(error-handling): Remove implicit contexts below and specify ad-hoc context for each conversion.
 
-    #[error("Postgres error: {0}")]
-    Postgres(#[from] tokio_postgres::Error),
+    // Parsing errors
+    url::ParseError => "failed to parse url",
+    serde_json::Error => "failed to parse json",
+    csv::Error => "failed to parse csv",
 
-    #[error("Pulsar error: {0}")]
-    Pulsar(
-        #[source]
-        #[backtrace]
-        anyhow::Error,
-    ),
+    uuid::Error => transparent, // believed to be self-explanatory
 
-    #[error(transparent)]
-    Internal(
-        #[from]
-        #[backtrace]
-        anyhow::Error,
-    ),
+    // Connector errors
+    opendal::Error => transparent, // believed to be self-explanatory
+    parquet::errors::ParquetError => transparent,
+    ArrayError => "Array error",
+    sqlx::Error => transparent, // believed to be self-explanatory
+    mysql_async::Error => "MySQL error",
+    tokio_postgres::Error => "Postgres error",
+    tiberius::error::Error => "Sql Server error",
+    apache_avro::Error => "Avro error",
+    rdkafka::error::KafkaError => "Kafka error",
+    pulsar::Error => "Pulsar error",
+
+    async_nats::jetstream::consumer::StreamError => "Nats error",
+    async_nats::jetstream::consumer::pull::MessagesError => "Nats error",
+    async_nats::jetstream::context::CreateStreamError => "Nats error",
+    async_nats::jetstream::stream::ConsumerError => "Nats error",
+    async_nats::error::Error<async_nats::jetstream::context::RequestErrorKind> => "Nats error",
+    NatsJetStreamError => "Nats error",
+
+    risingwave_common::error::IcebergError => "IcebergV2 error",
+    redis::RedisError => "Redis error",
+    risingwave_common::array::arrow::arrow_schema_iceberg::ArrowError => "Arrow error",
+    google_cloud_pubsub::client::google_cloud_auth::error::Error => "Google Cloud error",
+    rumqttc::tokio_rustls::rustls::Error => "TLS error",
+    rumqttc::v5::ClientError => "MQTT SDK error",
+    rumqttc::v5::OptionError => "MQTT Option error",
+    rumqttc::v5::ConnectionError => "MQTT Connection error",
+    MqttError => "MQTT Source error",
+    mongodb::error::Error => "Mongodb error",
+
+    openssl::error::ErrorStack => "OpenSSL error",
+    risingwave_common::secret::SecretError => "Secret error",
+    EnforceSecretError => transparent,
 }
 
-impl From<ConnectorError> for RwError {
-    fn from(s: ConnectorError) -> Self {
-        ErrorCode::ConnectorError(Box::new(s)).into()
+pub type ConnectorResult<T, E = ConnectorError> = std::result::Result<T, E>;
+
+impl From<ConnectorError> for RpcError {
+    fn from(value: ConnectorError) -> Self {
+        RpcError::Internal(value.0)
+    }
+}
+
+#[expect(clippy::disallowed_types)]
+impl From<iceberg::Error> for ConnectorError {
+    fn from(value: iceberg::Error) -> Self {
+        risingwave_common::error::IcebergError::from(value).into()
     }
 }

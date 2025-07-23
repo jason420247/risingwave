@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,18 @@ impl Row {
     pub fn values(&self) -> &[Option<Bytes>] {
         &self.0
     }
+
+    pub fn take(self) -> Vec<Option<Bytes>> {
+        self.0
+    }
+
+    pub fn project(&mut self, indices: &[usize]) -> Row {
+        let mut new_row = Vec::with_capacity(indices.len());
+        for i in indices {
+            new_row.push(self.0[*i].take());
+        }
+        Row(new_row)
+    }
 }
 
 impl Index<usize> for Row {
@@ -55,6 +67,7 @@ impl Index<usize> for Row {
     }
 }
 
+/// <https://www.postgresql.org/docs/current/protocol-overview.html#PROTOCOL-FORMAT-CODES>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Binary,
@@ -89,7 +102,7 @@ where
     default_format: Format,
 }
 
-impl<'a, 'b> FormatIterator<'a, 'b> {
+impl<'a> FormatIterator<'a, '_> {
     pub fn new(provided_formats: &'a [Format], actual_len: usize) -> Result<Self, String> {
         if !provided_formats.is_empty()
             && provided_formats.len() != 1

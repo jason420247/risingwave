@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use std::env;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use risingwave_common::array::{ListValue, StructValue};
 use risingwave_common::types::{
     DataType, Date, Datum, Interval, ScalarImpl, StructType, Time, Timestamp,
@@ -36,7 +36,7 @@ struct Case {
 impl Case {
     pub fn new(name: &str, ty: DataType, scalar: ScalarImpl) -> Self {
         Self {
-            name: name.to_string(),
+            name: name.to_owned(),
             ty,
             datum: Some(scalar),
         }
@@ -128,16 +128,16 @@ fn bench_encoding(c: &mut Criterion) {
         ),
     ];
 
-    let filter = env::var(ENV_CASE).unwrap_or_else(|_| "".to_string());
+    let filter = env::var(ENV_CASE).unwrap_or_else(|_| "".to_owned());
     let cases = cases
         .into_iter()
         .filter(|case| case.name.contains(&filter))
         .collect::<Vec<_>>();
     let bench_ser = !env::var(ENV_BENCH_SER)
-        .unwrap_or_else(|_| "1".to_string())
+        .unwrap_or_else(|_| "1".to_owned())
         .eq("0");
     let bench_de = !env::var(ENV_BENCH_DE)
-        .unwrap_or_else(|_| "1".to_string())
+        .unwrap_or_else(|_| "1".to_owned())
         .eq("0");
 
     if bench_ser {

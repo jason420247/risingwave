@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
 use std::ops::Bound::Unbounded;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::hummock::compactor::fast_compactor_runner::BlockStreamIterator;
 use crate::hummock::compactor::{SstableStreamIterator, TaskProgress};
 use crate::hummock::iterator::test_utils::{
-    gen_iterator_test_sstable_base, gen_iterator_test_sstable_info, iterator_test_bytes_key_of,
-    iterator_test_key_of, iterator_test_user_key_of, iterator_test_value_of, mock_sstable_store,
-    TEST_KEYS_COUNT,
+    TEST_KEYS_COUNT, gen_iterator_test_sstable_base, gen_iterator_test_sstable_info,
+    iterator_test_bytes_key_of, iterator_test_key_of, iterator_test_user_key_of,
+    iterator_test_value_of, mock_sstable_store,
 };
 use crate::hummock::iterator::{
-    BackwardConcatIterator, BackwardUserIterator, ConcatIterator, HummockIterator,
-    UnorderedMergeIteratorInner, UserIterator,
+    BackwardConcatIterator, BackwardUserIterator, ConcatIterator, HummockIterator, MergeIterator,
+    UserIterator,
 };
 use crate::hummock::sstable::SstableIteratorReadOptions;
 use crate::hummock::test_utils::{
@@ -41,7 +41,7 @@ use crate::monitor::StoreLocalStatistic;
 async fn test_failpoints_concat_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     let mem_read_err = "mem_read_err";
-    let sstable_store = mock_sstable_store();
+    let sstable_store = mock_sstable_store().await;
     let table0 = gen_iterator_test_sstable_info(
         0,
         default_builder_opt_for_test(),
@@ -101,7 +101,7 @@ async fn test_failpoints_concat_read_err() {
 async fn test_failpoints_backward_concat_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     let mem_read_err = "mem_read_err";
-    let sstable_store = mock_sstable_store();
+    let sstable_store = mock_sstable_store().await;
     let table0 = gen_iterator_test_sstable_info(
         0,
         default_builder_opt_for_test(),
@@ -157,8 +157,8 @@ async fn test_failpoints_backward_concat_read_err() {
 async fn test_failpoints_merge_invalid_key() {
     fail::cfg("disable_block_cache", "return").unwrap();
     let mem_read_err = "mem_read_err";
-    let sstable_store = mock_sstable_store();
-    let table0 = gen_iterator_test_sstable_base(
+    let sstable_store = mock_sstable_store().await;
+    let (table0, sstable_info_0) = gen_iterator_test_sstable_base(
         0,
         default_builder_opt_for_test(),
         |x| x,
@@ -166,7 +166,7 @@ async fn test_failpoints_merge_invalid_key() {
         200,
     )
     .await;
-    let table1 = gen_iterator_test_sstable_base(
+    let (table1, sstable_info_1) = gen_iterator_test_sstable_base(
         1,
         default_builder_opt_for_test(),
         |x| 200 + x,
@@ -174,14 +174,15 @@ async fn test_failpoints_merge_invalid_key() {
         200,
     )
     .await;
-    let tables = vec![table0, table1];
-    let mut mi = UnorderedMergeIteratorInner::new({
+    let tables = vec![(table0, sstable_info_0), (table1, sstable_info_1)];
+    let mut mi = MergeIterator::new({
         let mut iters = vec![];
-        for table in tables {
+        for (table, sstable_info) in tables {
             iters.push(SstableIterator::new(
                 table,
                 sstable_store.clone(),
                 Arc::new(SstableIteratorReadOptions::default()),
+                &sstable_info,
             ));
         }
         iters
@@ -205,8 +206,8 @@ async fn test_failpoints_merge_invalid_key() {
 async fn test_failpoints_backward_merge_invalid_key() {
     fail::cfg("disable_block_cache", "return").unwrap();
     let mem_read_err = "mem_read_err";
-    let sstable_store = mock_sstable_store();
-    let table0 = gen_iterator_test_sstable_base(
+    let sstable_store = mock_sstable_store().await;
+    let (table0, sstable_info_0) = gen_iterator_test_sstable_base(
         0,
         default_builder_opt_for_test(),
         |x| x,
@@ -214,7 +215,7 @@ async fn test_failpoints_backward_merge_invalid_key() {
         200,
     )
     .await;
-    let table1 = gen_iterator_test_sstable_base(
+    let (table1, sstable_info_1) = gen_iterator_test_sstable_base(
         1,
         default_builder_opt_for_test(),
         |x| 200 + x,
@@ -222,11 +223,15 @@ async fn test_failpoints_backward_merge_invalid_key() {
         200,
     )
     .await;
-    let tables = vec![table0, table1];
-    let mut mi = UnorderedMergeIteratorInner::new({
+    let tables = vec![(table0, sstable_info_0), (table1, sstable_info_1)];
+    let mut mi = MergeIterator::new({
         let mut iters = vec![];
-        for table in tables {
-            iters.push(BackwardSstableIterator::new(table, sstable_store.clone()));
+        for (table, sstable_info) in tables {
+            iters.push(BackwardSstableIterator::new(
+                table,
+                sstable_store.clone(),
+                &sstable_info,
+            ));
         }
         iters
     });
@@ -249,8 +254,8 @@ async fn test_failpoints_backward_merge_invalid_key() {
 async fn test_failpoints_user_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     let mem_read_err = "mem_read_err";
-    let sstable_store = mock_sstable_store();
-    let table0 = gen_iterator_test_sstable_base(
+    let sstable_store = mock_sstable_store().await;
+    let (table0, sstable_info_0) = gen_iterator_test_sstable_base(
         0,
         default_builder_opt_for_test(),
         |x| x,
@@ -258,7 +263,7 @@ async fn test_failpoints_user_read_err() {
         200,
     )
     .await;
-    let table1 = gen_iterator_test_sstable_base(
+    let (table1, sstable_info_1) = gen_iterator_test_sstable_base(
         1,
         default_builder_opt_for_test(),
         |x| 200 + x,
@@ -271,15 +276,17 @@ async fn test_failpoints_user_read_err() {
             table0,
             sstable_store.clone(),
             Arc::new(SstableIteratorReadOptions::default()),
+            &sstable_info_0,
         ),
         SstableIterator::new(
             table1,
             sstable_store.clone(),
             Arc::new(SstableIteratorReadOptions::default()),
+            &sstable_info_1,
         ),
     ];
 
-    let mi = UnorderedMergeIteratorInner::new(iters);
+    let mi = MergeIterator::new(iters);
     let mut ui = UserIterator::for_test(mi, (Unbounded, Unbounded));
     ui.rewind().await.unwrap();
 
@@ -288,7 +295,7 @@ async fn test_failpoints_user_read_err() {
     while ui.is_valid() {
         let key = ui.key();
         let val = ui.value();
-        assert_eq!(key, &iterator_test_bytes_key_of(i));
+        assert_eq!(key, iterator_test_bytes_key_of(i).to_ref());
         assert_eq!(val, iterator_test_value_of(i).as_slice());
         i += 1;
         let result = ui.next().await;
@@ -309,8 +316,8 @@ async fn test_failpoints_user_read_err() {
 async fn test_failpoints_backward_user_read_err() {
     fail::cfg("disable_block_cache", "return").unwrap();
     let mem_read_err = "mem_read_err";
-    let sstable_store = mock_sstable_store();
-    let table0 = gen_iterator_test_sstable_base(
+    let sstable_store = mock_sstable_store().await;
+    let (table0, sstable_info_0) = gen_iterator_test_sstable_base(
         0,
         default_builder_opt_for_test(),
         |x| x,
@@ -318,7 +325,7 @@ async fn test_failpoints_backward_user_read_err() {
         200,
     )
     .await;
-    let table1 = gen_iterator_test_sstable_base(
+    let (table1, sstable_info_1) = gen_iterator_test_sstable_base(
         1,
         default_builder_opt_for_test(),
         |x| 200 + x,
@@ -327,11 +334,11 @@ async fn test_failpoints_backward_user_read_err() {
     )
     .await;
     let iters = vec![
-        BackwardSstableIterator::new(table0, sstable_store.clone()),
-        BackwardSstableIterator::new(table1, sstable_store.clone()),
+        BackwardSstableIterator::new(table0, sstable_store.clone(), &sstable_info_0),
+        BackwardSstableIterator::new(table1, sstable_store.clone(), &sstable_info_1),
     ];
 
-    let mi = UnorderedMergeIteratorInner::new(iters);
+    let mi = MergeIterator::new(iters);
     let mut ui = BackwardUserIterator::for_test(mi, (Unbounded, Unbounded));
     ui.rewind().await.unwrap();
 
@@ -341,7 +348,7 @@ async fn test_failpoints_backward_user_read_err() {
         i -= 1;
         let key = ui.key();
         let val = ui.value();
-        assert_eq!(key, &iterator_test_bytes_key_of(i));
+        assert_eq!(key, iterator_test_bytes_key_of(i).to_ref());
         assert_eq!(val, iterator_test_value_of(i).as_slice());
         let result = ui.next().await;
         if result.is_err() {
@@ -362,7 +369,7 @@ async fn test_failpoints_compactor_iterator_recreate() {
     let get_stream_err = "get_stream_err";
     let stream_read_err = "stream_read_err";
     let create_stream_err = "create_stream_err";
-    let sstable_store = mock_sstable_store();
+    let sstable_store = mock_sstable_store().await;
     // when upload data is successful, but upload meta is fail and delete is fail
     let has_create = Arc::new(AtomicBool::new(false));
     fail::cfg_callback(get_stream_err, move || {
@@ -392,6 +399,7 @@ async fn test_failpoints_compactor_iterator_recreate() {
         meta.clone(),
         sstable_store.clone(),
         default_writer_opt_for_test(),
+        vec![table_id as u32],
     )
     .await
     .unwrap();
@@ -400,10 +408,8 @@ async fn test_failpoints_compactor_iterator_recreate() {
 
     let table = sstable_store.sstable(&info, &mut stats).await.unwrap();
     let mut sstable_iter = SstableStreamIterator::new(
-        table.value().meta.block_metas.clone(),
+        table.meta.block_metas.clone(),
         info,
-        HashSet::from_iter(std::iter::once(0)),
-        0,
         &stats,
         Arc::new(TaskProgress::default()),
         sstable_store,
@@ -420,6 +426,86 @@ async fn test_failpoints_compactor_iterator_recreate() {
         assert_eq!(value.into_user_value().unwrap(), expected_slice);
         cnt += 1;
         sstable_iter.next().await.unwrap();
+    }
+    assert_eq!(cnt, TEST_KEYS_COUNT);
+    assert!(meet_err.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn test_failpoints_fast_compactor_iterator_recreate() {
+    let get_stream_err = "get_stream_err";
+    let stream_read_err = "stream_read_err";
+    let create_stream_err = "create_stream_err";
+    let sstable_store = mock_sstable_store().await;
+    // when upload data is successful, but upload meta is fail and delete is fail
+    let has_create = Arc::new(AtomicBool::new(false));
+    fail::cfg_callback(get_stream_err, move || {
+        if has_create.load(Ordering::Acquire) {
+            fail::remove(stream_read_err);
+            fail::remove(get_stream_err);
+        } else {
+            has_create.store(true, Ordering::Release);
+            fail::cfg(stream_read_err, "return").unwrap();
+        }
+    })
+    .unwrap();
+    let meet_err = Arc::new(AtomicBool::new(false));
+    let other = meet_err.clone();
+    fail::cfg_callback(create_stream_err, move || {
+        other.store(true, Ordering::Release);
+    })
+    .unwrap();
+
+    let table_id = 0;
+    let kv_iter =
+        (0..TEST_KEYS_COUNT).map(|i| (test_key_of(i), HummockValue::put(test_value_of(i))));
+    let (data, meta) = gen_test_sstable_data(default_builder_opt_for_test(), kv_iter).await;
+    let info = put_sst(
+        table_id,
+        data.clone(),
+        meta.clone(),
+        sstable_store.clone(),
+        default_writer_opt_for_test(),
+        vec![table_id as u32],
+    )
+    .await
+    .unwrap();
+
+    let mut stats = StoreLocalStatistic::default();
+
+    let table = sstable_store.sstable(&info, &mut stats).await.unwrap();
+    let mut sstable_iter = BlockStreamIterator::new(
+        table,
+        Arc::new(TaskProgress::default()),
+        sstable_store.clone(),
+        info.clone(),
+        10,
+        Arc::new(AtomicU64::new(0)),
+    );
+
+    let mut cnt = 0;
+    while sstable_iter.is_valid() {
+        let (buf, _, meta) = match sstable_iter.download_next_block().await.unwrap() {
+            Some(x) => x,
+            None => break,
+        };
+        sstable_iter
+            .init_block_iter(buf, meta.uncompressed_size as usize)
+            .unwrap();
+
+        let block_iter = sstable_iter.iter_mut();
+
+        while block_iter.is_valid() {
+            let key = block_iter.key();
+            let value = HummockValue::from_slice(block_iter.value()).unwrap();
+            assert_eq!(test_key_of(cnt).to_ref(), key);
+            let expected = test_value_of(cnt);
+            let expected_slice = expected.as_slice();
+            assert_eq!(value.into_user_value().unwrap(), expected_slice);
+            cnt += 1;
+            block_iter.next();
+        }
     }
     assert_eq!(cnt, TEST_KEYS_COUNT);
     assert!(meet_err.load(Ordering::Acquire));

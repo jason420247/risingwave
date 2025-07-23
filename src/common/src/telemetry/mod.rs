@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,33 +13,63 @@
 // limitations under the License.
 
 pub mod manager;
+pub mod pb_compatible;
 pub mod report;
 
-use std::time::SystemTime;
+use std::env;
 
+use risingwave_pb::telemetry::PbTelemetryClusterType;
+pub use risingwave_telemetry_event::{
+    TelemetryError, TelemetryResult, current_timestamp, post_telemetry_report_pb,
+    report_event_common, request_to_telemetry_event,
+};
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
-use thiserror_ext::AsReport;
 
+use crate::RW_VERSION;
 use crate::util::env_var::env_var_is_true_or;
 use crate::util::resource_util::cpu::total_cpu_available;
 use crate::util::resource_util::memory::{system_memory_available_bytes, total_memory_used_bytes};
 
-/// Url of telemetry backend
-pub const TELEMETRY_REPORT_URL: &str = "https://telemetry.risingwave.dev/api/v1/report";
+type Result<T> = core::result::Result<T, TelemetryError>;
 
+pub const TELEMETRY_CLUSTER_TYPE: &str = "RW_TELEMETRY_TYPE";
+pub const TELEMETRY_CLUSTER_TYPE_HOSTED: &str = "hosted"; // hosted on RisingWave Cloud
+pub const TELEMETRY_CLUSTER_TYPE_KUBERNETES: &str = "kubernetes";
+pub const TELEMETRY_CLUSTER_TYPE_SINGLE_NODE: &str = "single-node";
+pub const TELEMETRY_CLUSTER_TYPE_DOCKER_COMPOSE: &str = "docker-compose";
+const TELEMETRY_CLUSTER_TYPE_TEST: &str = "test";
+pub use risingwave_telemetry_event::{
+    TELEMETRY_RISINGWAVE_CLOUD_UUID, get_telemetry_risingwave_cloud_uuid,
+};
+
+pub fn telemetry_cluster_type_from_env_var() -> TelemetryResult<PbTelemetryClusterType> {
+    let cluster_type = match env::var(TELEMETRY_CLUSTER_TYPE) {
+        Ok(cluster_type) => cluster_type,
+        Err(_) => return Ok(PbTelemetryClusterType::Unspecified),
+    };
+    match cluster_type.as_str() {
+        TELEMETRY_CLUSTER_TYPE_HOSTED => Ok(PbTelemetryClusterType::CloudHosted),
+        TELEMETRY_CLUSTER_TYPE_DOCKER_COMPOSE => Ok(PbTelemetryClusterType::DockerCompose),
+        TELEMETRY_CLUSTER_TYPE_KUBERNETES => Ok(PbTelemetryClusterType::Kubernetes),
+        TELEMETRY_CLUSTER_TYPE_SINGLE_NODE => Ok(PbTelemetryClusterType::SingleNode),
+
+        // block the report if the cluster is in test env
+        // but it only blocks the report from meta node, not other nodes
+        TELEMETRY_CLUSTER_TYPE_TEST => Err(TelemetryError::from(
+            "test cluster type should not send telemetry report",
+        )),
+        _ => Err(TelemetryError::from("invalid cluster type")),
+    }
+}
+
+/// Url of telemetry backend
+pub use risingwave_telemetry_event::TELEMETRY_REPORT_URL;
 /// Telemetry reporting interval in seconds, 6 hours
 pub const TELEMETRY_REPORT_INTERVAL: u64 = 6 * 60 * 60;
 
 /// Environment Variable that is default to be true
 const TELEMETRY_ENV_ENABLE: &str = "ENABLE_TELEMETRY";
-
-pub type TelemetryResult<T> = core::result::Result<T, TelemetryError>;
-
-/// Telemetry errors are generally recoverable/ignorable. `String` is good enough.
-pub type TelemetryError = String;
-
-type Result<T> = core::result::Result<T, TelemetryError>;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TelemetryNodeType {
@@ -51,18 +81,21 @@ pub enum TelemetryNodeType {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TelemetryReportBase {
-    /// tracking_id is persistent in etcd
+    /// `tracking_id` is persistent in metastore
     pub tracking_id: String,
-    /// session_id is reset every time node restarts
+    /// `session_id` is reset every time node restarts
     pub session_id: String,
-    /// system_data is hardware and os info
+    /// `system_data` is hardware and os info
     pub system_data: SystemData,
-    /// up_time is how long the node has been running
+    /// `up_time` is how long the node has been running
     pub up_time: u64,
-    /// time_stamp is when the report is created
+    /// `time_stamp` is when the report is created
     pub time_stamp: u64,
-    /// node_type is the node that creates the report
+    /// `node_type` is the node that creates the report
     pub node_type: TelemetryNodeType,
+    /// `is_test` is whether the report is from a test environment, default to be false
+    /// needed in CI for compatible tests with telemetry backend
+    pub is_test: bool,
 }
 
 pub trait TelemetryReport: Serialize {}
@@ -121,43 +154,60 @@ impl Default for SystemData {
     }
 }
 
-/// Sends a `POST` request of the telemetry reporting to a URL.
-async fn post_telemetry_report(url: &str, report_body: String) -> Result<()> {
-    let client = reqwest::Client::new();
-    let res = client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(report_body)
-        .send()
-        .await
-        .map_err(|err| format!("failed to send telemetry report, err: {}", err.as_report()))?;
-    if res.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "telemetry response is error, url {}, status {}",
-            url,
-            res.status()
-        ))
-    }
-}
-
 /// check whether telemetry is enabled in environment variable
 pub fn telemetry_env_enabled() -> bool {
     // default to be true
     env_var_is_true_or(TELEMETRY_ENV_ENABLE, true)
 }
 
-pub fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("Clock might go backward")
-        .as_secs()
+pub fn report_scarf_enabled() -> bool {
+    telemetry_env_enabled()
+        && !matches!(
+            telemetry_cluster_type_from_env_var(),
+            Ok(PbTelemetryClusterType::CloudHosted)
+        )
+}
+
+// impl logic to report to Scarf service, containing RW version and deployment platform
+pub async fn report_to_scarf() {
+    let request_url = format!(
+        "https://risingwave.gateway.scarf.sh/telemetry/{}/{}",
+        RW_VERSION,
+        System::name().unwrap_or_default()
+    );
+    // keep trying every 1h until success
+    loop {
+        let res = reqwest::get(&request_url).await;
+        if let Ok(res) = res
+            && res.status().is_success()
+        {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_enable_scarf() {
+        unsafe { std::env::set_var(TELEMETRY_ENV_ENABLE, "true") };
+
+        // setting env var to `Hosted` should disable scarf
+        unsafe { std::env::set_var(TELEMETRY_CLUSTER_TYPE, TELEMETRY_CLUSTER_TYPE_HOSTED) };
+        assert!(!report_scarf_enabled());
+
+        // setting env var to `DockerCompose` should enable scarf
+        unsafe {
+            std::env::set_var(
+                TELEMETRY_CLUSTER_TYPE,
+                TELEMETRY_CLUSTER_TYPE_DOCKER_COMPOSE,
+            )
+        };
+        assert!(report_scarf_enabled());
+    }
 
     #[test]
     fn test_system_data_new() {
@@ -183,25 +233,25 @@ mod tests {
             !is_enabled()
         }
 
-        std::env::set_var(key, "true");
+        unsafe { std::env::set_var(key, "true") };
         assert!(is_enabled());
 
-        std::env::set_var(key, "false");
+        unsafe { std::env::set_var(key, "false") };
         assert!(is_not_enabled());
 
-        std::env::set_var(key, "tRue");
+        unsafe { std::env::set_var(key, "tRue") };
         assert!(is_enabled());
 
-        std::env::set_var(key, "2");
+        unsafe { std::env::set_var(key, "2") };
         assert!(is_not_enabled());
 
-        std::env::set_var(key, "1");
+        unsafe { std::env::set_var(key, "1") };
         assert!(is_enabled());
 
-        std::env::set_var(key, "not_a_bool");
+        unsafe { std::env::set_var(key, "not_a_bool") };
         assert!(is_not_enabled());
 
-        std::env::remove_var(key);
+        unsafe { std::env::remove_var(key) };
         assert!(is_enabled());
     }
 }

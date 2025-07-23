@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,8 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 mod block;
 
-use std::fmt::{Debug, Display, Formatter};
+use std::collections::HashSet;
+use std::fmt::{Debug, Formatter};
 use std::ops::{BitXor, Bound, Range};
 
 pub use block::*;
@@ -26,8 +27,9 @@ pub use block_iterator::*;
 mod bloom;
 mod xor_filter;
 pub use bloom::BloomFilterBuilder;
+use serde::{Deserialize, Serialize};
 pub use xor_filter::{
-    BlockedXor16FilterBuilder, Xor16FilterBuilder, Xor8FilterBuilder, XorFilterReader,
+    BlockedXor16FilterBuilder, Xor8FilterBuilder, Xor16FilterBuilder, XorFilterReader,
 };
 pub mod builder;
 pub use builder::*;
@@ -38,29 +40,20 @@ mod forward_sstable_iterator;
 pub mod multi_builder;
 use bytes::{Buf, BufMut};
 pub use forward_sstable_iterator::*;
+use tracing::warn;
 mod backward_sstable_iterator;
 pub use backward_sstable_iterator::*;
-use risingwave_hummock_sdk::key::{
-    FullKey, KeyPayloadType, PointRange, TableKey, UserKey, UserKeyRangeRef,
-};
+use risingwave_hummock_sdk::key::{FullKey, KeyPayloadType, UserKey, UserKeyRangeRef};
 use risingwave_hummock_sdk::{HummockEpoch, HummockSstableObjectId};
 
-mod delete_range_aggregator;
 mod filter;
-mod sstable_object_id_manager;
 mod utils;
 
-pub use delete_range_aggregator::{
-    get_min_delete_range_epoch_from_sstable, CompactionDeleteRangeIterator,
-    SstableDeleteRangeIterator,
-};
 pub use filter::FilterBuilder;
-pub use sstable_object_id_manager::*;
-pub use utils::CompressionAlgorithm;
+pub use utils::{CompressionAlgorithm, xxhash64_checksum, xxhash64_verify};
 use utils::{get_length_prefixed_slice, put_length_prefixed_slice};
 use xxhash_rust::{xxh32, xxh64};
 
-use self::utils::{xxhash64_checksum, xxhash64_verify};
 use super::{HummockError, HummockResult};
 use crate::hummock::CachePolicy;
 use crate::store::ReadOptions;
@@ -68,69 +61,6 @@ use crate::store::ReadOptions;
 const MAGIC: u32 = 0x5785ab73;
 const OLD_VERSION: u32 = 1;
 const VERSION: u32 = 2;
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-// delete keys located in [start_user_key, end_user_key)
-pub struct DeleteRangeTombstone {
-    pub start_user_key: PointRange<Vec<u8>>,
-    pub end_user_key: PointRange<Vec<u8>>,
-    pub sequence: HummockEpoch,
-}
-
-impl PartialOrd for DeleteRangeTombstone {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DeleteRangeTombstone {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.start_user_key
-            .cmp(&other.start_user_key)
-            .then_with(|| self.end_user_key.cmp(&other.end_user_key))
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-impl DeleteRangeTombstone {
-    pub fn new(
-        table_id: TableId,
-        start_table_key: Vec<u8>,
-        is_left_open: bool,
-        end_table_key: Vec<u8>,
-        is_right_close: bool,
-        sequence: HummockEpoch,
-    ) -> Self {
-        Self {
-            start_user_key: PointRange::from_user_key(
-                UserKey::new(table_id, TableKey(start_table_key)),
-                is_left_open,
-            ),
-            end_user_key: PointRange::from_user_key(
-                UserKey::new(table_id, TableKey(end_table_key)),
-                is_right_close,
-            ),
-            sequence,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn new_for_test(
-        table_id: TableId,
-        start_table_key: Vec<u8>,
-        end_table_key: Vec<u8>,
-        sequence: HummockEpoch,
-    ) -> Self {
-        Self::new(
-            table_id,
-            start_table_key,
-            false,
-            end_table_key,
-            false,
-            sequence,
-        )
-    }
-}
 
 /// Assume that watermark1 is 5, watermark2 is 7, watermark3 is 11, delete ranges
 /// `{ [0, wmk1) in epoch1, [wmk1, wmk2) in epoch2, [wmk2, wmk3) in epoch3 }`
@@ -145,24 +75,14 @@ impl DeleteRangeTombstone {
 /// next event key wmk2 (7) (not inclusive).
 /// If there is no range deletes between current event key and next event key, `new_epoch` will be
 /// `HummockEpoch::MAX`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MonotonicDeleteEvent {
-    pub event_key: PointRange<Vec<u8>>,
+    pub event_key:
+        risingwave_hummock_sdk::key::range_delete_backward_compatibility_serde_struct::PointRange,
     pub new_epoch: HummockEpoch,
 }
 
 impl MonotonicDeleteEvent {
-    #[cfg(test)]
-    pub fn new(table_id: TableId, event_key: Vec<u8>, new_epoch: HummockEpoch) -> Self {
-        Self {
-            event_key: PointRange::from_user_key(
-                UserKey::new(table_id, TableKey(event_key)),
-                false,
-            ),
-            new_epoch,
-        }
-    }
-
     pub fn encode(&self, mut buf: impl BufMut) {
         self.event_key
             .left_user_key
@@ -176,6 +96,7 @@ impl MonotonicDeleteEvent {
     }
 
     pub fn decode(buf: &mut &[u8]) -> Self {
+        use risingwave_hummock_sdk::key::range_delete_backward_compatibility_serde_struct::*;
         let user_key = UserKey::decode_length_prefixed(buf);
         let exclude_left_key_flag = buf.get_u8();
         let is_exclude_left_key = match exclude_left_key_flag {
@@ -185,33 +106,34 @@ impl MonotonicDeleteEvent {
         };
         let new_epoch = buf.get_u64_le();
         Self {
-            event_key: PointRange::from_user_key(user_key, is_exclude_left_key),
+            event_key: PointRange {
+                left_user_key: user_key,
+                is_exclude_left_key,
+            },
             new_epoch,
         }
     }
-
-    #[inline]
-    pub fn encoded_size(&self) -> usize {
-        // length prefixed requires 4B more than its `encoded_len()`
-        4 + self.event_key.left_user_key.encoded_len() + 1 + 8
-    }
 }
 
-impl Display for MonotonicDeleteEvent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Event key {:?} epoch {:?}",
-            self.event_key, self.new_epoch
-        )
+#[derive(Serialize, Deserialize)]
+struct SerdeSstable {
+    id: HummockSstableObjectId,
+    meta: SstableMeta,
+}
+
+impl From<SerdeSstable> for Sstable {
+    fn from(SerdeSstable { id, meta }: SerdeSstable) -> Self {
+        Sstable::new(id, meta)
     }
 }
 
 /// [`Sstable`] is a handle for accessing SST.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "SerdeSstable")]
 pub struct Sstable {
     pub id: HummockSstableObjectId,
     pub meta: SstableMeta,
+    #[serde(skip)]
     pub filter_reader: XorFilterReader,
 }
 
@@ -278,7 +200,7 @@ impl Sstable {
     }
 }
 
-#[derive(Clone, Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockMeta {
     pub smallest_key: Vec<u8>,
     pub offset: u32,
@@ -348,7 +270,7 @@ impl BlockMeta {
     }
 }
 
-#[derive(Default, Clone, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SstableMeta {
     pub block_metas: Vec<BlockMeta>,
     pub bloom_filter: Vec<u8>,
@@ -370,6 +292,7 @@ pub struct SstableMeta {
     /// key wmk1 (5) and till the next event key wmk2 (7) (not inclusive).
     /// If there is no range deletes between current event key and next event key, `new_epoch` will
     /// be `HummockEpoch::MAX`.
+    #[deprecated]
     pub monotonic_tombstone_events: Vec<MonotonicDeleteEvent>,
     /// Format version, for further compatibility.
     pub version: u32,
@@ -418,6 +341,7 @@ impl SstableMeta {
         buf.put_u32_le(self.key_count);
         put_length_prefixed_slice(&mut buf, &self.smallest_key);
         put_length_prefixed_slice(&mut buf, &self.largest_key);
+        #[expect(deprecated)]
         buf.put_u32_le(
             utils::checked_into_u32(self.monotonic_tombstone_events.len()).unwrap_or_else(|_| {
                 let tmp_full_key = FullKey::decode(&self.smallest_key);
@@ -428,6 +352,7 @@ impl SstableMeta {
                 )
             }),
         );
+        #[expect(deprecated)]
         for monotonic_tombstone_event in &self.monotonic_tombstone_events {
             monotonic_tombstone_event.encode(&mut buf);
         }
@@ -486,6 +411,17 @@ impl SstableMeta {
         }
         let meta_offset = buf.get_u64_le();
 
+        if !monotonic_tombstone_events.is_empty() {
+            warn!(
+                count = monotonic_tombstone_events.len(),
+                tables = ?monotonic_tombstone_events
+                    .iter()
+                    .map(|event| event.event_key.left_user_key.table_id)
+                    .collect::<HashSet<_>>(),
+                "read non-empty range tombstones");
+        }
+
+        #[expect(deprecated)]
         Ok(Self {
             block_metas,
             bloom_filter,
@@ -508,11 +444,6 @@ impl SstableMeta {
             .map(|block_meta| block_meta.encoded_size())
             .sum::<usize>()
             + 4 // monotonic tombstone events len
-            + self
-            .monotonic_tombstone_events
-            .iter()
-            .map(|event| event.encoded_size())
-            .sum::<usize>()
             + 4 // bloom filter len
             + self.bloom_filter.len()
             + 4 // estimated size
@@ -550,9 +481,15 @@ impl SstableIteratorReadOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hummock::HummockValue;
+    use crate::hummock::iterator::test_utils::{
+        default_builder_opt_for_test, iterator_test_key_of,
+    };
+    use crate::hummock::test_utils::gen_test_sstable_data;
 
     #[test]
-    pub fn test_sstable_meta_enc_dec() {
+    fn test_sstable_meta_enc_dec() {
+        #[expect(deprecated)]
         let meta = SstableMeta {
             block_metas: vec![
                 BlockMeta {
@@ -581,5 +518,29 @@ mod tests {
         assert_eq!(sz, buf.len());
         let decoded_meta = SstableMeta::decode(&buf[..]).unwrap();
         assert_eq!(decoded_meta, meta);
+
+        println!("buf: {}", buf.len());
+    }
+
+    #[tokio::test]
+    async fn test_sstable_serde() {
+        let (_, meta) = gen_test_sstable_data(
+            default_builder_opt_for_test(),
+            (0..100).clone().map(|x| {
+                (
+                    iterator_test_key_of(x),
+                    HummockValue::put(format!("overlapped_new_{}", x).as_bytes().to_vec()),
+                )
+            }),
+        )
+        .await;
+
+        let buffer = bincode::serialize(&meta).unwrap();
+
+        let m: SstableMeta = bincode::deserialize(&buffer).unwrap();
+
+        assert_eq!(meta, m);
+
+        println!("{} vs {}", buffer.len(), meta.encoded_size());
     }
 }

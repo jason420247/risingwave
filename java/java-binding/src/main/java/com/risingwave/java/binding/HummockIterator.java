@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,16 @@ public class HummockIterator implements AutoCloseable {
     private final long pointer;
     private boolean isClosed;
 
+    static {
+        Binding.ensureInitialized();
+    }
+
+    // hummock iterator method
+    // Return a pointer to the iterator
+    private static native long iteratorNewHummock(byte[] readPlan);
+
     public HummockIterator(ReadPlan readPlan) {
-        this.pointer = Binding.iteratorNewHummock(readPlan.toByteArray());
+        this.pointer = iteratorNewHummock(readPlan.toByteArray());
         this.isClosed = false;
     }
 

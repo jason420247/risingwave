@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,9 +24,7 @@ import com.risingwave.proto.Data.DataType;
 import com.risingwave.proto.Data.DataType.TypeName;
 import io.grpc.Status;
 import java.nio.ByteBuffer;
-import java.sql.Date;
-import java.sql.Time;
-import java.sql.Timestamp;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -52,7 +50,10 @@ public class CassandraUtil {
             case DECIMAL:
                 return com.datastax.oss.protocol.internal.ProtocolConstants.DataType.DECIMAL;
             case TIMESTAMP:
-                return com.datastax.oss.protocol.internal.ProtocolConstants.DataType.TIMESTAMP;
+                throw Status.INVALID_ARGUMENT
+                        .withDescription(
+                                "cassandra does not have a type corresponding to naive timestamp")
+                        .asRuntimeException();
             case TIMESTAMPTZ:
                 return com.datastax.oss.protocol.internal.ProtocolConstants.DataType.TIMESTAMP;
             case DATE:
@@ -78,9 +79,10 @@ public class CassandraUtil {
     public static void checkSchema(
             List<ColumnDesc> columnDescs,
             Map<CqlIdentifier, ColumnMetadata> cassandraColumnDescMap) {
-        if (columnDescs.size() != cassandraColumnDescMap.size()) {
+        if (columnDescs.size() > cassandraColumnDescMap.size()) {
             throw Status.FAILED_PRECONDITION
-                    .withDescription("Don't match in the number of columns in the table")
+                    .withDescription(
+                            "The columns of the sink must be equal to or a superset of the target table's columns.")
                     .asRuntimeException();
         }
         for (ColumnDesc columnDesc : columnDescs) {
@@ -89,7 +91,7 @@ public class CassandraUtil {
                 throw Status.FAILED_PRECONDITION
                         .withDescription(
                                 String.format(
-                                        "Don't match in the name, rw is %s cassandra can't find it",
+                                        "Name mismatch. Column `%s` on RisingWave side is not found on Cassandra side.",
                                         columnDesc.getName()))
                         .asRuntimeException();
             }
@@ -98,7 +100,7 @@ public class CassandraUtil {
                 throw Status.FAILED_PRECONDITION
                         .withDescription(
                                 String.format(
-                                        "Don't match in the type, name is %s, cassandra is %s, rw is %s",
+                                        "Data type mismatch for column `%s`. Cassandra side: `%s`, RisingWave side: `%s`.",
                                         columnDesc.getName(),
                                         cassandraColumnDescMap.get(cql),
                                         columnDesc.getDataType().getTypeName()))
@@ -111,7 +113,7 @@ public class CassandraUtil {
             List<ColumnMetadata> cassandraColumnMetadatas, List<String> columnMetadatas) {
         if (cassandraColumnMetadatas.size() != columnMetadatas.size()) {
             throw Status.FAILED_PRECONDITION
-                    .withDescription("Primary key len don't match")
+                    .withDescription("Primary key length mismatch.")
                     .asRuntimeException();
         }
         Set<String> cassandraColumnsSet =
@@ -123,7 +125,7 @@ public class CassandraUtil {
                 throw Status.FAILED_PRECONDITION
                         .withDescription(
                                 String.format(
-                                        "Primary key don't match. RisingWave Primary key is %s, don't find it in cassandra",
+                                        "Primary key mismatch. Primary key `%s` on RisingWave side is not found on Cassandra side",
                                         columnMetadata))
                         .asRuntimeException();
             }
@@ -140,14 +142,16 @@ public class CassandraUtil {
             case BOOLEAN:
             case VARCHAR:
             case DECIMAL:
+            case DATE:
+            case TIME:
                 return value;
             case TIMESTAMP:
+                throw Status.INVALID_ARGUMENT
+                        .withDescription(
+                                "cassandra does not have a type corresponding to naive timestamp")
+                        .asRuntimeException();
             case TIMESTAMPTZ:
-                return ((Timestamp) value).toInstant();
-            case DATE:
-                return ((Date) value).toLocalDate();
-            case TIME:
-                return ((Time) value).toLocalTime();
+                return ((OffsetDateTime) value).toInstant();
             case INTERVAL:
                 return CqlDuration.from((String) value);
             case BYTEA:
@@ -162,5 +166,9 @@ public class CassandraUtil {
                         .withDescription("unspecified type" + typeName)
                         .asRuntimeException();
         }
+    }
+
+    public static String convertCQLIdentifiers(String identifier) {
+        return "\"" + identifier + "\"";
     }
 }

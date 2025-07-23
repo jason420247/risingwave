@@ -30,7 +30,7 @@ pub struct Query {
     /// ORDER BY
     pub order_by: Vec<OrderByExpr>,
     /// `LIMIT { <N> | ALL }`
-    pub limit: Option<String>,
+    pub limit: Option<Expr>,
     /// `OFFSET <N> [ { ROW | ROWS } ]`
     ///
     /// `ROW` and `ROWS` are noise words that don't influence the effect of the clause.
@@ -97,6 +97,7 @@ pub enum SetExpr {
     SetOperation {
         op: SetOperator,
         all: bool,
+        corresponding: Corresponding,
         left: Box<SetExpr>,
         right: Box<SetExpr>,
     },
@@ -114,15 +115,16 @@ impl fmt::Display for SetExpr {
                 right,
                 op,
                 all,
+                corresponding,
             } => {
                 let all_str = if *all { " ALL" } else { "" };
-                write!(f, "{} {}{} {}", left, op, all_str, right)
+                write!(f, "{} {}{}{} {}", left, op, all_str, corresponding, right)
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SetOperator {
     Union,
@@ -137,6 +139,50 @@ impl fmt::Display for SetOperator {
             SetOperator::Except => "EXCEPT",
             SetOperator::Intersect => "INTERSECT",
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+/// `CORRESPONDING [ BY <left paren> <corresponding column list> <right paren> ]`
+pub struct Corresponding {
+    pub corresponding: bool,
+    pub column_list: Option<Vec<Ident>>,
+}
+
+impl Corresponding {
+    pub fn with_column_list(column_list: Option<Vec<Ident>>) -> Self {
+        Self {
+            corresponding: true,
+            column_list,
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            corresponding: false,
+            column_list: None,
+        }
+    }
+
+    pub fn is_corresponding(&self) -> bool {
+        self.corresponding
+    }
+
+    pub fn column_list(&self) -> Option<&[Ident]> {
+        self.column_list.as_deref()
+    }
+}
+
+impl fmt::Display for Corresponding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.corresponding {
+            write!(f, " CORRESPONDING")?;
+            if let Some(column_list) = &self.column_list {
+                write!(f, " BY ({})", display_comma_separated(column_list))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -159,6 +205,8 @@ pub struct Select {
     pub group_by: Vec<Expr>,
     /// HAVING
     pub having: Option<Expr>,
+    /// WINDOW
+    pub window: Vec<NamedWindow>,
 }
 
 impl fmt::Display for Select {
@@ -181,6 +229,9 @@ impl fmt::Display for Select {
         }
         if let Some(ref having) = self.having {
             write!(f, " HAVING {}", having)?;
+        }
+        if !self.window.is_empty() {
+            write!(f, " WINDOW {}", display_comma_separated(&self.window))?;
         }
         Ok(())
     }
@@ -275,6 +326,7 @@ impl fmt::Display for With {
 }
 
 /// A single CTE (used after `WITH`): `alias [(col1, col2, ...)] AS ( query )`
+///
 /// The names in the column list before `AS`, when specified, replace the names
 /// of the columns returned by the query. The parser does not validate that the
 /// number of columns in the query matches the number of columns in the query.
@@ -282,18 +334,26 @@ impl fmt::Display for With {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Cte {
     pub alias: TableAlias,
-    pub query: Query,
-    pub from: Option<Ident>,
+    pub cte_inner: CteInner,
 }
 
 impl fmt::Display for Cte {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} AS ({})", self.alias, self.query)?;
-        if let Some(ref fr) = self.from {
-            write!(f, " FROM {}", fr)?;
+        match &self.cte_inner {
+            CteInner::Query(query) => write!(f, "{} AS ({})", self.alias, query)?,
+            CteInner::ChangeLog(obj_name) => {
+                write!(f, "{} AS changelog from {}", self.alias, obj_name)?
+            }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CteInner {
+    Query(Box<Query>),
+    ChangeLog(ObjectName),
 }
 
 /// One item of the comma-separated list following `SELECT`
@@ -380,8 +440,7 @@ pub enum TableFactor {
     Table {
         name: ObjectName,
         alias: Option<TableAlias>,
-        /// syntax `FOR SYSTEM_TIME AS OF PROCTIME()` is used for temporal join.
-        for_system_time_as_of_proctime: bool,
+        as_of: Option<AsOf>,
     },
     Derived {
         lateral: bool,
@@ -409,14 +468,10 @@ pub enum TableFactor {
 impl fmt::Display for TableFactor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TableFactor::Table {
-                name,
-                alias,
-                for_system_time_as_of_proctime,
-            } => {
+            TableFactor::Table { name, alias, as_of } => {
                 write!(f, "{}", name)?;
-                if *for_system_time_as_of_proctime {
-                    write!(f, " FOR SYSTEM_TIME AS OF PROCTIME()")?;
+                if let Some(as_of) = as_of {
+                    write!(f, "{}", as_of)?
                 }
                 if let Some(alias) = alias {
                     write!(f, " AS {}", alias)?;
@@ -491,7 +546,7 @@ impl fmt::Display for Join {
         }
         fn suffix(constraint: &'_ JoinConstraint) -> impl fmt::Display + '_ {
             struct Suffix<'a>(&'a JoinConstraint);
-            impl<'a> fmt::Display for Suffix<'a> {
+            impl fmt::Display for Suffix<'_> {
                 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     match self.0 {
                         JoinConstraint::On(expr) => write!(f, " ON {}", expr),
@@ -534,6 +589,20 @@ impl fmt::Display for Join {
                 suffix(constraint)
             ),
             JoinOperator::CrossJoin => write!(f, " CROSS JOIN {}", self.relation),
+            JoinOperator::AsOfInner(constraint) => write!(
+                f,
+                " {}ASOF JOIN {}{}",
+                prefix(constraint),
+                self.relation,
+                suffix(constraint)
+            ),
+            JoinOperator::AsOfLeft(constraint) => write!(
+                f,
+                " {}ASOF LEFT JOIN {}{}",
+                prefix(constraint),
+                self.relation,
+                suffix(constraint)
+            ),
         }
     }
 }
@@ -546,6 +615,8 @@ pub enum JoinOperator {
     RightOuter(JoinConstraint),
     FullOuter(JoinConstraint),
     CrossJoin,
+    AsOfInner(JoinConstraint),
+    AsOfLeft(JoinConstraint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -638,5 +709,19 @@ impl fmt::Display for Values {
             write!(f, "({})", display_comma_separated(row))?;
         }
         Ok(())
+    }
+}
+
+/// A named window definition in the WINDOW clause
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct NamedWindow {
+    pub name: Ident,
+    pub window_spec: WindowSpec,
+}
+
+impl fmt::Display for NamedWindow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} AS ({})", self.name, self.window_spec)
     }
 }

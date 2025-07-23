@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 risingwave_expr_impl::enable!();
 
 use itertools::Itertools;
-use risingwave_expr::sig::{FuncName, FuncSign, SigDataType, FUNCTION_REGISTRY};
+use risingwave_expr::sig::{FUNCTION_REGISTRY, FuncName, FuncSign, SigDataType};
 #[test]
 fn test_func_sig_map() {
     // convert FUNC_SIG_MAP to a more convenient map for testing
@@ -60,9 +60,9 @@ fn test_func_sig_map() {
     let expected = expect_test::expect![[r#"
         [
             "cast(anyarray) -> character varying/anyarray",
-            "cast(bigint) -> rw_int256/integer/smallint/numeric/double precision/real/character varying",
+            "cast(bigint) -> rw_int256/serial/integer/smallint/numeric/double precision/real/character varying",
             "cast(boolean) -> integer/character varying",
-            "cast(character varying) -> jsonb/interval/timestamp without time zone/time without time zone/date/rw_int256/real/double precision/numeric/smallint/integer/bigint/character varying/boolean/bytea/anyarray",
+            "cast(character varying) -> jsonb/interval/timestamp without time zone/time without time zone/date/rw_int256/real/double precision/numeric/smallint/integer/bigint/character varying/boolean/bytea/anyarray/vector",
             "cast(date) -> timestamp without time zone/character varying",
             "cast(double precision) -> numeric/real/bigint/integer/smallint/character varying",
             "cast(integer) -> rw_int256/smallint/numeric/double precision/real/bigint/boolean/character varying",

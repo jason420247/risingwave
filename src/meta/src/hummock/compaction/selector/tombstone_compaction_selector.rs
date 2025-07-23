@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,20 +14,15 @@
 
 use std::collections::HashMap;
 
-use risingwave_common::catalog::TableOption;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
 use risingwave_pb::hummock::compact_task;
-use risingwave_pb::hummock::hummock_version::Levels;
 
 use super::{CompactionSelector, DynamicLevelSelectorCore};
 use crate::hummock::compaction::picker::{
     TombstoneReclaimCompactionPicker, TombstoneReclaimPickerState,
 };
-use crate::hummock::compaction::{
-    create_compaction_task, create_overlap_strategy, CompactionTask, LocalSelectorStatistic,
-};
-use crate::hummock::level_handler::LevelHandler;
-use crate::hummock::model::CompactionGroup;
+use crate::hummock::compaction::selector::CompactionSelectorContext;
+use crate::hummock::compaction::{CompactionTask, create_compaction_task, create_overlap_strategy};
 
 #[derive(Default)]
 pub struct TombstoneCompactionSelector {
@@ -38,18 +33,22 @@ impl CompactionSelector for TombstoneCompactionSelector {
     fn pick_compaction(
         &mut self,
         task_id: HummockCompactionTaskId,
-        group: &CompactionGroup,
-        levels: &Levels,
-        level_handlers: &mut [LevelHandler],
-        _selector_stats: &mut LocalSelectorStatistic,
-        _table_id_to_options: HashMap<u32, TableOption>,
+        context: CompactionSelectorContext<'_>,
     ) -> Option<CompactionTask> {
+        let CompactionSelectorContext {
+            group,
+            levels,
+            level_handlers,
+            developer_config,
+            ..
+        } = context;
         if group.compaction_config.tombstone_reclaim_ratio == 0 {
             // it might cause full-compaction when tombstone_reclaim_ratio == 0
             return None;
         }
 
-        let dynamic_level_core = DynamicLevelSelectorCore::new(group.compaction_config.clone());
+        let dynamic_level_core =
+            DynamicLevelSelectorCore::new(group.compaction_config.clone(), developer_config);
         let ctx = dynamic_level_core.calculate_level_base_size(levels);
         let picker = TombstoneReclaimCompactionPicker::new(
             create_overlap_strategy(group.compaction_config.compaction_mode()),

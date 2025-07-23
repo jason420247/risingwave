@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,16 @@
 //! [`catalog_service::CatalogWriter`], which is held by [`crate::session::FrontendEnv`].
 
 use risingwave_common::catalog::{
-    is_row_id_column_name, is_system_schema, ROWID_PREFIX, RW_RESERVED_COLUMN_NAME_PREFIX,
+    ROW_ID_COLUMN_NAME, RW_RESERVED_COLUMN_NAME_PREFIX, is_system_schema,
 };
-use risingwave_common::error::{ErrorCode, Result, RwError};
+use risingwave_common::error::code::PostgresErrorCode;
 use risingwave_connector::sink::catalog::SinkCatalog;
+use risingwave_pb::user::grant_privilege::Object as PbGrantObject;
 use thiserror::Error;
+
+use crate::error::{ErrorCode, Result, RwError};
 pub(crate) mod catalog_service;
+pub mod purify;
 
 pub(crate) mod connection_catalog;
 pub(crate) mod database_catalog;
@@ -33,9 +37,12 @@ pub(crate) mod index_catalog;
 pub(crate) mod root_catalog;
 pub(crate) mod schema_catalog;
 pub(crate) mod source_catalog;
+pub(crate) mod subscription_catalog;
 pub(crate) mod system_catalog;
 pub(crate) mod table_catalog;
 pub(crate) mod view_catalog;
+
+pub(crate) mod secret_catalog;
 
 pub(crate) use catalog_service::CatalogReader;
 pub use index_catalog::IndexCatalog;
@@ -46,19 +53,21 @@ use crate::user::UserId;
 pub(crate) type ConnectionId = u32;
 pub(crate) type SourceId = u32;
 pub(crate) type SinkId = u32;
+pub(crate) type SubscriptionId = u32;
 pub(crate) type ViewId = u32;
 pub(crate) type DatabaseId = u32;
 pub(crate) type SchemaId = u32;
 pub(crate) type TableId = risingwave_common::catalog::TableId;
 pub(crate) type ColumnId = risingwave_common::catalog::ColumnId;
 pub(crate) type FragmentId = u32;
+pub(crate) type SecretId = risingwave_common::catalog::SecretId;
 
 /// Check if the column name does not conflict with the internally reserved column name.
-pub fn check_valid_column_name(column_name: &str) -> Result<()> {
-    if is_row_id_column_name(column_name) {
+pub fn check_column_name_not_reserved(column_name: &str) -> Result<()> {
+    if column_name.starts_with(ROW_ID_COLUMN_NAME) {
         return Err(ErrorCode::InternalError(format!(
             "column name prefixed with {:?} are reserved word.",
-            ROWID_PREFIX
+            ROW_ID_COLUMN_NAME
         ))
         .into());
     }
@@ -95,14 +104,29 @@ pub fn check_schema_writable(schema: &str) -> Result<()> {
 
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+// TODO(error-handling): provide more concrete error code for different object types.
 #[derive(Error, Debug)]
 pub enum CatalogError {
+    #[provide(PostgresErrorCode => PostgresErrorCode::UndefinedObject)]
     #[error("{0} not found: {1}")]
     NotFound(&'static str, String),
-    #[error("{0} with name {1} exists")]
-    Duplicated(&'static str, String),
-    #[error("cannot drop {0} {1} because {2} {3} depend on it")]
-    NotEmpty(&'static str, String, &'static str, String),
+
+    #[provide(PostgresErrorCode => PostgresErrorCode::DuplicateObject)]
+    #[error(
+        "{0} with name {1} exists{under_creation}", under_creation = (.2).then_some(" but under creation").unwrap_or("")
+    )]
+    Duplicated(
+        &'static str,
+        String,
+        // whether the object is under creation (only used for StreamingJob type and Subscription for now)
+        bool,
+    ),
+}
+
+impl CatalogError {
+    pub fn duplicated(object_type: &'static str, name: String) -> Self {
+        Self::Duplicated(object_type, name, false)
+    }
 }
 
 impl From<CatalogError> for RwError {
@@ -124,4 +148,9 @@ impl OwnedByUserCatalog for SinkCatalog {
     fn owner(&self) -> UserId {
         self.owner.user_id
     }
+}
+
+pub struct OwnedGrantObject {
+    pub owner: UserId,
+    pub object: PbGrantObject,
 }

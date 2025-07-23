@@ -1,3 +1,5 @@
+SET enable_json_type = 1;
+
 CREATE table demo_test(
     user_id Int32,
     target_id String,
@@ -28,5 +30,26 @@ CREATE table ck_types (
   c_date_array Array(Date32),
   c_timestamptz_array Array(DateTime64(6)),
   c_struct Nested(s_int Int32, s_boolean Bool),
+  c_jsonb: Json,
 )ENGINE = ReplacingMergeTree
 PRIMARY KEY (types_id);
+
+CREATE TABLE demo_test_null(
+    user_id Int32,
+    target_id String,
+    event_timestamp DateTime64,
+) ENGINE = Null;
+
+CREATE TABLE demo_test_target_null(
+    user_id Int32,
+    target_id String,
+    event_timestamp DateTime64
+) ENGINE = MergeTree()
+ORDER BY (user_id, event_timestamp);
+
+CREATE MATERIALIZED VIEW demo_mv_null TO demo_test_target_null AS
+SELECT
+    user_id,
+    target_id,
+    event_timestamp
+FROM demo_test_null;

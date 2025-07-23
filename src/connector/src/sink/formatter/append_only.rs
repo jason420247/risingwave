@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,19 +40,22 @@ impl<KE: RowEncoder, VE: RowEncoder> SinkFormatter for AppendOnlyFormatter<KE, V
         &self,
         chunk: &StreamChunk,
     ) -> impl Iterator<Item = Result<(Option<Self::K>, Option<Self::V>)>> {
-        std::iter::from_coroutine(|| {
-            for (op, row) in chunk.rows() {
-                if op != Op::Insert {
-                    continue;
-                }
-                let event_key_object = match &self.key_encoder {
-                    Some(key_encoder) => Some(tri!(key_encoder.encode(row))),
-                    None => None,
-                };
-                let event_object = Some(tri!(self.val_encoder.encode(row)));
+        std::iter::from_coroutine(
+            #[coroutine]
+            || {
+                for (op, row) in chunk.rows() {
+                    if op != Op::Insert {
+                        continue;
+                    }
+                    let event_key_object = match &self.key_encoder {
+                        Some(key_encoder) => Some(tri!(key_encoder.encode(row))),
+                        None => None,
+                    };
+                    let event_object = Some(tri!(self.val_encoder.encode(row)));
 
-                yield Ok((event_key_object, event_object))
-            }
-        })
+                    yield Ok((event_key_object, event_object))
+                }
+            },
+        )
     }
 }

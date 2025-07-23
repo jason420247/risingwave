@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ use risingwave_pb::plan_common::JoinType;
 
 use super::{BoxedRule, Rule};
 use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef};
+use crate::optimizer::PlanRef;
 use crate::optimizer::plan_node::generic::Agg;
 use crate::optimizer::plan_node::{LogicalIntersect, LogicalJoin, PlanTreeNode};
-use crate::optimizer::PlanRef;
 
 pub struct IntersectToSemiJoinRule {}
 impl Rule for IntersectToSemiJoinRule {
@@ -50,14 +50,14 @@ impl Rule for IntersectToSemiJoinRule {
 
 impl IntersectToSemiJoinRule {
     pub(crate) fn gen_null_safe_equal(left: PlanRef, right: PlanRef) -> ExprImpl {
-        (left
+        let arms = (left
             .schema()
             .fields()
             .iter()
             .zip_eq_debug(right.schema().fields())
             .enumerate())
-        .fold(None, |expr, (i, (left_field, right_field))| {
-            let equal = ExprImpl::FunctionCall(Box::new(FunctionCall::new_unchecked(
+        .map(|(i, (left_field, right_field))| {
+            ExprImpl::FunctionCall(Box::new(FunctionCall::new_unchecked(
                 ExprType::IsNotDistinctFrom,
                 vec![
                     ExprImpl::InputRef(Box::new(InputRef::new(i, left_field.data_type()))),
@@ -67,16 +67,9 @@ impl IntersectToSemiJoinRule {
                     ))),
                 ],
                 Boolean,
-            )));
-
-            match expr {
-                None => Some(equal),
-                Some(expr) => Some(ExprImpl::FunctionCall(Box::new(
-                    FunctionCall::new_unchecked(ExprType::And, vec![expr, equal], Boolean),
-                ))),
-            }
-        })
-        .unwrap()
+            )))
+        });
+        ExprImpl::and(arms)
     }
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use futures::executor::block_on;
 use risingwave_common::array::{DataChunk, DataChunkTestExt, StreamChunk};
 use risingwave_common::catalog::{ColumnDesc, ColumnId, TableId};
@@ -20,10 +20,11 @@ use risingwave_common::field_generator::VarcharProperty;
 use risingwave_common::row::{OwnedRow, Row};
 use risingwave_common::test_prelude::StreamChunkTestExt;
 use risingwave_common::types::DataType;
-use risingwave_common::util::epoch::EpochPair;
+use risingwave_common::util::epoch::{EpochPair, test_epoch};
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_storage::memory::MemoryStateStore;
 use risingwave_stream::common::table::state_table::WatermarkCacheParameterizedStateTable;
+use risingwave_stream::common::table::test_utils::gen_pbtable;
 use tokio::runtime::Runtime;
 
 type TestStateTable<const USE_WATERMARK_CACHE: bool> =
@@ -72,12 +73,10 @@ async fn create_state_table<const USE_WATERMARK_CACHE: bool>(
     let pk_indices = (0..key_length).collect();
 
     let store = MemoryStateStore::new();
-    TestStateTable::<USE_WATERMARK_CACHE>::new_without_distribution_inconsistent_op(
+    TestStateTable::<USE_WATERMARK_CACHE>::from_table_catalog_inconsistent_op(
+        &gen_pbtable(TEST_TABLE_ID, column_descs, order_types, pk_indices, 0),
         store,
-        TEST_TABLE_ID,
-        column_descs,
-        order_types,
-        pk_indices,
+        None,
     )
     .await
 }
@@ -113,13 +112,16 @@ async fn run_bench_state_table_inserts<const USE_WATERMARK_CACHE: bool>(
     mut state_table: TestStateTable<USE_WATERMARK_CACHE>,
     rows: Vec<OwnedRow>,
 ) {
-    let mut epoch = EpochPair::new_test_epoch(1);
-    state_table.init_epoch(epoch);
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    state_table.init_epoch(epoch).await.unwrap();
     for row in rows {
         state_table.insert(row);
     }
-    epoch.inc();
-    state_table.commit(epoch).await.unwrap();
+    epoch.inc_for_test();
+    state_table
+        .commit_assert_no_update_vnode_bitmap(epoch)
+        .await
+        .unwrap();
 }
 
 fn bench_state_table_inserts(c: &mut Criterion) {
@@ -173,13 +175,16 @@ async fn run_bench_state_table_chunks<const USE_WATERMARK_CACHE: bool>(
     mut state_table: TestStateTable<USE_WATERMARK_CACHE>,
     chunks: Vec<StreamChunk>,
 ) {
-    let mut epoch = EpochPair::new_test_epoch(1);
-    state_table.init_epoch(epoch);
+    let mut epoch = EpochPair::new_test_epoch(test_epoch(1));
+    state_table.init_epoch(epoch).await.unwrap();
     for chunk in chunks {
         state_table.write_chunk(chunk);
     }
-    epoch.inc();
-    state_table.commit(epoch).await.unwrap();
+    epoch.inc_for_test();
+    state_table
+        .commit_assert_no_update_vnode_bitmap(epoch)
+        .await
+        .unwrap();
 }
 
 fn bench_state_table_write_chunk(c: &mut Criterion) {

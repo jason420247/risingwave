@@ -1,117 +1,143 @@
-from pyspark.sql import SparkSession
 import argparse
 import configparser
-import subprocess
-import csv
-import unittest
-import time
-import tomli as toml
-from datetime import date
+import os
+import sys
 from datetime import datetime
-from datetime import timezone
+from typing import Optional
+
+import tomli as toml
+
+from test_utils import (
+    log,
+    LogLevel,
+    TestResult,
+    print_test_summary,
+    init_iceberg_table,
+    compare_sql,
+    drop_table,
+    discover_test_cases,
+    execute_slt,
+    prepare_test_env,
+    verify_result,
+)
 
 
-def strtobool(v):
-    return v.lower() == 'true'
+def run_test_case(test_file: str, args: dict) -> TestResult:
+    """Run a single test case."""
+    log(f"\nRunning test case: {test_file}", level=LogLevel.HEADER)
+    start_time = datetime.now()
+    error = None
+    success = True
+
+    try:
+        with open(test_file, "rb") as f:
+            test_case = toml.load(f)
+
+            # Extract content from testcase
+            init_sqls = test_case["init_sqls"]
+            slt = test_case.get("slt")
+            log(f"slt: {slt}", level=LogLevel.INFO)
+            verify_schema = test_case.get("verify_schema")
+            log(f"verify_schema: {verify_schema}", level=LogLevel.INFO)
+            verify_sql = test_case.get("verify_sql")
+            log(f"verify_sql: {verify_sql}", level=LogLevel.INFO)
+            verify_data = test_case.get("verify_data")
+            verify_slt = test_case.get("verify_slt")
+            cmp_sqls = test_case.get("cmp_sqls")
+            drop_sqls = test_case["drop_sqls"]
+
+            init_iceberg_table(args, init_sqls)
+            if slt:
+                execute_slt(args, slt)
+            if verify_data and verify_sql and verify_schema:
+                verify_result(args, verify_sql, verify_schema, verify_data)
+            if cmp_sqls and len(cmp_sqls) == 2:
+                compare_sql(args, cmp_sqls)
+            if verify_slt:
+                execute_slt(args, verify_slt)
+            if drop_sqls:
+                drop_table(args, drop_sqls)
+    except KeyboardInterrupt:
+        log(f"test case {test_file} interrupted by user", level=LogLevel.ERROR)
+        error = "Interrupted by user"
+        success = False
+        # Don't raise the exception, just return the failed result
+        duration = datetime.now() - start_time
+        return TestResult(test_file, success, duration, error)
+    except Exception as e:
+        log(f"test case {test_file} failed: {e}", level=LogLevel.ERROR)
+        error = e
+        success = False
+        raise e
+    finally:
+        duration = datetime.now() - start_time
+        return TestResult(test_file, success, duration, error)
 
 
-def strtodate(v):
-    return date.fromisoformat(v)
+def get_parallel_job_info() -> Optional[tuple[int, int]]:
+    """Get parallel job information from environment variables."""
+    job = os.environ.get("BUILDKITE_PARALLEL_JOB")
+    if job is None:
+        return None
+    job = int(job)
+    total = int(os.environ.get("BUILDKITE_PARALLEL_JOB_COUNT"))
+    return job, total
 
-
-def strtots(v):
-    return datetime.fromisoformat(v).astimezone(timezone.utc).replace(tzinfo=None)
-
-
-g_spark = None
-
-
-def get_spark(args):
-    spark_config = args['spark']
-    global g_spark
-    if g_spark is None:
-        g_spark = SparkSession.builder.remote(spark_config['url']).getOrCreate()
-
-    return g_spark
-
-
-def init_iceberg_table(args,init_sqls):
-    spark = get_spark(args)
-    for sql in init_sqls:
-        print(f"Executing sql: {sql}")
-        spark.sql(sql)
-
-
-def execute_slt(args,slt):
-    if slt is None or slt == "":
-        return
-    rw_config = args['risingwave']
-    cmd = f"sqllogictest -p {rw_config['port']} -d {rw_config['db']} {slt}"
-    print(f"Command line is [{cmd}]")
-    subprocess.run(cmd,
-                   shell=True,
-                   check=True)
-    time.sleep(30)
-
-
-def verify_result(args,verify_sql,verify_schema,verify_data):
-    tc = unittest.TestCase()
-    print(f"Executing sql: {verify_sql}")
-    spark = get_spark(args)
-    df = spark.sql(verify_sql).collect()
-    for row in df:
-        print(row)
-    rows = verify_data.splitlines()
-    tc.assertEqual(len(df), len(rows))
-    for (row1, row2) in zip(df, rows):
-        print(f"Row1: {row1}, Row 2: {row2}")
-        row2 = row2.split(',')
-        for idx, ty in enumerate(verify_schema):
-            if ty == "int" or ty == "long":
-                tc.assertEqual(row1[idx], int(row2[idx]))
-            elif ty == "float" or ty == "double":
-                tc.assertEqual(round(row1[idx], 5), round(float(row2[idx]), 5))
-            elif ty == "boolean":
-                tc.assertEqual(row1[idx], strtobool(row2[idx]))
-            elif ty == "date":
-                tc.assertEqual(row1[idx], strtodate(row2[idx]))
-            elif ty == "timestamp":
-                tc.assertEqual(row1[idx].astimezone(timezone.utc).replace(tzinfo=None), strtots(row2[idx]))
-            elif ty == "timestamp_ntz":
-                tc.assertEqual(row1[idx], datetime.fromisoformat(row2[idx]))
-            elif ty == "string":
-                tc.assertEqual(row1[idx], row2[idx])
-            else:
-                tc.fail(f"Unsupported type {ty}")
-
-def drop_table(args,drop_sqls):
-    spark = get_spark(args)
-    for sql in drop_sqls:
-        print(f"Executing sql: {sql}")
-        spark.sql(sql)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test script for iceberg")
-    parser.add_argument("-t", dest="test_case", type=str, help="Test case file")
-    with open(parser.parse_args().test_case,"rb") as test_case:
-        test_case = toml.load(test_case)
-        # Extract content from testcase
-        init_sqls = test_case['init_sqls']
-        print(f"init_sqls:{init_sqls}")
-        slt = test_case['slt']
-        print(f"slt:{slt}")
-        verify_schema = test_case['verify_schema']
-        print(f"verify_schema:{verify_schema}")
-        verify_sql = test_case['verify_sql']
-        print(f"verify_sql:{verify_sql}")
-        verify_data = test_case['verify_data']
-        drop_sqls = test_case['drop_sqls']
+    parser.add_argument(
+        "-t",
+        dest="test_case",
+        type=str,
+        help="Optional: specific test case file (toml file) to run. If not provided, all test cases will be run.",
+    )
 
-        config = configparser.ConfigParser()
-        config.read("config.ini")
-        print({section: dict(config[section]) for section in config.sections()})
+    args = parser.parse_args()
+    config = configparser.ConfigParser()
+    config.read("config.ini")
+    config_dict = {section: dict(config[section]) for section in config.sections()}
 
-        init_iceberg_table(config,init_sqls)
-        execute_slt(config,slt)
-        verify_result(config,verify_sql,verify_schema,verify_data)
-        drop_table(config,drop_sqls)
+    prepare_test_env()
+
+    test_results = []
+
+    try:
+        if args.test_case:
+            # Run single test case if specified
+            result = run_test_case(args.test_case, config_dict)
+            test_results.append(result)
+        else:
+            # Run discovered test cases
+            test_files = discover_test_cases()
+            log(f"Discovered {len(test_files)} test cases", level=LogLevel.INFO)
+
+            # Get parallel job information
+            parallel_info = get_parallel_job_info()
+            if parallel_info:
+                job_index, total_jobs = parallel_info
+                # Distribute test files among parallel jobs
+                test_files.sort()  # Ensure consistent distribution
+                test_files = test_files[job_index::total_jobs]
+                log(
+                    f"Running job {job_index + 1} of {total_jobs} with {len(test_files)} test cases",
+                    level=LogLevel.INFO,
+                )
+
+            # Run all test cases assigned to this job
+            for test_file in test_files:
+                result = run_test_case(test_file, config_dict)
+                test_results.append(result)
+                if (
+                    not result.success
+                    and isinstance(result.error, str)
+                    and "Interrupted" in result.error
+                ):
+                    # If the test was interrupted, stop running more tests
+                    break
+    finally:
+        # Always print summary, even if some tests failed or were interrupted
+        print_test_summary(test_results)
+        # Exit with error code if any test failed
+        if any(not result.success for result in test_results):
+            sys.exit(1)

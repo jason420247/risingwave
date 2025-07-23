@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,31 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use itertools::Itertools;
 use risingwave_pb::catalog::Table;
 use risingwave_pb::stream_plan::stream_fragment_graph::StreamFragment;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
-use risingwave_pb::stream_plan::{agg_call_state, StreamNode};
+use risingwave_pb::stream_plan::{SourceBackfillNode, StreamNode, StreamScanNode, agg_call_state};
 
 /// A utility for visiting and mutating the [`NodeBody`] of the [`StreamNode`]s recursively.
-pub fn visit_stream_node<F>(stream_node: &mut StreamNode, mut f: F)
-where
-    F: FnMut(&mut NodeBody),
-{
-    fn visit_inner<F>(stream_node: &mut StreamNode, f: &mut F)
-    where
-        F: FnMut(&mut NodeBody),
-    {
+pub fn visit_stream_node_mut(stream_node: &mut StreamNode, mut f: impl FnMut(&mut NodeBody)) {
+    visit_stream_node_cont_mut(stream_node, |stream_node| {
         f(stream_node.node_body.as_mut().unwrap());
-        for input in &mut stream_node.input {
-            visit_inner(input, f);
-        }
-    }
-
-    visit_inner(stream_node, &mut f)
+        true
+    })
 }
 
-/// A utility for to accessing the [`StreamNode`]. The returned bool is used to determine whether the access needs to continue.
-pub fn visit_stream_node_cont<F>(stream_node: &mut StreamNode, mut f: F)
+/// A utility for to accessing the [`StreamNode`] mutably. The returned bool is used to determine whether the access needs to continue.
+pub fn visit_stream_node_cont_mut<F>(stream_node: &mut StreamNode, mut f: F)
 where
     F: FnMut(&mut StreamNode) -> bool,
 {
@@ -55,19 +46,58 @@ where
     visit_inner(stream_node, &mut f)
 }
 
+/// A utility for visiting the [`NodeBody`] of the [`StreamNode`]s recursively.
+pub fn visit_stream_node_body(stream_node: &StreamNode, mut f: impl FnMut(&NodeBody)) {
+    visit_stream_node_cont(stream_node, |stream_node| {
+        f(stream_node.node_body.as_ref().unwrap());
+        true
+    })
+}
+
+pub fn visit_stream_node(stream_node: &StreamNode, mut f: impl FnMut(&StreamNode)) {
+    visit_stream_node_cont(stream_node, |stream_node| {
+        f(stream_node);
+        true
+    })
+}
+
+/// A utility for to accessing the [`StreamNode`] immutably. The returned bool is used to determine whether the access needs to continue.
+pub fn visit_stream_node_cont<F>(stream_node: &StreamNode, mut f: F)
+where
+    F: FnMut(&StreamNode) -> bool,
+{
+    fn visit_inner<F>(stream_node: &StreamNode, f: &mut F)
+    where
+        F: FnMut(&StreamNode) -> bool,
+    {
+        if !f(stream_node) {
+            return;
+        }
+        for input in &stream_node.input {
+            visit_inner(input, f);
+        }
+    }
+
+    visit_inner(stream_node, &mut f)
+}
+
 /// A utility for visiting and mutating the [`NodeBody`] of the [`StreamNode`]s in a
 /// [`StreamFragment`] recursively.
-pub fn visit_fragment<F>(fragment: &mut StreamFragment, f: F)
-where
-    F: FnMut(&mut NodeBody),
-{
-    visit_stream_node(fragment.node.as_mut().unwrap(), f)
+pub fn visit_fragment_mut(fragment: &mut StreamFragment, f: impl FnMut(&mut NodeBody)) {
+    visit_stream_node_mut(fragment.node.as_mut().unwrap(), f)
+}
+
+/// A utility for visiting the [`NodeBody`] of the [`StreamNode`]s in a
+/// [`StreamFragment`] recursively.
+pub fn visit_fragment(fragment: &StreamFragment, f: impl FnMut(&NodeBody)) {
+    visit_stream_node_body(fragment.node.as_ref().unwrap(), f)
 }
 
 /// Visit the tables of a [`StreamNode`].
-fn visit_stream_node_tables_inner<F>(
+pub fn visit_stream_node_tables_inner<F>(
     stream_node: &mut StreamNode,
     internal_tables_only: bool,
+    visit_child_recursively: bool,
     mut f: F,
 ) where
     F: FnMut(&mut Table, &str),
@@ -97,7 +127,7 @@ fn visit_stream_node_tables_inner<F>(
         };
     }
 
-    visit_stream_node(stream_node, |body| {
+    let mut visit_body = |body: &mut NodeBody| {
         match body {
             // Join
             NodeBody::HashJoin(node) => {
@@ -107,13 +137,11 @@ fn visit_stream_node_tables_inner<F>(
                 always!(node.right_table, "HashJoinRight");
                 always!(node.right_degree_table, "HashJoinDegreeRight");
             }
+            NodeBody::TemporalJoin(node) => {
+                optional!(node.memo_table, "TemporalJoinMemo");
+            }
             NodeBody::DynamicFilter(node) => {
-                if node.condition_always_relax {
-                    always!(node.left_table, "DynamicFilterLeftNotSatisfy");
-                } else {
-                    always!(node.left_table, "DynamicFilterLeft");
-                }
-
+                always!(node.left_table, "DynamicFilterLeft");
                 always!(node.right_table, "DynamicFilterRight");
             }
 
@@ -129,7 +157,11 @@ fn visit_stream_node_tables_inner<F>(
                         }
                     }
                 }
-                for (distinct_col, dedup_table) in &mut node.distinct_dedup_tables {
+                for (distinct_col, dedup_table) in node
+                    .distinct_dedup_tables
+                    .iter_mut()
+                    .sorted_by_key(|(i, _)| *i)
+                {
                     f(dedup_table, &format!("HashAggDedupForCol{}", distinct_col));
                 }
             }
@@ -144,7 +176,11 @@ fn visit_stream_node_tables_inner<F>(
                         }
                     }
                 }
-                for (distinct_col, dedup_table) in &mut node.distinct_dedup_tables {
+                for (distinct_col, dedup_table) in node
+                    .distinct_dedup_tables
+                    .iter_mut()
+                    .sorted_by_key(|(i, _)| *i)
+                {
                     f(
                         dedup_table,
                         &format!("SimpleAggDedupForCol{}", distinct_col),
@@ -176,6 +212,9 @@ fn visit_stream_node_tables_inner<F>(
                 if let Some(source) = &mut node.node_inner {
                     always!(source.state_table, "FsFetch");
                 }
+            }
+            NodeBody::SourceBackfill(node) => {
+                always!(node.state_table, "SourceBackfill")
             }
 
             // Sink
@@ -231,9 +270,60 @@ fn visit_stream_node_tables_inner<F>(
 
             // Note: add internal tables for new nodes here.
             NodeBody::Materialize(node) if !internal_tables_only => {
+                // Note: Plan directly generated by frontend may not have the table filled,
+                // as it is filled by the meta service during building fragments.
+                // However, if caller requests to visit this table via `!internal_tables_only`,
+                // we still assert on its existence to avoid undefined behavior.
                 always!(node.table, "Materialize")
             }
+
+            // Global Approx Percentile
+            NodeBody::GlobalApproxPercentile(node) => {
+                always!(node.bucket_state_table, "GlobalApproxPercentileBucketState");
+                always!(node.count_state_table, "GlobalApproxPercentileCountState");
+            }
+
+            // AsOf join
+            NodeBody::AsOfJoin(node) => {
+                always!(node.left_table, "AsOfJoinLeft");
+                always!(node.right_table, "AsOfJoinRight");
+            }
+
+            // Synced Log Store
+            NodeBody::SyncLogStore(node) => {
+                always!(node.log_store_table, "StreamSyncLogStore");
+            }
+
+            // MaterializedExprs
+            NodeBody::MaterializedExprs(node) => {
+                always!(node.state_table, "MaterializedExprs");
+            }
+
             _ => {}
+        }
+    };
+    if visit_child_recursively {
+        visit_stream_node_mut(stream_node, visit_body)
+    } else {
+        visit_body(stream_node.node_body.as_mut().unwrap())
+    }
+}
+
+pub fn visit_stream_node_stream_scan(stream_node: &StreamNode, mut f: impl FnMut(&StreamScanNode)) {
+    visit_stream_node_body(stream_node, |body| {
+        if let NodeBody::StreamScan(node) = body {
+            f(node)
+        }
+    })
+}
+
+pub fn visit_stream_node_source_backfill(
+    stream_node: &StreamNode,
+    mut f: impl FnMut(&SourceBackfillNode),
+) {
+    visit_stream_node_body(stream_node, |body| {
+        if let NodeBody::SourceBackfill(node) = body {
+            f(node)
         }
     })
 }
@@ -242,15 +332,14 @@ pub fn visit_stream_node_internal_tables<F>(stream_node: &mut StreamNode, f: F)
 where
     F: FnMut(&mut Table, &str),
 {
-    visit_stream_node_tables_inner(stream_node, true, f)
+    visit_stream_node_tables_inner(stream_node, true, true, f)
 }
 
-#[allow(dead_code)]
 pub fn visit_stream_node_tables<F>(stream_node: &mut StreamNode, f: F)
 where
     F: FnMut(&mut Table, &str),
 {
-    visit_stream_node_tables_inner(stream_node, false, f)
+    visit_stream_node_tables_inner(stream_node, false, true, f)
 }
 
 /// Visit the internal tables of a [`StreamFragment`].
@@ -259,4 +348,14 @@ where
     F: FnMut(&mut Table, &str),
 {
     visit_stream_node_internal_tables(fragment.node.as_mut().unwrap(), f)
+}
+
+/// Visit the tables of a [`StreamFragment`].
+///
+/// Compared to [`visit_internal_tables`], this function also visits the table of `Materialize` node.
+pub fn visit_tables<F>(fragment: &mut StreamFragment, f: F)
+where
+    F: FnMut(&mut Table, &str),
+{
+    visit_stream_node_tables(fragment.node.as_mut().unwrap(), f)
 }

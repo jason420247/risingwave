@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,28 +13,27 @@
 // limitations under the License.
 
 use std::cmp::max;
-use std::collections::BTreeMap;
 
 use itertools::Itertools;
 use risingwave_common::catalog::Schema;
-use risingwave_common::error::Result;
 use risingwave_common::types::{DataType, Scalar};
 
 use super::utils::impl_distill_by_unit;
 use super::{
     ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef, PredicatePushdown, ToBatch, ToStream,
 };
+use crate::Explain;
+use crate::error::Result;
 use crate::expr::{ExprImpl, InputRef, Literal};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::generic::GenericPlanRef;
 use crate::optimizer::plan_node::stream_union::StreamUnion;
 use crate::optimizer::plan_node::{
-    generic, BatchHashAgg, BatchUnion, ColumnPruningContext, LogicalProject, PlanTreeNode,
-    PredicatePushdownContext, RewriteStreamContext, ToStreamContext,
+    BatchHashAgg, BatchUnion, ColumnPruningContext, LogicalProject, PlanTreeNode,
+    PredicatePushdownContext, RewriteStreamContext, ToStreamContext, generic,
 };
 use crate::optimizer::property::RequiredDist;
 use crate::utils::{ColIndexMapping, Condition};
-use crate::Explain;
 
 /// `LogicalUnion` returns the union of the rows of its inputs.
 /// If `all` is false, it needs to eliminate duplicates.
@@ -175,6 +174,9 @@ impl ToStream for LogicalUnion {
         &self,
         ctx: &mut RewriteStreamContext,
     ) -> Result<(PlanRef, ColIndexMapping)> {
+        type FixedState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+        type TypeMap<T> = std::collections::HashMap<DataType, T, FixedState>;
+
         let original_schema = self.base.schema().clone();
         let original_schema_len = original_schema.len();
         let mut rewrites = vec![];
@@ -236,9 +238,9 @@ impl ToStream for LogicalUnion {
             // If all inputs have the same stream key column types, we have a small merged_stream_key. Otherwise, we will have a large merged_stream_key.
 
             let (merged_stream_key_types, types_offset) = {
-                let mut max_types_counter = BTreeMap::default();
+                let mut max_types_counter = TypeMap::default();
                 for (new_input, _) in &rewrites {
-                    let mut types_counter = BTreeMap::default();
+                    let mut types_counter = TypeMap::default();
                     for x in new_input.expect_stream_key() {
                         types_counter
                             .entry(new_input.schema().fields[*x].data_type())
@@ -254,12 +256,12 @@ impl ToStream for LogicalUnion {
                 }
 
                 let mut merged_stream_key_types = vec![];
-                let mut types_offset = BTreeMap::default();
+                let mut types_offset = TypeMap::default();
                 let mut offset = 0;
                 for (key, val) in max_types_counter {
                     let _ = types_offset.insert(key.clone(), offset);
                     offset += val;
-                    merged_stream_key_types.extend(std::iter::repeat(key.clone()).take(val));
+                    merged_stream_key_types.extend(std::iter::repeat_n(key.clone(), val));
                 }
 
                 (merged_stream_key_types, types_offset)
@@ -288,7 +290,7 @@ impl ToStream for LogicalUnion {
                         .collect_vec();
                     // merged_stream_key
                     let mut input_stream_keys = input_stream_key_nulls.clone();
-                    let mut types_counter = BTreeMap::default();
+                    let mut types_counter = TypeMap::default();
                     for stream_key_idx in new_input.expect_stream_key() {
                         let data_type =
                             new_input.schema().fields[*stream_key_idx].data_type.clone();
@@ -327,8 +329,7 @@ impl ToStream for LogicalUnion {
 #[cfg(test)]
 mod tests {
 
-    use risingwave_common::catalog::{Field, Schema};
-    use risingwave_common::types::DataType;
+    use risingwave_common::catalog::Field;
 
     use super::*;
     use crate::optimizer::optimizer_context::OptimizerContext;

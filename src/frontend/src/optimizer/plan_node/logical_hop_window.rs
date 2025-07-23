@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,16 +14,16 @@
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_common::error::Result;
 use risingwave_common::types::Interval;
 
 use super::generic::{GenericPlanNode, GenericPlanRef};
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchHopWindow, ColPrunable, ExprRewritable, Logical,
-    LogicalFilter, PlanBase, PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamHopWindow,
-    ToBatch, ToStream,
+    BatchHopWindow, ColPrunable, ExprRewritable, Logical, LogicalFilter, PlanBase, PlanRef,
+    PlanTreeNodeUnary, PredicatePushdown, StreamHopWindow, ToBatch, ToStream,
+    gen_filter_and_pushdown, generic,
 };
+use crate::error::Result;
 use crate::expr::{ExprType, FunctionCall, InputRef};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::{
@@ -160,7 +160,6 @@ impl PlanTreeNodeUnary for LogicalHopWindow {
         )
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -366,11 +365,10 @@ mod test {
     use risingwave_common::types::DataType;
 
     use super::*;
-    use crate::expr::InputRef;
+    use crate::Explain;
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::LogicalValues;
     use crate::optimizer::property::FunctionalDependency;
-    use crate::Explain;
     #[tokio::test]
     /// Pruning
     /// ```text

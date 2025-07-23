@@ -7,16 +7,13 @@ keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
+[lib]
+test = false
 
 [dependencies]
 anyhow = "1"
 expect-test = "1"
-itertools = "0.12"
+itertools = { workspace = true }
 paste = "1"
 risingwave_expr_impl = { workspace = true }
 risingwave_frontend = { workspace = true }
@@ -40,11 +37,8 @@ walkdir = "2"
 workspace-hack = { path = "../../workspace-hack" }
 
 [dev-dependencies]
-libtest-mimic = "0.6"
+libtest-mimic = "0.8"
 tempfile = "3"
-
-[lib]
-test = false
 
 [[test]]
 name = "planner_test_runner"

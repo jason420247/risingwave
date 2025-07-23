@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,11 @@
 
 use std::env;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use risingwave_common::config::MetaConfig;
 use risingwave_common::util::addr::HostAddr;
 use risingwave_pb::common::WorkerType;
-use risingwave_pb::meta::add_worker_node_request::Property;
+use risingwave_pb::common::worker_node::Property;
 use risingwave_rpc_client::MetaClient;
 
 pub struct MetaServiceOpts {
@@ -43,8 +43,8 @@ impl MetaServiceOpts {
 For `./risedev d` use cases, please do the following:
 * use `./risedev ctl` to use risectl.
 
-For `./risedev apply-compose-deploy` users,
-* `RW_META_ADDR` will be printed out when deploying. Please copy the bash exports to your console.
+For production use cases,
+* please set `RW_META_ADDR` to the address of the meta node.
 
 Note: the default value of `RW_META_ADDR` is 'http://127.0.0.1:5690'.";
                 bail!(MESSAGE);
@@ -62,7 +62,7 @@ Note: the default value of `RW_META_ADDR` is 'http://127.0.0.1:5690'.";
             Property::default(),
             &MetaConfig::default(),
         )
-        .await?;
+        .await;
         let worker_id = client.worker_id();
         tracing::info!("registered as RiseCtl worker, worker_id = {}", worker_id);
         Ok(client)

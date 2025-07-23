@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::Context;
 use risingwave_pb::common::PbHostAddress;
+use thiserror_ext::AsReport;
+use tokio::time::sleep;
+use tokio_retry::strategy::ExponentialBackoff;
+use tracing::error;
 
 /// General host address and port.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -71,7 +76,7 @@ impl FromStr for HostAddr {
 impl From<&PbHostAddress> for HostAddr {
     fn from(addr: &PbHostAddress) -> Self {
         HostAddr {
-            host: addr.get_host().to_string(),
+            host: addr.get_host().clone(),
             port: addr.get_port() as u16,
         }
     }
@@ -90,9 +95,35 @@ pub fn is_local_address(server_addr: &HostAddr, peer_addr: &HostAddr) -> bool {
     server_addr == peer_addr
 }
 
+pub async fn try_resolve_dns(host: &str, port: i32) -> Result<SocketAddr, String> {
+    let addr = format!("{}:{}", host, port);
+    let mut backoff = ExponentialBackoff::from_millis(100)
+        .max_delay(Duration::from_secs(3))
+        .factor(5);
+    const MAX_RETRY: usize = 20;
+    for i in 1..=MAX_RETRY {
+        let err = match addr.to_socket_addrs() {
+            Ok(mut addr_iter) => {
+                if let Some(addr) = addr_iter.next() {
+                    return Ok(addr);
+                } else {
+                    format!("{} resolved to no addr", addr)
+                }
+            }
+            Err(e) => e.to_report_string(),
+        };
+        // It may happen that the dns information of newly registered worker node
+        // has not been propagated to the meta node and cause error. Wait for a while and retry
+        let delay = backoff.next().unwrap();
+        error!(attempt = i, backoff_delay = ?delay, err, addr, "fail to resolve worker node address");
+        sleep(delay).await;
+    }
+    Err(format!("failed to resolve dns: {}", addr))
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::util::addr::{is_local_address, HostAddr};
+    use crate::util::addr::{HostAddr, is_local_address};
 
     #[test]
     fn test_is_local_address() {

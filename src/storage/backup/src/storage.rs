@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use risingwave_common::config::ObjectStoreConfig;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use risingwave_object_store::object::{
     InMemObjectStore, MonitoredObjectStore, ObjectError, ObjectStoreImpl, ObjectStoreRef,
@@ -61,7 +62,7 @@ pub struct ObjectStoreMetaSnapshotStorage {
 impl ObjectStoreMetaSnapshotStorage {
     pub async fn new(path: &str, store: ObjectStoreRef) -> BackupResult<Self> {
         let instance = Self {
-            path: path.to_string(),
+            path: path.to_owned(),
             store,
             manifest: Default::default(),
         };
@@ -189,8 +190,9 @@ pub async fn unused() -> ObjectStoreMetaSnapshotStorage {
     ObjectStoreMetaSnapshotStorage::new(
         "",
         Arc::new(ObjectStoreImpl::InMem(MonitoredObjectStore::new(
-            InMemObjectStore::new(),
+            InMemObjectStore::for_test(),
             Arc::new(ObjectStoreMetrics::unused()),
+            Arc::new(ObjectStoreConfig::default()),
         ))),
     )
     .await

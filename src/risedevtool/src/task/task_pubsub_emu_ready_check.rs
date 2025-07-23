@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use google_cloud_pubsub::client::Client;
 
 use crate::{ExecuteContext, PubsubConfig, Task};
@@ -36,10 +36,13 @@ impl Task for PubsubReadyTaskCheck {
         ctx.pb.set_message("waiting for online...");
 
         // environment variables to use the pubsub emulator
-        std::env::set_var(
-            "PUBSUB_EMULATOR_HOST",
-            format!("{}:{}", self.config.address, self.config.port),
-        );
+        // SAFETY: RiseDev is for development purposes only.
+        unsafe {
+            std::env::set_var(
+                "PUBSUB_EMULATOR_HOST",
+                format!("{}:{}", self.config.address, self.config.port),
+            );
+        }
 
         thread::sleep(Duration::from_secs(5));
         let async_runtime = tokio::runtime::Builder::new_current_thread()

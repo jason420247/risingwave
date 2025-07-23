@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,17 @@
 
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_pb::stream_plan::stream_node::NodeBody;
-use risingwave_pb::stream_plan::{DispatchStrategy, DispatcherType, ExchangeNode};
+use risingwave_pb::stream_plan::{
+    DispatchStrategy, DispatcherType, ExchangeNode, PbDispatchOutputMapping,
+};
 
 use super::stream::prelude::*;
-use super::utils::{childless_record, plan_node_name, Distill};
+use super::utils::{Distill, childless_record, plan_node_name};
 use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
-use crate::optimizer::property::{Distribution, DistributionDisplay};
+use crate::optimizer::property::{
+    Distribution, DistributionDisplay, MonotonicityMap, RequiredDist,
+};
 use crate::stream_fragmenter::BuildFragmentGraphState;
 
 /// `StreamExchange` imposes a particular distribution on its input
@@ -34,16 +38,24 @@ pub struct StreamExchange {
 
 impl StreamExchange {
     pub fn new(input: PlanRef, dist: Distribution) -> Self {
-        // Dispatch executor won't change the append-only behavior of the stream.
+        let columns_monotonicity = if input.distribution().satisfies(&RequiredDist::single()) {
+            // If the input is a singleton, the monotonicity will be preserved during shuffle
+            // since we use ordered channel/buffer when exchanging data.
+            input.columns_monotonicity().clone()
+        } else {
+            MonotonicityMap::new()
+        };
+        assert!(!input.schema().is_empty());
         let base = PlanBase::new_stream(
             input.ctx(),
             input.schema().clone(),
             input.stream_key().map(|v| v.to_vec()),
             input.functional_dependency().clone(),
             dist,
-            input.append_only(),
+            input.append_only(), // append-only property won't change
             input.emit_on_window_close(),
             input.watermark_columns().clone(),
+            columns_monotonicity,
         );
         StreamExchange {
             base,
@@ -54,16 +66,16 @@ impl StreamExchange {
 
     pub fn new_no_shuffle(input: PlanRef) -> Self {
         let ctx = input.ctx();
-        // Dispatch executor won't change the append-only behavior of the stream.
         let base = PlanBase::new_stream(
             ctx,
             input.schema().clone(),
             input.stream_key().map(|v| v.to_vec()),
             input.functional_dependency().clone(),
             input.distribution().clone(),
-            input.append_only(),
+            input.append_only(), // append-only property won't change
             input.emit_on_window_close(),
             input.watermark_columns().clone(),
+            input.columns_monotonicity().clone(),
         );
         StreamExchange {
             base,
@@ -110,12 +122,14 @@ impl_plan_tree_node_for_unary! {StreamExchange}
 
 impl StreamNode for StreamExchange {
     fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> NodeBody {
-        NodeBody::Exchange(ExchangeNode {
+        let output_mapping = PbDispatchOutputMapping::identical(self.schema().len()).into();
+
+        NodeBody::Exchange(Box::new(ExchangeNode {
             strategy: if self.no_shuffle {
                 Some(DispatchStrategy {
                     r#type: DispatcherType::NoShuffle as i32,
                     dist_key_indices: vec![],
-                    output_indices: (0..self.schema().len() as u32).collect(),
+                    output_mapping,
                 })
             } else {
                 Some(DispatchStrategy {
@@ -131,10 +145,10 @@ impl StreamNode for StreamExchange {
                         }
                         _ => vec![],
                     },
-                    output_indices: (0..self.schema().len() as u32).collect(),
+                    output_mapping,
                 })
             },
-        })
+        }))
     }
 }
 

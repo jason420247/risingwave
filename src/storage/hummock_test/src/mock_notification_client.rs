@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use risingwave_common::util::addr::HostAddr;
-use risingwave_common_service::observer_manager::{Channel, NotificationClient, ObserverError};
+use risingwave_common_service::{Channel, NotificationClient, ObserverError};
+use risingwave_meta::controller::cluster::ClusterControllerRef;
 use risingwave_meta::hummock::{HummockManager, HummockManagerRef};
 use risingwave_meta::manager::{MessageStatus, MetaSrvEnv, NotificationManagerRef, WorkerKey};
 use risingwave_pb::backup_service::MetaBackupManifestId;
-use risingwave_pb::common::WorkerNode;
 use risingwave_pb::hummock::WriteLimits;
 use risingwave_pb::meta::{MetaSnapshot, SubscribeResponse, SubscribeType};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -57,12 +57,11 @@ impl NotificationClient for MockNotificationClient {
 
         let worker_key = WorkerKey(self.addr.to_protobuf());
         self.notification_manager
-            .insert_sender(subscribe_type, worker_key.clone(), tx.clone())
-            .await;
+            .insert_sender(subscribe_type, worker_key.clone(), tx.clone());
 
         let hummock_version = self.hummock_manager.get_current_version().await;
         let meta_snapshot = MetaSnapshot {
-            hummock_version: Some(hummock_version.to_protobuf()),
+            hummock_version: Some(hummock_version.into()),
             version: Some(Default::default()),
             meta_backup_manifest_id: Some(MetaBackupManifestId { id: 0 }),
             hummock_write_limits: Some(WriteLimits {
@@ -78,11 +77,18 @@ impl NotificationClient for MockNotificationClient {
     }
 }
 
-pub fn get_notification_client_for_test(
+pub async fn get_notification_client_for_test(
     env: MetaSrvEnv,
     hummock_manager_ref: Arc<HummockManager>,
-    worker_node: WorkerNode,
+    cluster_controller_ref: ClusterControllerRef,
+    worker_id: i32,
 ) -> MockNotificationClient {
+    let worker_node = cluster_controller_ref
+        .get_worker_by_id(worker_id)
+        .await
+        .unwrap()
+        .unwrap();
+
     MockNotificationClient::new(
         worker_node.get_host().unwrap().into(),
         env.notification_manager_ref(),

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,8 +33,8 @@ fn string_agg(
 #[cfg(test)]
 mod tests {
     use risingwave_common::array::*;
-    use risingwave_expr::aggregate::{build_append_only, AggCall};
     use risingwave_expr::Result;
+    use risingwave_expr::aggregate::{AggCall, build_append_only};
 
     #[tokio::test]
     async fn test_string_agg_basic() -> Result<()> {
@@ -48,7 +48,7 @@ mod tests {
         let string_agg = build_append_only(&AggCall::from_pretty(
             "(string_agg:varchar $0:varchar $1:varchar)",
         ))?;
-        let mut state = string_agg.create_state();
+        let mut state = string_agg.create_state()?;
         string_agg.update(&mut state, &chunk).await?;
         assert_eq!(
             string_agg.get_result(&state).await?,
@@ -69,7 +69,7 @@ mod tests {
         let string_agg = build_append_only(&AggCall::from_pretty(
             "(string_agg:varchar $0:varchar $1:varchar)",
         ))?;
-        let mut state = string_agg.create_state();
+        let mut state = string_agg.create_state()?;
         string_agg.update(&mut state, &chunk).await?;
         assert_eq!(
             string_agg.get_result(&state).await?,

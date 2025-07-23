@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
-use risingwave_common::error::{ErrorCode, Result};
-use risingwave_common::util::epoch::Epoch;
+use risingwave_common::session_config::VisibilityMode;
+use risingwave_hummock_sdk::EpochWithGap;
 
 use super::SessionImpl;
 use crate::catalog::catalog_service::CatalogWriter;
+use crate::error::{ErrorCode, Result};
 use crate::scheduler::ReadSnapshot;
 use crate::user::user_service::UserInfoWriter;
 
@@ -137,6 +138,11 @@ impl SessionImpl {
             // explicit transaction.
             State::Initial => unreachable!("no implicit transaction in progress"),
             State::Implicit(ctx) => {
+                if self.config().visibility_mode() == VisibilityMode::All {
+                    self.notice_to_user(
+                        "`visibility_mode` is set to `All`, and there is no consistency ensured in the transaction",
+                    );
+                }
                 *txn = State::Explicit(Context {
                     id: ctx.id,
                     access_mode,
@@ -195,6 +201,15 @@ impl SessionImpl {
         })
     }
 
+    pub fn get_pinned_snapshot(&self) -> Option<ReadSnapshot> {
+        self.txn_ctx().snapshot.clone()
+    }
+
+    /// Unpin snapshot by replacing the snapshot with None.
+    pub fn unpin_snapshot(&self) {
+        self.txn_ctx().snapshot = None;
+    }
+
     /// Acquires and pins a snapshot for the current transaction.
     ///
     /// If a snapshot is already acquired, returns it directly.
@@ -202,19 +217,23 @@ impl SessionImpl {
         self.txn_ctx()
             .snapshot
             .get_or_insert_with(|| {
-                let query_epoch = self.config().query_epoch().map(|epoch| Epoch(epoch.get()));
+                // query_epoch must be pure epoch
+                let query_epoch = self
+                    .config()
+                    .query_epoch()
+                    .map(|epoch| EpochWithGap::from_u64(epoch.get()).pure_epoch().into());
 
                 if let Some(query_epoch) = query_epoch {
                     ReadSnapshot::Other(query_epoch)
+                } else if self.is_barrier_read() {
+                    ReadSnapshot::ReadUncommitted
                 } else {
                     // Acquire hummock snapshot for execution.
-                    let is_barrier_read = self.is_barrier_read();
                     let hummock_snapshot_manager = self.env().hummock_snapshot_manager();
                     let pinned_snapshot = hummock_snapshot_manager.acquire();
 
                     ReadSnapshot::FrontendPinned {
                         snapshot: pinned_snapshot,
-                        is_barrier_read,
                     }
                 }
             })

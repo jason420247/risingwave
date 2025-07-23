@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,18 +14,19 @@
 
 use std::sync::Arc;
 
-use risingwave_common::catalog::{ColumnDesc, TableId, TableOption};
+use risingwave_common::catalog::ColumnId;
 use risingwave_common::hash::{HashKey, HashKeyDispatcher};
 use risingwave_common::types::DataType;
-use risingwave_common::util::sort_util::OrderType;
-use risingwave_expr::expr::{build_non_strict_from_prost, NonStrictExpression};
+use risingwave_expr::expr::{NonStrictExpression, build_non_strict_from_prost};
 use risingwave_pb::plan_common::{JoinType as JoinTypeProto, StorageTableDesc};
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
-use risingwave_storage::table::Distribution;
+use risingwave_storage::table::batch_table::BatchTable;
 
 use super::*;
+use crate::common::table::state_table::StateTable;
 use crate::executor::monitor::StreamingMetrics;
-use crate::executor::{ActorContextRef, JoinType, TemporalJoinExecutor};
+use crate::executor::{
+    ActorContextRef, JoinType, NestedLoopTemporalJoinExecutor, TemporalJoinExecutor,
+};
 use crate::task::AtomicU64Ref;
 
 pub struct TemporalJoinExecutorBuilder;
@@ -37,100 +38,8 @@ impl ExecutorBuilder for TemporalJoinExecutorBuilder {
         params: ExecutorParams,
         node: &Self::Node,
         store: impl StateStore,
-        stream: &mut LocalStreamManagerCore,
-    ) -> StreamResult<BoxedExecutor> {
+    ) -> StreamResult<Executor> {
         let table_desc: &StorageTableDesc = node.get_table_desc()?;
-        let table = {
-            let table_id = TableId {
-                table_id: table_desc.table_id,
-            };
-
-            let order_types = table_desc
-                .pk
-                .iter()
-                .map(|desc| OrderType::from_protobuf(desc.get_order_type().unwrap()))
-                .collect_vec();
-
-            let column_descs = table_desc
-                .columns
-                .iter()
-                .map(ColumnDesc::from)
-                .collect_vec();
-            let column_ids = column_descs.iter().map(|x| x.column_id).collect_vec();
-
-            // Use indices based on full table instead of streaming executor output.
-            let pk_indices = table_desc
-                .pk
-                .iter()
-                .map(|k| k.column_index as usize)
-                .collect_vec();
-
-            let dist_key_in_pk_indices = table_desc
-                .dist_key_in_pk_indices
-                .iter()
-                .map(|&k| k as usize)
-                .collect_vec();
-            let distribution = match params.vnode_bitmap.clone() {
-                Some(vnodes) => Distribution {
-                    dist_key_in_pk_indices,
-                    vnodes: vnodes.into(),
-                },
-                None => Distribution::fallback(),
-            };
-
-            let table_option = TableOption {
-                retention_seconds: if table_desc.retention_seconds > 0 {
-                    Some(table_desc.retention_seconds)
-                } else {
-                    None
-                },
-            };
-
-            let value_indices = table_desc
-                .get_value_indices()
-                .iter()
-                .map(|&k| k as usize)
-                .collect_vec();
-
-            let prefix_hint_len = table_desc.get_read_prefix_len_hint() as usize;
-
-            StorageTable::new_partial(
-                store,
-                table_id,
-                column_descs,
-                column_ids,
-                order_types,
-                pk_indices,
-                distribution,
-                table_option,
-                value_indices,
-                prefix_hint_len,
-                table_desc.versioned,
-            )
-        };
-
-        let table_stream_key_indices = table_desc
-            .stream_key
-            .iter()
-            .map(|&k| k as usize)
-            .collect_vec();
-
-        let [source_l, source_r]: [_; 2] = params.input.try_into().unwrap();
-
-        let left_join_keys = node
-            .get_left_key()
-            .iter()
-            .map(|key| *key as usize)
-            .collect_vec();
-
-        let right_join_keys = node
-            .get_right_key()
-            .iter()
-            .map(|key| *key as usize)
-            .collect_vec();
-
-        let null_safe = node.get_null_safe().to_vec();
-
         let condition = match node.get_condition() {
             Ok(cond_prost) => Some(build_non_strict_from_prost(
                 cond_prost,
@@ -150,42 +59,127 @@ impl ExecutorBuilder for TemporalJoinExecutorBuilder {
             .iter()
             .map(|&x| x as usize)
             .collect_vec();
+        let [source_l, source_r]: [_; 2] = params.input.try_into().unwrap();
 
-        let join_key_data_types = left_join_keys
-            .iter()
-            .map(|idx| source_l.schema().fields[*idx].data_type())
-            .collect_vec();
+        if node.get_is_nested_loop() {
+            let right_table = BatchTable::new_partial(
+                store.clone(),
+                table_output_indices
+                    .iter()
+                    .map(|&x| ColumnId::new(table_desc.columns[x].column_id))
+                    .collect_vec(),
+                params.vnode_bitmap.clone().map(Into::into),
+                table_desc,
+            );
 
-        let dispatcher_args = TemporalJoinExecutorDispatcherArgs {
-            ctx: params.actor_context,
-            info: params.info,
-            left: source_l,
-            right: source_r,
-            right_table: table,
-            left_join_keys,
-            right_join_keys,
-            null_safe,
-            condition,
-            output_indices,
-            table_output_indices,
-            table_stream_key_indices,
-            watermark_epoch: stream.get_watermark_epoch(),
-            chunk_size: params.env.config().developer.chunk_size,
-            metrics: params.executor_stats,
-            join_type_proto: node.get_join_type()?,
-            join_key_data_types,
-        };
+            let dispatcher_args = NestedLoopTemporalJoinExecutorDispatcherArgs {
+                ctx: params.actor_context,
+                info: params.info.clone(),
+                left: source_l,
+                right: source_r,
+                right_table,
+                condition,
+                output_indices,
+                chunk_size: params.env.config().developer.chunk_size,
+                metrics: params.executor_stats,
+                join_type_proto: node.get_join_type()?,
+            };
+            Ok((params.info, dispatcher_args.dispatch()?).into())
+        } else {
+            let table = {
+                let column_ids = table_desc
+                    .columns
+                    .iter()
+                    .map(|x| ColumnId::new(x.column_id))
+                    .collect_vec();
 
-        dispatcher_args.dispatch()
+                BatchTable::new_partial(
+                    store.clone(),
+                    column_ids,
+                    params.vnode_bitmap.clone().map(Into::into),
+                    table_desc,
+                )
+            };
+
+            let table_stream_key_indices = table_desc
+                .stream_key
+                .iter()
+                .map(|&k| k as usize)
+                .collect_vec();
+
+            let left_join_keys = node
+                .get_left_key()
+                .iter()
+                .map(|key| *key as usize)
+                .collect_vec();
+
+            let right_join_keys = node
+                .get_right_key()
+                .iter()
+                .map(|key| *key as usize)
+                .collect_vec();
+
+            let null_safe = node.get_null_safe().to_vec();
+
+            let join_key_data_types = left_join_keys
+                .iter()
+                .map(|idx| source_l.schema().fields[*idx].data_type())
+                .collect_vec();
+
+            let memo_table = node.get_memo_table();
+            let memo_table = match memo_table {
+                Ok(memo_table) => {
+                    let vnodes = Arc::new(
+                        params
+                            .vnode_bitmap
+                            .expect("vnodes not set for temporal join"),
+                    );
+                    Some(
+                        StateTable::from_table_catalog(
+                            memo_table,
+                            store.clone(),
+                            Some(vnodes.clone()),
+                        )
+                        .await,
+                    )
+                }
+                Err(_) => None,
+            };
+            let append_only = memo_table.is_none();
+
+            let dispatcher_args = TemporalJoinExecutorDispatcherArgs {
+                ctx: params.actor_context,
+                info: params.info.clone(),
+                left: source_l,
+                right: source_r,
+                right_table: table,
+                left_join_keys,
+                right_join_keys,
+                null_safe,
+                condition,
+                output_indices,
+                table_output_indices,
+                table_stream_key_indices,
+                watermark_epoch: params.watermark_epoch,
+                chunk_size: params.env.config().developer.chunk_size,
+                metrics: params.executor_stats,
+                join_type_proto: node.get_join_type()?,
+                join_key_data_types,
+                memo_table,
+                append_only,
+            };
+
+            Ok((params.info, dispatcher_args.dispatch()?).into())
+        }
     }
 }
 
 struct TemporalJoinExecutorDispatcherArgs<S: StateStore> {
     ctx: ActorContextRef,
     info: ExecutorInfo,
-    left: BoxedExecutor,
-    right: BoxedExecutor,
-    right_table: StorageTable<S>,
+    left: Executor,
+    right: Executor,
+    right_table: BatchTable<S>,
     left_join_keys: Vec<usize>,
     right_join_keys: Vec<usize>,
     null_safe: Vec<bool>,
@@ -198,19 +192,22 @@ struct TemporalJoinExecutorDispatcherArgs<S: StateStore> {
     metrics: Arc<StreamingMetrics>,
     join_type_proto: JoinTypeProto,
     join_key_data_types: Vec<DataType>,
+    memo_table: Option<StateTable<S>>,
+    append_only: bool,
 }
 
 impl<S: StateStore> HashKeyDispatcher for TemporalJoinExecutorDispatcherArgs<S> {
-    type Output = StreamResult<BoxedExecutor>;
+    type Output = StreamResult<Box<dyn Execute>>;
 
     fn dispatch_impl<K: HashKey>(self) -> Self::Output {
         /// This macro helps to fill the const generic type parameter.
         macro_rules! build {
-            ($join_type:ident) => {
+            ($join_type:ident, $append_only:ident) => {
                 Ok(Box::new(TemporalJoinExecutor::<
                     K,
                     S,
                     { JoinType::$join_type },
+                    { $append_only },
                 >::new(
                     self.ctx,
                     self.info,
@@ -228,17 +225,76 @@ impl<S: StateStore> HashKeyDispatcher for TemporalJoinExecutorDispatcherArgs<S> 
                     self.metrics,
                     self.chunk_size,
                     self.join_key_data_types,
+                    self.memo_table,
                 )))
             };
         }
         match self.join_type_proto {
-            JoinTypeProto::Inner => build!(Inner),
-            JoinTypeProto::LeftOuter => build!(LeftOuter),
+            JoinTypeProto::Inner => {
+                if self.append_only {
+                    build!(Inner, true)
+                } else {
+                    build!(Inner, false)
+                }
+            }
+            JoinTypeProto::LeftOuter => {
+                if self.append_only {
+                    build!(LeftOuter, true)
+                } else {
+                    build!(LeftOuter, false)
+                }
+            }
             _ => unreachable!(),
         }
     }
 
     fn data_types(&self) -> &[DataType] {
         &self.join_key_data_types
+    }
+}
+
+struct NestedLoopTemporalJoinExecutorDispatcherArgs<S: StateStore> {
+    ctx: ActorContextRef,
+    info: ExecutorInfo,
+    left: Executor,
+    right: Executor,
+    right_table: BatchTable<S>,
+    condition: Option<NonStrictExpression>,
+    output_indices: Vec<usize>,
+    chunk_size: usize,
+    metrics: Arc<StreamingMetrics>,
+    join_type_proto: JoinTypeProto,
+}
+
+impl<S: StateStore> NestedLoopTemporalJoinExecutorDispatcherArgs<S> {
+    fn dispatch(self) -> StreamResult<Box<dyn Execute>> {
+        /// This macro helps to fill the const generic type parameter.
+        macro_rules! build {
+            ($join_type:ident) => {
+                Ok(Box::new(NestedLoopTemporalJoinExecutor::<
+                    S,
+                    { JoinType::$join_type },
+                >::new(
+                    self.ctx,
+                    self.info,
+                    self.left,
+                    self.right,
+                    self.right_table,
+                    self.condition,
+                    self.output_indices,
+                    self.metrics,
+                    self.chunk_size,
+                )))
+            };
+        }
+        match self.join_type_proto {
+            JoinTypeProto::Inner => {
+                build!(Inner)
+            }
+            JoinTypeProto::LeftOuter => {
+                build!(LeftOuter)
+            }
+            _ => unreachable!(),
+        }
     }
 }

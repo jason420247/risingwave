@@ -1,14 +1,13 @@
 ---
-version: "3"
 services:
   risingwave-standalone:
     extends:
       file: ../../docker/docker-compose.yml
       service: risingwave-standalone
-  etcd-0:
+  postgres-0:
     extends:
       file: ../../docker/docker-compose.yml
-      service: etcd-0
+      service: postgres-0
   grafana-0:
     extends:
       file: ../../docker/docker-compose.yml
@@ -24,13 +23,13 @@ services:
   # Use this command to connect to the DB from outside the container:
   #   docker exec postgres psql --username=myuser --dbname=mydb
   postgres:
-    image: postgres:14-alpine
+    image: postgres:17-alpine
     environment:
       - POSTGRES_USER=myuser
       - POSTGRES_PASSWORD=123456
       - POSTGRES_DB=mydb
     ports:
-      - 8432:5432
+      - 5432:5432
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready --username=myuser --dbname=mydb" ]
       interval: 5s
@@ -78,7 +77,7 @@ services:
 volumes:
   risingwave-standalone:
     external: false
-  etcd-0:
+  postgres-0:
     external: false
   grafana-0:
     external: false

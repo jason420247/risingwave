@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,33 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use risingwave_common_service::observer_manager::{ObserverState, SubscribeHummock};
+use risingwave_common::license::LicenseManager;
+use risingwave_common_service::ObserverState;
 use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
 use risingwave_hummock_trace::TraceSpan;
 use risingwave_pb::catalog::Table;
-use risingwave_pb::meta::relation::RelationInfo;
-use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use risingwave_pb::meta::SubscribeResponse;
+use risingwave_pb::meta::object::PbObjectInfo;
+use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::filter_key_extractor::{FilterKeyExtractorImpl, FilterKeyExtractorManagerRef};
+use crate::compaction_catalog_manager::CompactionCatalogManagerRef;
 use crate::hummock::backup_reader::BackupReaderRef;
-use crate::hummock::event_handler::{HummockEvent, HummockVersionUpdate};
+use crate::hummock::event_handler::HummockVersionUpdate;
 use crate::hummock::write_limiter::WriteLimiterRef;
 
 pub struct HummockObserverNode {
-    filter_key_extractor_manager: FilterKeyExtractorManagerRef,
+    compaction_catalog_manager: CompactionCatalogManagerRef,
     backup_reader: BackupReaderRef,
     write_limiter: WriteLimiterRef,
-    version_update_sender: UnboundedSender<HummockEvent>,
+    version_update_sender: UnboundedSender<HummockVersionUpdate>,
     version: u64,
 }
 
 impl ObserverState for HummockObserverNode {
-    type SubscribeType = SubscribeHummock;
+    fn subscribe_type() -> risingwave_pb::meta::SubscribeType {
+        risingwave_pb::meta::SubscribeType::Hummock
+    }
 
     fn handle_notification(&mut self, resp: SubscribeResponse) {
         let Some(info) = resp.info.as_ref() else {
@@ -49,39 +49,35 @@ impl ObserverState for HummockObserverNode {
             TraceSpan::new_meta_message_span(resp.clone());
 
         match info.to_owned() {
-            Info::RelationGroup(relation_group) => {
-                for relation in relation_group.relations {
-                    match relation.relation_info.unwrap() {
-                        RelationInfo::Table(table_catalog) => {
-                            assert!(
-                                resp.version > self.version,
-                                "resp version={:?}, current version={:?}",
-                                resp.version,
-                                self.version
-                            );
-
+            Info::ObjectGroup(object_group) => {
+                for object in object_group.objects {
+                    match object.object_info.unwrap() {
+                        PbObjectInfo::Table(table_catalog) => {
                             self.handle_catalog_notification(resp.operation(), table_catalog);
-
-                            self.version = resp.version;
                         }
                         _ => panic!("error type notification"),
                     };
                 }
+                assert!(
+                    resp.version > self.version,
+                    "resp version={:?}, current version={:?}",
+                    resp.version,
+                    self.version
+                );
+                self.version = resp.version;
             }
             Info::HummockVersionDeltas(hummock_version_deltas) => {
                 let _ = self
                     .version_update_sender
-                    .send(HummockEvent::VersionUpdate(
-                        HummockVersionUpdate::VersionDeltas(
-                            hummock_version_deltas
-                                .version_deltas
-                                .iter()
-                                .map(HummockVersionDelta::from_rpc_protobuf)
-                                .collect(),
-                        ),
+                    .send(HummockVersionUpdate::VersionDeltas(
+                        hummock_version_deltas
+                            .version_deltas
+                            .iter()
+                            .map(HummockVersionDelta::from_rpc_protobuf)
+                            .collect(),
                     ))
                     .inspect_err(|e| {
-                        tracing::error!("unable to send version delta: {:?}", e);
+                        tracing::error!(event = ?e.0, "unable to send version delta");
                     });
             }
 
@@ -92,6 +88,10 @@ impl ObserverState for HummockObserverNode {
             Info::HummockWriteLimits(write_limits) => {
                 self.write_limiter
                     .update_write_limits(write_limits.write_limits);
+            }
+
+            Info::ComputeNodeTotalCpuCount(count) => {
+                LicenseManager::get().update_cpu_core_count(count as _);
             }
 
             _ => {
@@ -123,30 +123,31 @@ impl ObserverState for HummockObserverNode {
         );
         let _ = self
             .version_update_sender
-            .send(HummockEvent::VersionUpdate(
-                HummockVersionUpdate::PinnedVersion(HummockVersion::from_rpc_protobuf(
+            .send(HummockVersionUpdate::PinnedVersion(Box::new(
+                HummockVersion::from_rpc_protobuf(
                     &snapshot
                         .hummock_version
                         .expect("should get hummock version"),
-                )),
-            ))
+                ),
+            )))
             .inspect_err(|e| {
-                tracing::error!("unable to send full version: {:?}", e);
+                tracing::error!(event = ?e.0, "unable to send full version");
             });
         let snapshot_version = snapshot.version.unwrap();
         self.version = snapshot_version.catalog_version;
+        LicenseManager::get().update_cpu_core_count(snapshot.compute_node_total_cpu_count as _);
     }
 }
 
 impl HummockObserverNode {
     pub fn new(
-        filter_key_extractor_manager: FilterKeyExtractorManagerRef,
+        compaction_catalog_manager: CompactionCatalogManagerRef,
         backup_reader: BackupReaderRef,
-        version_update_sender: UnboundedSender<HummockEvent>,
+        version_update_sender: UnboundedSender<HummockVersionUpdate>,
         write_limiter: WriteLimiterRef,
     ) -> Self {
         Self {
-            filter_key_extractor_manager,
+            compaction_catalog_manager,
             backup_reader,
             version_update_sender,
             version: 0,
@@ -155,25 +156,19 @@ impl HummockObserverNode {
     }
 
     fn handle_catalog_snapshot(&mut self, tables: Vec<Table>) {
-        let all_filter_key_extractors: HashMap<u32, Arc<FilterKeyExtractorImpl>> = tables
-            .iter()
-            .map(|t| (t.id, Arc::new(FilterKeyExtractorImpl::from_table(t))))
-            .collect();
-        self.filter_key_extractor_manager
-            .sync(all_filter_key_extractors);
+        self.compaction_catalog_manager
+            .sync(tables.into_iter().map(|t| (t.id, t)).collect());
     }
 
     fn handle_catalog_notification(&mut self, operation: Operation, table_catalog: Table) {
         match operation {
             Operation::Add | Operation::Update => {
-                self.filter_key_extractor_manager.update(
-                    table_catalog.id,
-                    Arc::new(FilterKeyExtractorImpl::from_table(&table_catalog)),
-                );
+                self.compaction_catalog_manager
+                    .update(table_catalog.id, table_catalog);
             }
 
             Operation::Delete => {
-                self.filter_key_extractor_manager.remove(table_catalog.id);
+                self.compaction_catalog_manager.remove(table_catalog.id);
             }
 
             _ => panic!("receive an unsupported notify {:?}", operation),

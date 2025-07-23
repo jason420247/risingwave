@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,40 +11,51 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 use core::fmt::Debug;
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use core::num::NonZeroU64;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::anyhow;
+use clickhouse::insert::Insert;
 use clickhouse::{Client as ClickHouseClient, Row as ClickHouseRow};
 use itertools::Itertools;
+use phf::{Set, phf_set};
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::catalog::Schema;
 use risingwave_common::row::Row;
 use risingwave_common::types::{DataType, Decimal, ScalarRefImpl, Serial};
-use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::Serialize;
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde_derive::Deserialize;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
+use thiserror_ext::AsReport;
+use tonic::async_trait;
+use tracing::warn;
 use with_options::WithOptions;
 
-use super::{DummySinkCommitCoordinator, SinkWriterParam};
-use crate::sink::catalog::desc::SinkDesc;
-use crate::sink::log_store::DeliveryFutureManagerAddFuture;
-use crate::sink::writer::{
-    AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter, AsyncTruncateSinkWriterExt,
+use super::decouple_checkpoint_log_sink::{
+    DecoupleCheckpointLogSinkerOf, default_commit_checkpoint_interval,
 };
+use super::writer::SinkWriter;
+use super::{SinkWriterMetrics, SinkWriterParam};
+use crate::enforce_secret::EnforceSecret;
+use crate::error::ConnectorResult;
 use crate::sink::{
-    Result, Sink, SinkError, SinkParam, SINK_TYPE_APPEND_ONLY, SINK_TYPE_OPTION, SINK_TYPE_UPSERT,
+    Result, SINK_TYPE_APPEND_ONLY, SINK_TYPE_OPTION, SINK_TYPE_UPSERT, Sink, SinkError, SinkParam,
 };
 
 const QUERY_ENGINE: &str =
-    "select distinct ?fields from system.tables where database = ? and table = ?";
+    "select distinct ?fields from system.tables where database = ? and name = ?";
 const QUERY_COLUMN: &str =
     "select distinct ?fields from system.columns where database = ? and table = ? order by ?";
 pub const CLICKHOUSE_SINK: &str = "clickhouse";
-const BUFFER_SIZE: usize = 1024;
 
+const ALLOW_EXPERIMENTAL_JSON_TYPE: &str = "allow_experimental_json_type";
+const INPUT_FORMAT_BINARY_READ_JSON_AS_STRING: &str = "input_format_binary_read_json_as_string";
+const OUTPUT_FORMAT_BINARY_WRITE_JSON_AS_STRING: &str = "output_format_binary_write_json_as_string";
+
+#[serde_as]
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct ClickHouseCommon {
     #[serde(rename = "clickhouse.url")]
@@ -57,18 +68,46 @@ pub struct ClickHouseCommon {
     pub database: String,
     #[serde(rename = "clickhouse.table")]
     pub table: String,
+    #[serde(rename = "clickhouse.delete.column")]
+    pub delete_column: Option<String>,
+    /// Commit every n(>0) checkpoints, default is 10.
+    #[serde(default = "default_commit_checkpoint_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[with_option(allow_alter_on_fly)]
+    pub commit_checkpoint_interval: u64,
+}
+
+impl EnforceSecret for ClickHouseCommon {
+    const ENFORCE_SECRET_PROPERTIES: Set<&'static str> = phf_set! {
+        "clickhouse.password", "clickhouse.user"
+    };
 }
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 enum ClickHouseEngine {
     MergeTree,
-    ReplacingMergeTree,
+    ReplacingMergeTree(Option<String>),
     SummingMergeTree,
     AggregatingMergeTree,
     CollapsingMergeTree(String),
     VersionedCollapsingMergeTree(String),
     GraphiteMergeTree,
+    ReplicatedMergeTree,
+    ReplicatedReplacingMergeTree(Option<String>),
+    ReplicatedSummingMergeTree,
+    ReplicatedAggregatingMergeTree,
+    ReplicatedCollapsingMergeTree(String),
+    ReplicatedVersionedCollapsingMergeTree(String),
+    ReplicatedGraphiteMergeTree,
+    SharedMergeTree,
+    SharedReplacingMergeTree(Option<String>),
+    SharedSummingMergeTree,
+    SharedAggregatingMergeTree,
+    SharedCollapsingMergeTree(String),
+    SharedVersionedCollapsingMergeTree(String),
+    SharedGraphiteMergeTree,
+    Null,
 }
 impl ClickHouseEngine {
     pub fn is_collapsing_engine(&self) -> bool {
@@ -76,50 +115,194 @@ impl ClickHouseEngine {
             self,
             ClickHouseEngine::CollapsingMergeTree(_)
                 | ClickHouseEngine::VersionedCollapsingMergeTree(_)
+                | ClickHouseEngine::ReplicatedCollapsingMergeTree(_)
+                | ClickHouseEngine::ReplicatedVersionedCollapsingMergeTree(_)
+                | ClickHouseEngine::SharedCollapsingMergeTree(_)
+                | ClickHouseEngine::SharedVersionedCollapsingMergeTree(_)
         )
     }
 
-    pub fn get_sign_name(&self) -> Option<String> {
+    pub fn is_delete_replacing_engine(&self) -> bool {
         match self {
-            ClickHouseEngine::CollapsingMergeTree(sign_name) => Some(sign_name.to_string()),
-            ClickHouseEngine::VersionedCollapsingMergeTree(sign_name) => {
-                Some(sign_name.to_string())
+            ClickHouseEngine::ReplacingMergeTree(delete_col) => delete_col.is_some(),
+            ClickHouseEngine::ReplicatedReplacingMergeTree(delete_col) => delete_col.is_some(),
+            ClickHouseEngine::SharedReplacingMergeTree(delete_col) => delete_col.is_some(),
+            _ => false,
+        }
+    }
+
+    pub fn get_delete_col(&self) -> Option<String> {
+        match self {
+            ClickHouseEngine::ReplacingMergeTree(Some(delete_col)) => Some(delete_col.clone()),
+            ClickHouseEngine::ReplicatedReplacingMergeTree(Some(delete_col)) => {
+                Some(delete_col.clone())
+            }
+            ClickHouseEngine::SharedReplacingMergeTree(Some(delete_col)) => {
+                Some(delete_col.clone())
             }
             _ => None,
         }
     }
 
-    pub fn from_query_engine(engine_name: &ClickhouseQueryEngine) -> Result<Self> {
+    pub fn get_sign_name(&self) -> Option<String> {
+        match self {
+            ClickHouseEngine::CollapsingMergeTree(sign_name) => Some(sign_name.clone()),
+            ClickHouseEngine::VersionedCollapsingMergeTree(sign_name) => Some(sign_name.clone()),
+            ClickHouseEngine::ReplicatedCollapsingMergeTree(sign_name) => Some(sign_name.clone()),
+            ClickHouseEngine::ReplicatedVersionedCollapsingMergeTree(sign_name) => {
+                Some(sign_name.clone())
+            }
+            ClickHouseEngine::SharedCollapsingMergeTree(sign_name) => Some(sign_name.clone()),
+            ClickHouseEngine::SharedVersionedCollapsingMergeTree(sign_name) => {
+                Some(sign_name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_shared_tree(&self) -> bool {
+        matches!(
+            self,
+            ClickHouseEngine::SharedMergeTree
+                | ClickHouseEngine::SharedReplacingMergeTree(_)
+                | ClickHouseEngine::SharedSummingMergeTree
+                | ClickHouseEngine::SharedAggregatingMergeTree
+                | ClickHouseEngine::SharedCollapsingMergeTree(_)
+                | ClickHouseEngine::SharedVersionedCollapsingMergeTree(_)
+                | ClickHouseEngine::SharedGraphiteMergeTree
+        )
+    }
+
+    pub fn from_query_engine(
+        engine_name: &ClickhouseQueryEngine,
+        config: &ClickHouseConfig,
+    ) -> Result<Self> {
         match engine_name.engine.as_str() {
             "MergeTree" => Ok(ClickHouseEngine::MergeTree),
-            "ReplacingMergeTree" => Ok(ClickHouseEngine::ReplacingMergeTree),
+            "Null" => Ok(ClickHouseEngine::Null),
+            "ReplacingMergeTree" => {
+                let delete_column = config.common.delete_column.clone();
+                Ok(ClickHouseEngine::ReplacingMergeTree(delete_column))
+            }
             "SummingMergeTree" => Ok(ClickHouseEngine::SummingMergeTree),
             "AggregatingMergeTree" => Ok(ClickHouseEngine::AggregatingMergeTree),
+            // VersionedCollapsingMergeTree(sign_name,"a")
             "VersionedCollapsingMergeTree" => {
                 let sign_name = engine_name
                     .create_table_query
                     .split("VersionedCollapsingMergeTree(")
                     .last()
-                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_string()))?
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
                     .split(',')
                     .next()
-                    .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
-                    .to_string();
+                    .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
+                    .trim()
+                    .to_owned();
                 Ok(ClickHouseEngine::VersionedCollapsingMergeTree(sign_name))
             }
+            // CollapsingMergeTree(sign_name)
             "CollapsingMergeTree" => {
                 let sign_name = engine_name
                     .create_table_query
                     .split("CollapsingMergeTree(")
                     .last()
-                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_string()))?
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
                     .split(')')
                     .next()
-                    .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
-                    .to_string();
+                    .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
+                    .trim()
+                    .to_owned();
                 Ok(ClickHouseEngine::CollapsingMergeTree(sign_name))
             }
             "GraphiteMergeTree" => Ok(ClickHouseEngine::GraphiteMergeTree),
+            "ReplicatedMergeTree" => Ok(ClickHouseEngine::ReplicatedMergeTree),
+            "ReplicatedReplacingMergeTree" => {
+                let delete_column = config.common.delete_column.clone();
+                Ok(ClickHouseEngine::ReplicatedReplacingMergeTree(
+                    delete_column,
+                ))
+            }
+            "ReplicatedSummingMergeTree" => Ok(ClickHouseEngine::ReplicatedSummingMergeTree),
+            "ReplicatedAggregatingMergeTree" => {
+                Ok(ClickHouseEngine::ReplicatedAggregatingMergeTree)
+            }
+            // ReplicatedVersionedCollapsingMergeTree("a","b",sign_name,"c")
+            "ReplicatedVersionedCollapsingMergeTree" => {
+                let sign_name = engine_name
+                    .create_table_query
+                    .split("ReplicatedVersionedCollapsingMergeTree(")
+                    .last()
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
+                    .split(',')
+                    .rev()
+                    .nth(1)
+                    .ok_or_else(|| SinkError::ClickHouse("must have index 1".to_owned()))?
+                    .trim()
+                    .to_owned();
+                Ok(ClickHouseEngine::ReplicatedVersionedCollapsingMergeTree(
+                    sign_name,
+                ))
+            }
+            // ReplicatedCollapsingMergeTree("a","b",sign_name)
+            "ReplicatedCollapsingMergeTree" => {
+                let sign_name = engine_name
+                    .create_table_query
+                    .split("ReplicatedCollapsingMergeTree(")
+                    .last()
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
+                    .split(')')
+                    .next()
+                    .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
+                    .split(',')
+                    .next_back()
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
+                    .trim()
+                    .to_owned();
+                Ok(ClickHouseEngine::ReplicatedCollapsingMergeTree(sign_name))
+            }
+            "ReplicatedGraphiteMergeTree" => Ok(ClickHouseEngine::ReplicatedGraphiteMergeTree),
+            "SharedMergeTree" => Ok(ClickHouseEngine::SharedMergeTree),
+            "SharedReplacingMergeTree" => {
+                let delete_column = config.common.delete_column.clone();
+                Ok(ClickHouseEngine::SharedReplacingMergeTree(delete_column))
+            }
+            "SharedSummingMergeTree" => Ok(ClickHouseEngine::SharedSummingMergeTree),
+            "SharedAggregatingMergeTree" => Ok(ClickHouseEngine::SharedAggregatingMergeTree),
+            // SharedVersionedCollapsingMergeTree("a","b",sign_name,"c")
+            "SharedVersionedCollapsingMergeTree" => {
+                let sign_name = engine_name
+                    .create_table_query
+                    .split("SharedVersionedCollapsingMergeTree(")
+                    .last()
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
+                    .split(',')
+                    .rev()
+                    .nth(1)
+                    .ok_or_else(|| SinkError::ClickHouse("must have index 1".to_owned()))?
+                    .trim()
+                    .to_owned();
+                Ok(ClickHouseEngine::SharedVersionedCollapsingMergeTree(
+                    sign_name,
+                ))
+            }
+            // SharedCollapsingMergeTree("a","b",sign_name)
+            "SharedCollapsingMergeTree" => {
+                let sign_name = engine_name
+                    .create_table_query
+                    .split("SharedCollapsingMergeTree(")
+                    .last()
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
+                    .split(')')
+                    .next()
+                    .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
+                    .split(',')
+                    .next_back()
+                    .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
+                    .trim()
+                    .to_owned();
+                Ok(ClickHouseEngine::SharedCollapsingMergeTree(sign_name))
+            }
+            "SharedGraphiteMergeTree" => Ok(ClickHouseEngine::SharedGraphiteMergeTree),
             _ => Err(SinkError::ClickHouse(format!(
                 "Cannot find clickhouse engine {:?}",
                 engine_name.engine
@@ -128,22 +311,16 @@ impl ClickHouseEngine {
     }
 }
 
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-
 impl ClickHouseCommon {
-    pub(crate) fn build_client(&self) -> anyhow::Result<ClickHouseClient> {
-        use hyper_tls::HttpsConnector;
-
-        let https = HttpsConnector::new();
-        let client = hyper::Client::builder()
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .build::<_, hyper::Body>(https);
-
-        let client = ClickHouseClient::with_http_client(client)
+    pub(crate) fn build_client(&self) -> ConnectorResult<ClickHouseClient> {
+        let client = ClickHouseClient::default() // hyper(0.14) client inside
             .with_url(&self.url)
             .with_user(&self.user)
             .with_password(&self.password)
-            .with_database(&self.database);
+            .with_database(&self.database)
+            .with_option(ALLOW_EXPERIMENTAL_JSON_TYPE, "1")
+            .with_option(INPUT_FORMAT_BINARY_READ_JSON_AS_STRING, "1")
+            .with_option(OUTPUT_FORMAT_BINARY_WRITE_JSON_AS_STRING, "1");
         Ok(client)
     }
 }
@@ -157,6 +334,21 @@ pub struct ClickHouseConfig {
     pub r#type: String, // accept "append-only" or "upsert"
 }
 
+impl EnforceSecret for ClickHouseConfig {
+    fn enforce_one(prop: &str) -> crate::error::ConnectorResult<()> {
+        ClickHouseCommon::enforce_one(prop)
+    }
+
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            ClickHouseCommon::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClickHouseSink {
     pub config: ClickHouseConfig,
@@ -165,8 +357,19 @@ pub struct ClickHouseSink {
     is_append_only: bool,
 }
 
+impl EnforceSecret for ClickHouseSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            ClickHouseConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
+
 impl ClickHouseConfig {
-    pub fn from_hashmap(properties: HashMap<String, String>) -> Result<Self> {
+    pub fn from_btreemap(properties: BTreeMap<String, String>) -> Result<Self> {
         let config =
             serde_json::from_value::<ClickHouseConfig>(serde_json::to_value(properties).unwrap())
                 .map_err(|e| SinkError::Config(anyhow!(e)))?;
@@ -187,7 +390,7 @@ impl TryFrom<SinkParam> for ClickHouseSink {
 
     fn try_from(param: SinkParam) -> std::result::Result<Self, Self::Error> {
         let schema = param.schema();
-        let config = ClickHouseConfig::from_hashmap(param.properties)?;
+        let config = ClickHouseConfig::from_btreemap(param.properties)?;
         Ok(Self {
             config,
             schema,
@@ -207,7 +410,7 @@ impl ClickHouseSink {
             .collect();
 
         if rw_fields_name.len().gt(&clickhouse_columns_desc.len()) {
-            return Err(SinkError::ClickHouse("The nums of the RisingWave column must be greater than/equal to the length of the Clickhouse column".to_string()));
+            return Err(SinkError::ClickHouse("The columns of the sink must be equal to or a superset of the target table's columns.".to_owned()));
         }
 
         for i in rw_fields_name {
@@ -240,14 +443,14 @@ impl ClickHouseSink {
         {
             if !clickhouse_pks.remove(&field.name) {
                 return Err(SinkError::ClickHouse(
-                    "Clicklhouse and RisingWave pk is not match".to_string(),
+                    "Clicklhouse and RisingWave pk is not match".to_owned(),
                 ));
             }
         }
 
         if !clickhouse_pks.is_empty() {
             return Err(SinkError::ClickHouse(
-                "Clicklhouse and RisingWave pk is not match".to_string(),
+                "Clicklhouse and RisingWave pk is not match".to_owned(),
             ));
         }
         Ok(())
@@ -258,11 +461,14 @@ impl ClickHouseSink {
         fields_type: &DataType,
         ck_column: &SystemColumn,
     ) -> Result<()> {
+        // FIXME: the "contains" based implementation is wrong
         let is_match = match fields_type {
             risingwave_common::types::DataType::Boolean => Ok(ck_column.r#type.contains("Bool")),
-            risingwave_common::types::DataType::Int16 => {
-                Ok(ck_column.r#type.contains("UInt16") | ck_column.r#type.contains("Int16"))
-            }
+            risingwave_common::types::DataType::Int16 => Ok(ck_column.r#type.contains("UInt16")
+                | ck_column.r#type.contains("Int16")
+                // Allow Int16 to be pushed to Enum16, they share an encoding and value range
+                // No special care is taken to ensure values are valid.
+                | ck_column.r#type.contains("Enum16")),
             risingwave_common::types::DataType::Int32 => {
                 Ok(ck_column.r#type.contains("UInt32") | ck_column.r#type.contains("Int32"))
             }
@@ -275,36 +481,38 @@ impl ClickHouseSink {
             risingwave_common::types::DataType::Date => Ok(ck_column.r#type.contains("Date32")),
             risingwave_common::types::DataType::Varchar => Ok(ck_column.r#type.contains("String")),
             risingwave_common::types::DataType::Time => Err(SinkError::ClickHouse(
-                "clickhouse can not support Time".to_string(),
+                "clickhouse can not support Time".to_owned(),
             )),
             risingwave_common::types::DataType::Timestamp => Err(SinkError::ClickHouse(
-                "clickhouse does not have a type corresponding to naive timestamp".to_string(),
+                "clickhouse does not have a type corresponding to naive timestamp".to_owned(),
             )),
             risingwave_common::types::DataType::Timestamptz => {
                 Ok(ck_column.r#type.contains("DateTime64"))
             }
             risingwave_common::types::DataType::Interval => Err(SinkError::ClickHouse(
-                "clickhouse can not support Interval".to_string(),
+                "clickhouse can not support Interval".to_owned(),
             )),
             risingwave_common::types::DataType::Struct(_) => Err(SinkError::ClickHouse(
-                "struct needs to be converted into a list".to_string(),
+                "struct needs to be converted into a list".to_owned(),
             )),
             risingwave_common::types::DataType::List(list) => {
                 Self::check_and_correct_column_type(list.as_ref(), ck_column)?;
                 Ok(ck_column.r#type.contains("Array"))
             }
             risingwave_common::types::DataType::Bytea => Err(SinkError::ClickHouse(
-                "clickhouse can not support Bytea".to_string(),
+                "clickhouse can not support Bytea".to_owned(),
             )),
-            risingwave_common::types::DataType::Jsonb => Err(SinkError::ClickHouse(
-                "clickhouse rust can not support Json".to_string(),
-            )),
+            risingwave_common::types::DataType::Jsonb => Ok(ck_column.r#type.contains("JSON")),
             risingwave_common::types::DataType::Serial => {
                 Ok(ck_column.r#type.contains("UInt64") | ck_column.r#type.contains("Int64"))
             }
             risingwave_common::types::DataType::Int256 => Err(SinkError::ClickHouse(
-                "clickhouse can not support Int256".to_string(),
+                "clickhouse can not support Int256".to_owned(),
             )),
+            risingwave_common::types::DataType::Map(_) => Err(SinkError::ClickHouse(
+                "clickhouse can not support Map".to_owned(),
+            )),
+            DataType::Vector(_) => todo!("VECTOR_PLACEHOLDER"),
         };
         if !is_match? {
             return Err(SinkError::ClickHouse(format!(
@@ -316,21 +524,18 @@ impl ClickHouseSink {
         Ok(())
     }
 }
+
 impl Sink for ClickHouseSink {
-    type Coordinator = DummySinkCommitCoordinator;
-    type LogSinker = AsyncTruncateLogSinkerOf<ClickHouseSinkWriter>;
+    type LogSinker = DecoupleCheckpointLogSinkerOf<ClickHouseSinkWriter>;
 
     const SINK_NAME: &'static str = CLICKHOUSE_SINK;
-
-    fn default_sink_decouple(desc: &SinkDesc) -> bool {
-        desc.sink_type.is_append_only()
-    }
 
     async fn validate(&self) -> Result<()> {
         // For upsert clickhouse sink, the primary key must be defined.
         if !self.is_append_only && self.pk_indices.is_empty() {
             return Err(SinkError::Config(anyhow!(
-                "Primary key not defined for upsert clickhouse sink (please define in `primary_key` field)")));
+                "Primary key not defined for upsert clickhouse sink (please define in `primary_key` field)"
+            )));
         }
 
         // check reachability
@@ -338,40 +543,76 @@ impl Sink for ClickHouseSink {
 
         let (clickhouse_column, clickhouse_engine) =
             query_column_engine_from_ck(client, &self.config).await?;
+        if clickhouse_engine.is_shared_tree() {
+            risingwave_common::license::Feature::ClickHouseSharedEngine
+                .check_available()
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
 
-        if !self.is_append_only && !clickhouse_engine.is_collapsing_engine() {
-            return Err(SinkError::ClickHouse(
-                "If you want to use upsert, please modify your engine is `VersionedCollapsingMergeTree` or `CollapsingMergeTree` in ClickHouse".to_owned()));
+        if !self.is_append_only
+            && !clickhouse_engine.is_collapsing_engine()
+            && !clickhouse_engine.is_delete_replacing_engine()
+        {
+            return match clickhouse_engine {
+                ClickHouseEngine::ReplicatedReplacingMergeTree(None) | ClickHouseEngine::ReplacingMergeTree(None) | ClickHouseEngine::SharedReplacingMergeTree(None) =>  {
+                    Err(SinkError::ClickHouse("To enable upsert with a `ReplacingMergeTree`, you must set a `clickhouse.delete.column` to the UInt8 column in ClickHouse used to signify deletes. See https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree#is_deleted for more information".to_owned()))
+                }
+                _ => Err(SinkError::ClickHouse("If you want to use upsert, please use either `VersionedCollapsingMergeTree`, `CollapsingMergeTree` or the `ReplacingMergeTree` in ClickHouse".to_owned()))
+            };
         }
 
         self.check_column_name_and_type(&clickhouse_column)?;
         if !self.is_append_only {
             self.check_pk_match(&clickhouse_column)?;
         }
+
+        if self.config.common.commit_checkpoint_interval == 0 {
+            return Err(SinkError::Config(anyhow!(
+                "`commit_checkpoint_interval` must be greater than 0"
+            )));
+        }
         Ok(())
     }
 
-    async fn new_log_sinker(&self, _writer_param: SinkWriterParam) -> Result<Self::LogSinker> {
-        Ok(ClickHouseSinkWriter::new(
+    fn validate_alter_config(config: &BTreeMap<String, String>) -> Result<()> {
+        ClickHouseConfig::from_btreemap(config.clone())?;
+        Ok(())
+    }
+
+    async fn new_log_sinker(&self, writer_param: SinkWriterParam) -> Result<Self::LogSinker> {
+        let writer = ClickHouseSinkWriter::new(
             self.config.clone(),
             self.schema.clone(),
             self.pk_indices.clone(),
             self.is_append_only,
         )
-        .await?
-        .into_log_sinker(usize::MAX))
+        .await?;
+        let commit_checkpoint_interval =
+    NonZeroU64::new(self.config.common.commit_checkpoint_interval).expect(
+        "commit_checkpoint_interval should be greater than 0, and it should be checked in config validation",
+    );
+
+        Ok(DecoupleCheckpointLogSinkerOf::new(
+            writer,
+            SinkWriterMetrics::new(&writer_param),
+            commit_checkpoint_interval,
+        ))
     }
 }
 pub struct ClickHouseSinkWriter {
     pub config: ClickHouseConfig,
+    #[expect(dead_code)]
     schema: Schema,
+    #[expect(dead_code)]
     pk_indices: Vec<usize>,
     client: ClickHouseClient,
+    #[expect(dead_code)]
     is_append_only: bool,
     // Save some features of the clickhouse column type
     column_correct_vec: Vec<ClickHouseSchemaFeature>,
     rw_fields_name_after_calibration: Vec<String>,
     clickhouse_engine: ClickHouseEngine,
+    inserter: Option<Insert<ClickHouseColumn>>,
 }
 #[derive(Debug)]
 struct ClickHouseSchemaFeature {
@@ -406,6 +647,9 @@ impl ClickHouseSinkWriter {
         if let Some(sign) = clickhouse_engine.get_sign_name() {
             rw_fields_name_after_calibration.push(sign);
         }
+        if let Some(delete_col) = clickhouse_engine.get_delete_col() {
+            rw_fields_name_after_calibration.push(delete_col);
+        }
         Ok(Self {
             config,
             schema,
@@ -415,6 +659,7 @@ impl ClickHouseSinkWriter {
             column_correct_vec: column_correct_vec?,
             rw_fields_name_after_calibration,
             clickhouse_engine,
+            inserter: None,
         })
     }
 
@@ -428,15 +673,15 @@ impl ClickHouseSinkWriter {
                 .r#type
                 .split("DateTime64(")
                 .last()
-                .ok_or_else(|| SinkError::ClickHouse("must have last".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
                 .split(')')
                 .next()
-                .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
                 .split(',')
                 .next()
-                .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
                 .parse::<u8>()
-                .map_err(|e| SinkError::ClickHouse(format!("clickhouse sink error {}", e)))?
+                .map_err(|e| SinkError::ClickHouse(e.to_report_string()))?
         } else {
             0_u8
         };
@@ -445,29 +690,29 @@ impl ClickHouseSinkWriter {
                 .r#type
                 .split("Decimal(")
                 .last()
-                .ok_or_else(|| SinkError::ClickHouse("must have last".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have last".to_owned()))?
                 .split(')')
                 .next()
-                .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
                 .split(", ")
                 .collect_vec();
             let length = decimal_all
                 .first()
-                .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
                 .parse::<u8>()
-                .map_err(|e| SinkError::ClickHouse(format!("clickhouse sink error {}", e)))?;
+                .map_err(|e| SinkError::ClickHouse(e.to_report_string()))?;
 
             if length > 38 {
                 return Err(SinkError::ClickHouse(
-                    "RW don't support Decimal256".to_string(),
+                    "RW don't support Decimal256".to_owned(),
                 ));
             }
 
             let scale = decimal_all
                 .last()
-                .ok_or_else(|| SinkError::ClickHouse("must have next".to_string()))?
+                .ok_or_else(|| SinkError::ClickHouse("must have next".to_owned()))?
                 .parse::<u8>()
-                .map_err(|e| SinkError::ClickHouse(format!("clickhouse sink error {}", e)))?;
+                .map_err(|e| SinkError::ClickHouse(e.to_report_string()))?;
             (length, scale)
         } else {
             (0_u8, 0_u8)
@@ -480,10 +725,12 @@ impl ClickHouseSinkWriter {
     }
 
     async fn write(&mut self, chunk: StreamChunk) -> Result<()> {
-        let mut insert = self.client.insert_with_fields_name(
-            &self.config.common.table,
-            self.rw_fields_name_after_calibration.clone(),
-        )?;
+        if self.inserter.is_none() {
+            self.inserter = Some(self.client.insert_with_fields_name(
+                &self.config.common.table,
+                self.rw_fields_name_after_calibration.clone(),
+            )?);
+        }
         for (op, row) in chunk.rows() {
             let mut clickhouse_filed_vec = vec![];
             for (index, data) in row.iter().enumerate() {
@@ -495,40 +742,69 @@ impl ClickHouseSinkWriter {
             }
             match op {
                 Op::Insert | Op::UpdateInsert => {
-                    if self.clickhouse_engine.get_sign_name().is_some() {
+                    if self.clickhouse_engine.is_collapsing_engine() {
                         clickhouse_filed_vec.push(ClickHouseFieldWithNull::WithoutSome(
                             ClickHouseField::Int8(1),
                         ));
                     }
+                    if self.clickhouse_engine.is_delete_replacing_engine() {
+                        clickhouse_filed_vec.push(ClickHouseFieldWithNull::WithoutSome(
+                            ClickHouseField::Int8(0),
+                        ))
+                    }
                 }
                 Op::Delete | Op::UpdateDelete => {
-                    if !self.clickhouse_engine.is_collapsing_engine() {
+                    if !self.clickhouse_engine.is_collapsing_engine()
+                        && !self.clickhouse_engine.is_delete_replacing_engine()
+                    {
                         return Err(SinkError::ClickHouse(
-                            "Clickhouse engine don't support upsert".to_string(),
+                            "Clickhouse engine don't support upsert".to_owned(),
                         ));
                     }
-                    clickhouse_filed_vec.push(ClickHouseFieldWithNull::WithoutSome(
-                        ClickHouseField::Int8(-1),
-                    ))
+                    if self.clickhouse_engine.is_collapsing_engine() {
+                        clickhouse_filed_vec.push(ClickHouseFieldWithNull::WithoutSome(
+                            ClickHouseField::Int8(-1),
+                        ));
+                    }
+                    if self.clickhouse_engine.is_delete_replacing_engine() {
+                        clickhouse_filed_vec.push(ClickHouseFieldWithNull::WithoutSome(
+                            ClickHouseField::Int8(1),
+                        ))
+                    }
                 }
             }
             let clickhouse_column = ClickHouseColumn {
                 row: clickhouse_filed_vec,
             };
-            insert.write(&clickhouse_column).await?;
+            self.inserter
+                .as_mut()
+                .unwrap()
+                .write(&clickhouse_column)
+                .await?;
         }
-        insert.end().await?;
         Ok(())
     }
 }
 
-impl AsyncTruncateSinkWriter for ClickHouseSinkWriter {
-    async fn write_chunk<'a>(
-        &'a mut self,
-        chunk: StreamChunk,
-        _add_future: DeliveryFutureManagerAddFuture<'a, Self::DeliveryFuture>,
-    ) -> Result<()> {
+#[async_trait]
+impl SinkWriter for ClickHouseSinkWriter {
+    async fn write_batch(&mut self, chunk: StreamChunk) -> Result<()> {
         self.write(chunk).await
+    }
+
+    async fn begin_epoch(&mut self, _epoch: u64) -> Result<()> {
+        Ok(())
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn barrier(&mut self, is_checkpoint: bool) -> Result<()> {
+        if is_checkpoint && let Some(inserter) = self.inserter.take() {
+            inserter.end().await?;
+        }
+        Ok(())
     }
 }
 
@@ -541,6 +817,7 @@ struct SystemColumn {
 
 #[derive(ClickHouseRow, Deserialize)]
 struct ClickhouseQueryEngine {
+    #[expect(dead_code)]
     name: String,
     engine: String,
     create_table_query: String,
@@ -574,11 +851,16 @@ async fn query_column_engine_from_ck(
     }
 
     let clickhouse_engine =
-        ClickHouseEngine::from_query_engine(clickhouse_engine.first().unwrap())?;
+        ClickHouseEngine::from_query_engine(clickhouse_engine.first().unwrap(), config)?;
 
     if let Some(sign) = &clickhouse_engine.get_sign_name() {
         clickhouse_column.retain(|a| sign.ne(&a.name))
     }
+
+    if let Some(delete_col) = &clickhouse_engine.get_delete_col() {
+        clickhouse_column.retain(|a| delete_col.ne(&a.name))
+    }
+
     Ok((clickhouse_column, clickhouse_engine))
 }
 
@@ -638,11 +920,11 @@ impl ClickHouseFieldWithNull {
     ) -> Result<Vec<ClickHouseFieldWithNull>> {
         let clickhouse_schema_feature = clickhouse_schema_feature_vec
             .get(clickhouse_schema_feature_index)
-            .unwrap();
+            .ok_or_else(|| SinkError::ClickHouse(format!("No column found from clickhouse table schema, index is {clickhouse_schema_feature_index}")))?;
         if data.is_none() {
             if !clickhouse_schema_feature.can_null {
                 return Err(SinkError::ClickHouse(
-                    "clickhouse column can not insert null".to_string(),
+                    "clickhouse column can not insert null".to_owned(),
                 ));
             } else {
                 return Ok(vec![ClickHouseFieldWithNull::None]);
@@ -654,42 +936,42 @@ impl ClickHouseFieldWithNull {
             ScalarRefImpl::Int64(v) => ClickHouseField::Int64(v),
             ScalarRefImpl::Int256(_) => {
                 return Err(SinkError::ClickHouse(
-                    "clickhouse can not support Int256".to_string(),
-                ))
+                    "clickhouse can not support Int256".to_owned(),
+                ));
             }
             ScalarRefImpl::Serial(v) => ClickHouseField::Serial(v),
             ScalarRefImpl::Float32(v) => ClickHouseField::Float32(v.into_inner()),
             ScalarRefImpl::Float64(v) => ClickHouseField::Float64(v.into_inner()),
-            ScalarRefImpl::Utf8(v) => ClickHouseField::String(v.to_string()),
+            ScalarRefImpl::Utf8(v) => ClickHouseField::String(v.to_owned()),
             ScalarRefImpl::Bool(v) => ClickHouseField::Bool(v),
             ScalarRefImpl::Decimal(d) => {
-                if let Decimal::Normalized(d) = d {
+                let d = if let Decimal::Normalized(d) = d {
                     let scale =
                         clickhouse_schema_feature.accuracy_decimal.1 as i32 - d.scale() as i32;
-
-                    let scale = if scale < 0 {
+                    if scale < 0 {
                         d.mantissa() / 10_i128.pow(scale.unsigned_abs())
                     } else {
                         d.mantissa() * 10_i128.pow(scale as u32)
-                    };
-
-                    if clickhouse_schema_feature.accuracy_decimal.0 <= 9 {
-                        ClickHouseField::Decimal(ClickHouseDecimal::Decimal32(scale as i32))
-                    } else if clickhouse_schema_feature.accuracy_decimal.0 <= 18 {
-                        ClickHouseField::Decimal(ClickHouseDecimal::Decimal64(scale as i64))
-                    } else {
-                        ClickHouseField::Decimal(ClickHouseDecimal::Decimal128(scale))
                     }
+                } else if clickhouse_schema_feature.can_null {
+                    warn!("Inf, -Inf, Nan in RW decimal is converted into clickhouse null!");
+                    return Ok(vec![ClickHouseFieldWithNull::None]);
                 } else {
-                    return Err(SinkError::ClickHouse(
-                        "clickhouse can not support Decimal NAN,-INF and INF".to_string(),
-                    ));
+                    warn!("Inf, -Inf, Nan in RW decimal is converted into clickhouse 0!");
+                    0_i128
+                };
+                if clickhouse_schema_feature.accuracy_decimal.0 <= 9 {
+                    ClickHouseField::Decimal(ClickHouseDecimal::Decimal32(d as i32))
+                } else if clickhouse_schema_feature.accuracy_decimal.0 <= 18 {
+                    ClickHouseField::Decimal(ClickHouseDecimal::Decimal64(d as i64))
+                } else {
+                    ClickHouseField::Decimal(ClickHouseDecimal::Decimal128(d))
                 }
             }
             ScalarRefImpl::Interval(_) => {
                 return Err(SinkError::ClickHouse(
-                    "clickhouse can not support Interval".to_string(),
-                ))
+                    "clickhouse can not support Interval".to_owned(),
+                ));
             }
             ScalarRefImpl::Date(v) => {
                 let days = v.get_nums_days_unix_epoch();
@@ -697,13 +979,13 @@ impl ClickHouseFieldWithNull {
             }
             ScalarRefImpl::Time(_) => {
                 return Err(SinkError::ClickHouse(
-                    "clickhouse can not support Time".to_string(),
-                ))
+                    "clickhouse can not support Time".to_owned(),
+                ));
             }
             ScalarRefImpl::Timestamp(_) => {
                 return Err(SinkError::ClickHouse(
-                    "clickhouse does not have a type corresponding to naive timestamp".to_string(),
-                ))
+                    "clickhouse does not have a type corresponding to naive timestamp".to_owned(),
+                ));
             }
             ScalarRefImpl::Timestamptz(v) => {
                 let micros = v.timestamp_micros();
@@ -715,14 +997,13 @@ impl ClickHouseFieldWithNull {
                         .checked_mul(
                             10_i64.pow((clickhouse_schema_feature.accuracy_time - 6).into()),
                         )
-                        .ok_or_else(|| SinkError::ClickHouse("DateTime64 overflow".to_string()))?,
+                        .ok_or_else(|| SinkError::ClickHouse("DateTime64 overflow".to_owned()))?,
                 };
                 ClickHouseField::Int64(ticks)
             }
-            ScalarRefImpl::Jsonb(_) => {
-                return Err(SinkError::ClickHouse(
-                    "clickhouse rust interface can not support Json".to_string(),
-                ))
+            ScalarRefImpl::Jsonb(v) => {
+                let json_str = v.to_string();
+                ClickHouseField::String(json_str)
             }
             ScalarRefImpl::Struct(v) => {
                 let mut struct_vec = vec![];
@@ -753,9 +1034,15 @@ impl ClickHouseFieldWithNull {
             }
             ScalarRefImpl::Bytea(_) => {
                 return Err(SinkError::ClickHouse(
-                    "clickhouse can not support Bytea".to_string(),
-                ))
+                    "clickhouse can not support Bytea".to_owned(),
+                ));
             }
+            ScalarRefImpl::Map(_) => {
+                return Err(SinkError::ClickHouse(
+                    "clickhouse can not support Map".to_owned(),
+                ));
+            }
+            ScalarRefImpl::Vector(_) => todo!("VECTOR_PLACEHOLDER"),
         };
         let data = if clickhouse_schema_feature.can_null {
             vec![ClickHouseFieldWithNull::WithSome(data)]
@@ -822,16 +1109,16 @@ impl Serialize for ClickHouseColumn {
 pub fn build_fields_name_type_from_schema(schema: &Schema) -> Result<Vec<(String, DataType)>> {
     let mut vec = vec![];
     for field in schema.fields() {
-        if matches!(field.data_type, DataType::Struct(_)) {
-            for i in &field.sub_fields {
-                if matches!(i.data_type, DataType::Struct(_)) {
+        if let DataType::Struct(st) = &field.data_type {
+            for (name, data_type) in st.iter() {
+                if matches!(data_type, DataType::Struct(_)) {
                     return Err(SinkError::ClickHouse(
-                        "Only one level of nesting is supported for sturct".to_string(),
+                        "Only one level of nesting is supported for struct".to_owned(),
                     ));
                 } else {
                     vec.push((
-                        format!("{}.{}", field.name, i.name),
-                        DataType::List(Box::new(i.data_type())),
+                        format!("{}.{}", field.name, name),
+                        DataType::List(Box::new(data_type.clone())),
                     ))
                 }
             }

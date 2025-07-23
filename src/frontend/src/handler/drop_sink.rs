@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
+
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::error::Result;
-use risingwave_pb::ddl_service::ReplaceTablePlan;
+use risingwave_common::catalog::StreamJobStatus;
+use risingwave_pb::ddl_service::{ReplaceJobPlan, replace_job_plan};
+use risingwave_pb::meta::cancel_creating_jobs_request::{CreatingJobIds, PbJobs};
 use risingwave_sqlparser::ast::ObjectName;
 
 use super::RwPgResponse;
 use crate::binder::Binder;
 use crate::catalog::root_catalog::SchemaPath;
-use crate::handler::create_sink::{insert_merger_to_union, reparse_table_for_sink};
+use crate::error::Result;
 use crate::handler::HandlerArgs;
+use crate::handler::alter_table_column::hijack_merger_for_target_table;
+use crate::handler::create_sink::{fetch_incoming_sinks, reparse_table_for_sink};
 
 pub async fn handle_drop_sink(
     handler_args: HandlerArgs,
@@ -29,17 +34,17 @@ pub async fn handle_drop_sink(
     if_exists: bool,
     cascade: bool,
 ) -> Result<RwPgResponse> {
-    let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, sink_name) = Binder::resolve_schema_qualified_name(db_name, sink_name)?;
+    let session = handler_args.session.clone();
+    let db_name = &session.database();
+    let (schema_name, sink_name) = Binder::resolve_schema_qualified_name(db_name, &sink_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let sink = {
         let catalog_reader = session.env().catalog_reader().read_guard();
         let (sink, schema_name) =
-            match catalog_reader.get_sink_by_name(db_name, schema_path, &sink_name) {
+            match catalog_reader.get_any_sink_by_name(db_name, schema_path, &sink_name) {
                 Ok((sink, schema)) => (sink.clone(), schema),
                 Err(e) => {
                     return if if_exists {
@@ -48,7 +53,7 @@ pub async fn handle_drop_sink(
                             .into())
                     } else {
                         Err(e.into())
-                    }
+                    };
                 }
             };
 
@@ -59,41 +64,68 @@ pub async fn handle_drop_sink(
 
     let sink_id = sink.id;
 
-    let mut affected_table_change = None;
-    if let Some(target_table_id) = &sink.target_table {
-        let table_catalog = {
-            let reader = session.env().catalog_reader().read_guard();
-            let table = reader.get_table_by_id(target_table_id)?;
-            table.clone()
-        };
-
-        let (mut graph, mut table, source) =
-            reparse_table_for_sink(&session, &table_catalog).await?;
-
-        assert!(!table_catalog.incoming_sinks.is_empty());
-
-        table.incoming_sinks = table_catalog.incoming_sinks.clone();
-
-        for _ in 0..(table_catalog.incoming_sinks.len() - 1) {
-            for fragment in graph.fragments.values_mut() {
-                if let Some(node) = &mut fragment.node {
-                    insert_merger_to_union(node);
-                }
-            }
+    match sink.stream_job_status {
+        StreamJobStatus::Creating => {
+            let canceled_jobs = session
+                .env()
+                .meta_client()
+                .cancel_creating_jobs(PbJobs::Ids(CreatingJobIds {
+                    job_ids: vec![sink_id.sink_id],
+                }))
+                .await?;
+            tracing::info!(?canceled_jobs, "cancelled creating jobs");
         }
+        StreamJobStatus::Created => {
+            let mut affected_table_change = None;
+            if let Some(target_table_id) = &sink.target_table {
+                let table_catalog = {
+                    let reader = session.env().catalog_reader().read_guard();
+                    let table = reader.get_any_table_by_id(target_table_id)?;
+                    table.clone()
+                };
 
-        affected_table_change = Some(ReplaceTablePlan {
-            source,
-            table: Some(table),
-            fragment_graph: Some(graph),
-            table_col_index_mapping: None,
-        });
+                let (mut graph, mut table, source, target_job_type) =
+                    reparse_table_for_sink(&session, &table_catalog).await?;
+
+                assert!(!table_catalog.incoming_sinks.is_empty());
+
+                table
+                    .incoming_sinks
+                    .clone_from(&table_catalog.incoming_sinks);
+
+                let mut incoming_sink_ids: HashSet<_> =
+                    table_catalog.incoming_sinks.iter().copied().collect();
+
+                assert!(incoming_sink_ids.remove(&sink_id.sink_id));
+
+                let columns_without_rw_timestamp = table_catalog.columns_without_rw_timestamp();
+                for sink in fetch_incoming_sinks(&session, &incoming_sink_ids)? {
+                    hijack_merger_for_target_table(
+                        &mut graph,
+                        &columns_without_rw_timestamp,
+                        &sink,
+                        Some(&sink.unique_identity()),
+                    )?;
+                }
+
+                affected_table_change = Some(ReplaceJobPlan {
+                    replace_job: Some(replace_job_plan::ReplaceJob::ReplaceTable(
+                        replace_job_plan::ReplaceTable {
+                            table: Some(table.to_prost()),
+                            source: source.map(|x| x.to_prost()),
+                            job_type: target_job_type as _,
+                        },
+                    )),
+                    fragment_graph: Some(graph),
+                });
+            }
+
+            let catalog_writer = session.catalog_writer()?;
+            catalog_writer
+                .drop_sink(sink_id.sink_id, cascade, affected_table_change)
+                .await?;
+        }
     }
-
-    let catalog_writer = session.catalog_writer()?;
-    catalog_writer
-        .drop_sink(sink_id.sink_id, cascade, affected_table_change)
-        .await?;
 
     Ok(PgResponse::empty_result(StatementType::DROP_SINK))
 }
@@ -121,7 +153,8 @@ mod tests {
         let catalog_reader = session.env().catalog_reader().read_guard();
         let schema_path = SchemaPath::Name(DEFAULT_SCHEMA_NAME);
 
-        let sink = catalog_reader.get_table_by_name(DEFAULT_DATABASE_NAME, schema_path, "snk");
+        let sink =
+            catalog_reader.get_created_table_by_name(DEFAULT_DATABASE_NAME, schema_path, "snk");
         assert!(sink.is_err());
     }
 }

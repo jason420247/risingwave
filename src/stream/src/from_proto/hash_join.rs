@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,16 +18,16 @@ use std::sync::Arc;
 use risingwave_common::hash::{HashKey, HashKeyDispatcher};
 use risingwave_common::types::DataType;
 use risingwave_expr::expr::{
-    build_func_non_strict, build_non_strict_from_prost, InputRefExpression, NonStrictExpression,
+    InputRefExpression, NonStrictExpression, build_func_non_strict, build_non_strict_from_prost,
 };
 use risingwave_pb::plan_common::JoinType as JoinTypeProto;
-use risingwave_pb::stream_plan::HashJoinNode;
+use risingwave_pb::stream_plan::{HashJoinNode, JoinEncodingType as JoinEncodingTypeProto};
 
 use super::*;
 use crate::common::table::state_table::StateTable;
 use crate::executor::hash_join::*;
 use crate::executor::monitor::StreamingMetrics;
-use crate::executor::ActorContextRef;
+use crate::executor::{ActorContextRef, CpuEncoding, JoinType, MemoryEncoding};
 use crate::task::AtomicU64Ref;
 
 pub struct HashJoinExecutorBuilder;
@@ -39,8 +39,7 @@ impl ExecutorBuilder for HashJoinExecutorBuilder {
         params: ExecutorParams,
         node: &Self::Node,
         store: impl StateStore,
-        stream: &mut LocalStreamManagerCore,
-    ) -> StreamResult<BoxedExecutor> {
+    ) -> StreamResult<Executor> {
         let is_append_only = node.is_append_only;
         let vnodes = Arc::new(params.vnode_bitmap.expect("vnodes not set for hash join"));
 
@@ -135,9 +134,13 @@ impl ExecutorBuilder for HashJoinExecutorBuilder {
         let degree_state_table_r =
             StateTable::from_table_catalog(degree_table_r, store, Some(vnodes)).await;
 
+        let join_encoding_type = node
+            .get_join_encoding_type()
+            .unwrap_or(JoinEncodingTypeProto::MemoryOptimized);
+
         let args = HashJoinExecutorDispatcherArgs {
             ctx: params.actor_context,
-            info: params.info,
+            info: params.info.clone(),
             source_l,
             source_r,
             params_l,
@@ -150,23 +153,30 @@ impl ExecutorBuilder for HashJoinExecutorBuilder {
             degree_state_table_l,
             state_table_r,
             degree_state_table_r,
-            lru_manager: stream.get_watermark_epoch(),
+            lru_manager: params.watermark_epoch,
             is_append_only,
             metrics: params.executor_stats,
             join_type_proto: node.get_join_type()?,
             join_key_data_types,
             chunk_size: params.env.config().developer.chunk_size,
+            high_join_amplification_threshold: params
+                .env
+                .config()
+                .developer
+                .high_join_amplification_threshold,
+            join_encoding_type,
         };
 
-        args.dispatch()
+        let exec = args.dispatch()?;
+        Ok((params.info, exec).into())
     }
 }
 
 struct HashJoinExecutorDispatcherArgs<S: StateStore> {
     ctx: ActorContextRef,
     info: ExecutorInfo,
-    source_l: Box<dyn Executor>,
-    source_r: Box<dyn Executor>,
+    source_l: Executor,
+    source_r: Executor,
     params_l: JoinParams,
     params_r: JoinParams,
     null_safe: Vec<bool>,
@@ -183,17 +193,19 @@ struct HashJoinExecutorDispatcherArgs<S: StateStore> {
     join_type_proto: JoinTypeProto,
     join_key_data_types: Vec<DataType>,
     chunk_size: usize,
+    high_join_amplification_threshold: usize,
+    join_encoding_type: JoinEncodingTypeProto,
 }
 
 impl<S: StateStore> HashKeyDispatcher for HashJoinExecutorDispatcherArgs<S> {
-    type Output = StreamResult<BoxedExecutor>;
+    type Output = StreamResult<Box<dyn Execute>>;
 
     fn dispatch_impl<K: HashKey>(self) -> Self::Output {
         /// This macro helps to fill the const generic type parameter.
         macro_rules! build {
-            ($join_type:ident) => {
-                Ok(Box::new(
-                    HashJoinExecutor::<K, S, { JoinType::$join_type }>::new(
+            ($join_type:ident, $join_encoding:ident) => {
+                Ok(
+                    HashJoinExecutor::<K, S, { JoinType::$join_type }, $join_encoding>::new(
                         self.ctx,
                         self.info,
                         self.source_l,
@@ -212,20 +224,36 @@ impl<S: StateStore> HashKeyDispatcher for HashJoinExecutorDispatcherArgs<S> {
                         self.is_append_only,
                         self.metrics,
                         self.chunk_size,
-                    ),
-                ))
+                        self.high_join_amplification_threshold,
+                    )
+                    .boxed(),
+                )
             };
         }
-        match self.join_type_proto {
-            JoinTypeProto::Unspecified => unreachable!(),
-            JoinTypeProto::Inner => build!(Inner),
-            JoinTypeProto::LeftOuter => build!(LeftOuter),
-            JoinTypeProto::RightOuter => build!(RightOuter),
-            JoinTypeProto::FullOuter => build!(FullOuter),
-            JoinTypeProto::LeftSemi => build!(LeftSemi),
-            JoinTypeProto::LeftAnti => build!(LeftAnti),
-            JoinTypeProto::RightSemi => build!(RightSemi),
-            JoinTypeProto::RightAnti => build!(RightAnti),
+
+        macro_rules! build_match {
+            ($($join_type:ident),*) => {
+                match (self.join_type_proto, self.join_encoding_type) {
+                    (JoinTypeProto::AsofInner, _)
+                    | (JoinTypeProto::AsofLeftOuter, _)
+                    | (JoinTypeProto::Unspecified, _)
+                    | (_, JoinEncodingTypeProto::Unspecified ) => unreachable!(),
+                    $(
+                        (JoinTypeProto::$join_type, JoinEncodingTypeProto::MemoryOptimized) => build!($join_type, MemoryEncoding),
+                        (JoinTypeProto::$join_type, JoinEncodingTypeProto::CpuOptimized) => build!($join_type, CpuEncoding),
+                    )*
+                }
+            };
+        }
+        build_match! {
+            Inner,
+            LeftOuter,
+            RightOuter,
+            FullOuter,
+            LeftSemi,
+            LeftAnti,
+            RightSemi,
+            RightAnti
         }
     }
 

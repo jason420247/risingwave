@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,188 +12,111 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use anyhow::{Context, anyhow};
 use either::Either;
+use external_schema::debezium::extract_debezium_avro_table_pk_columns;
+use external_schema::nexmark::check_nexmark_schema;
 use itertools::Itertools;
-use maplit::{convert_args, hashmap};
+use maplit::{convert_args, hashmap, hashset};
 use pgwire::pg_response::{PgResponse, StatementType};
+use rand::Rng;
+use risingwave_common::array::arrow::{IcebergArrowConvert, arrow_schema_iceberg};
+use risingwave_common::bail_not_implemented;
 use risingwave_common::catalog::{
-    is_column_ids_dedup, ColumnCatalog, ColumnDesc, TableId, INITIAL_SOURCE_VERSION_ID,
-    KAFKA_TIMESTAMP_COLUMN_NAME,
+    ColumnCatalog, ColumnDesc, ColumnId, INITIAL_SOURCE_VERSION_ID, KAFKA_TIMESTAMP_COLUMN_NAME,
+    ROW_ID_COLUMN_NAME, TableId, debug_assert_column_ids_distinct,
 };
-use risingwave_common::error::ErrorCode::{self, InvalidInputSyntax, ProtocolError};
-use risingwave_common::error::{Result, RwError};
+use risingwave_common::license::Feature;
+use risingwave_common::secret::LocalSecretManager;
+use risingwave_common::system_param::reader::SystemParamsRead;
 use risingwave_common::types::DataType;
+use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_connector::parser::additional_columns::{
+    build_additional_column_desc, get_supported_additional_columns,
+    source_add_partition_offset_cols,
+};
 use risingwave_connector::parser::{
-    schema_to_columns, AvroParserConfig, DebeziumAvroParserConfig, ProtobufParserConfig,
-    SpecificParserConfig,
+    AvroParserConfig, DEBEZIUM_IGNORE_KEY, DebeziumAvroParserConfig, ProtobufParserConfig,
+    SchemaLocation, SpecificParserConfig, TimestamptzHandling,
+    fetch_json_schema_and_map_to_columns,
 };
+use risingwave_connector::schema::AWS_GLUE_SCHEMA_ARN_KEY;
 use risingwave_connector::schema::schema_registry::{
-    name_strategy_from_str, SchemaRegistryAuth, SCHEMA_REGISTRY_PASSWORD, SCHEMA_REGISTRY_USERNAME,
+    SCHEMA_REGISTRY_BACKOFF_DURATION_KEY, SCHEMA_REGISTRY_BACKOFF_FACTOR_KEY,
+    SCHEMA_REGISTRY_MAX_DELAY_KEY, SCHEMA_REGISTRY_PASSWORD, SCHEMA_REGISTRY_RETRIES_MAX_KEY,
+    SCHEMA_REGISTRY_USERNAME, SchemaRegistryConfig, name_strategy_from_str,
 };
-use risingwave_connector::source::cdc::external::CdcTableType;
 use risingwave_connector::source::cdc::{
-    CDC_SHARING_MODE_KEY, CDC_SNAPSHOT_BACKFILL, CDC_SNAPSHOT_MODE_KEY, CITUS_CDC_CONNECTOR,
-    MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR,
+    CDC_MONGODB_STRONG_SCHEMA_KEY, CDC_SHARING_MODE_KEY, CDC_SNAPSHOT_BACKFILL,
+    CDC_SNAPSHOT_MODE_KEY, CDC_TRANSACTIONAL_KEY, CDC_WAIT_FOR_STREAMING_START_TIMEOUT,
+    CITUS_CDC_CONNECTOR, MONGODB_CDC_CONNECTOR, MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR,
+    SQL_SERVER_CDC_CONNECTOR,
 };
 use risingwave_connector::source::datagen::DATAGEN_CONNECTOR;
-use risingwave_connector::source::nexmark::source::{get_event_data_types_with_names, EventType};
+use risingwave_connector::source::iceberg::ICEBERG_CONNECTOR;
+use risingwave_connector::source::nexmark::source::{EventType, get_event_data_types_with_names};
 use risingwave_connector::source::test_source::TEST_CONNECTOR;
 use risingwave_connector::source::{
-    get_connector_compatible_additional_columns, GCS_CONNECTOR, GOOGLE_PUBSUB_CONNECTOR,
-    KAFKA_CONNECTOR, KINESIS_CONNECTOR, NATS_CONNECTOR, NEXMARK_CONNECTOR, OPENDAL_S3_CONNECTOR,
-    POSIX_FS_CONNECTOR, PULSAR_CONNECTOR, S3_CONNECTOR,
+    AZBLOB_CONNECTOR, ConnectorProperties, GCS_CONNECTOR, GOOGLE_PUBSUB_CONNECTOR, KAFKA_CONNECTOR,
+    KINESIS_CONNECTOR, LEGACY_S3_CONNECTOR, MQTT_CONNECTOR, NATS_CONNECTOR, NEXMARK_CONNECTOR,
+    OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
 };
-use risingwave_pb::catalog::{
-    PbSchemaRegistryNameStrategy, PbSource, StreamSourceInfo, WatermarkDesc,
-};
-use risingwave_pb::plan_common::{AdditionalColumnType, EncodeType, FormatType};
-use risingwave_pb::stream_plan::stream_fragment_graph::Parallelism;
+pub use risingwave_connector::source::{UPSTREAM_SOURCE_KEY, WEBHOOK_CONNECTOR};
+use risingwave_connector::{AUTO_SCHEMA_CHANGE_KEY, WithPropertiesExt};
+use risingwave_pb::catalog::connection_params::PbConnectionType;
+use risingwave_pb::catalog::{PbSchemaRegistryNameStrategy, StreamSourceInfo, WatermarkDesc};
+use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
+use risingwave_pb::plan_common::{EncodeType, FormatType};
+use risingwave_pb::stream_plan::PbStreamFragmentGraph;
+use risingwave_pb::telemetry::TelemetryDatabaseObject;
 use risingwave_sqlparser::ast::{
-    get_delimiter, AstString, ColumnDef, ConnectorSchema, CreateSourceStatement, Encode, Format,
-    Ident, ProtobufSchema, SourceWatermark,
+    AstString, ColumnDef, ColumnOption, CreateSourceStatement, Encode, Format, FormatEncodeOptions,
+    ObjectName, SourceWatermark, SqlOptionValue, TableConstraint, Value, get_delimiter,
 };
+use risingwave_sqlparser::parser::{IncludeOption, IncludeOptionItem};
+use thiserror_ext::AsReport;
 
 use super::RwPgResponse;
 use crate::binder::Binder;
+use crate::catalog::CatalogError;
 use crate::catalog::source_catalog::SourceCatalog;
-use crate::catalog::ColumnId;
+use crate::error::ErrorCode::{self, Deprecated, InvalidInputSyntax, NotSupported, ProtocolError};
+use crate::error::{Result, RwError};
 use crate::expr::Expr;
+use crate::handler::HandlerArgs;
 use crate::handler::create_table::{
-    bind_pk_on_relation, bind_sql_column_constraints, bind_sql_columns, bind_sql_pk_names,
-    ensure_table_constraints_supported, ColumnIdGenerator,
+    ColumnIdGenerator, bind_pk_and_row_id_on_relation, bind_sql_column_constraints,
+    bind_sql_columns, bind_sql_pk_names, bind_table_constraints,
 };
 use crate::handler::util::{
-    get_connector, is_cdc_connector, is_kafka_connector, SourceSchemaCompatExt,
+    SourceSchemaCompatExt, check_connector_match_connection_type, ensure_connection_type_allowed,
 };
-use crate::handler::HandlerArgs;
+use crate::optimizer::plan_node::generic::SourceNodeKind;
 use crate::optimizer::plan_node::{LogicalSource, ToStream, ToStreamContext};
 use crate::session::SessionImpl;
-use crate::utils::resolve_privatelink_in_with_option;
-use crate::{bind_data_type, build_graph, OptimizerContext, WithOptions};
+use crate::session::current::notice_to_user;
+use crate::utils::{
+    OverwriteOptions, resolve_connection_ref_and_secret_ref, resolve_privatelink_in_with_option,
+    resolve_secret_ref_in_with_options,
+};
+use crate::{OptimizerContext, WithOptions, WithOptionsSecResolved, bind_data_type, build_graph};
 
-pub(crate) const UPSTREAM_SOURCE_KEY: &str = "connector";
+mod external_schema;
+pub use external_schema::{
+    bind_columns_from_source, get_schema_location, schema_has_schema_registry,
+};
+mod validate;
+pub use validate::validate_compatibility;
+use validate::{SOURCE_ALLOWED_CONNECTION_CONNECTOR, SOURCE_ALLOWED_CONNECTION_SCHEMA_REGISTRY};
+mod additional_column;
+use additional_column::check_and_add_timestamp_column;
+pub use additional_column::handle_addition_columns;
 
-/// Map a JSON schema to a relational schema
-async fn extract_json_table_schema(
-    schema_config: &Option<(AstString, bool)>,
-    with_properties: &HashMap<String, String>,
-    format_encode_options: &mut BTreeMap<String, String>,
-) -> Result<Option<Vec<ColumnCatalog>>> {
-    match schema_config {
-        None => Ok(None),
-        Some((schema_location, use_schema_registry)) => {
-            let schema_registry_auth = use_schema_registry.then(|| {
-                let auth = SchemaRegistryAuth::from(&*format_encode_options);
-                try_consume_string_from_options(format_encode_options, SCHEMA_REGISTRY_USERNAME);
-                try_consume_string_from_options(format_encode_options, SCHEMA_REGISTRY_PASSWORD);
-                auth
-            });
-            Ok(Some(
-                schema_to_columns(&schema_location.0, schema_registry_auth, with_properties)
-                    .await?
-                    .into_iter()
-                    .map(|col| ColumnCatalog {
-                        column_desc: col.into(),
-                        is_hidden: false,
-                    })
-                    .collect_vec(),
-            ))
-        }
-    }
-}
-
-pub fn debezium_cdc_source_schema() -> Vec<ColumnCatalog> {
-    let columns = vec![
-        ColumnCatalog {
-            column_desc: ColumnDesc::named("payload", ColumnId::placeholder(), DataType::Jsonb),
-            is_hidden: false,
-        },
-        ColumnCatalog::offset_column(),
-        ColumnCatalog::cdc_table_name_column(),
-    ];
-    columns
-}
-
-fn json_schema_infer_use_schema_registry(schema_config: &Option<(AstString, bool)>) -> bool {
-    match schema_config {
-        None => false,
-        Some((_, use_registry)) => *use_registry,
-    }
-}
-
-/// Map an Avro schema to a relational schema.
-async fn extract_avro_table_schema(
-    info: &StreamSourceInfo,
-    with_properties: &HashMap<String, String>,
-    format_encode_options: &mut BTreeMap<String, String>,
-    is_debezium: bool,
-) -> Result<Vec<ColumnCatalog>> {
-    let parser_config = SpecificParserConfig::new(info, with_properties)?;
-    try_consume_string_from_options(format_encode_options, SCHEMA_REGISTRY_USERNAME);
-    try_consume_string_from_options(format_encode_options, SCHEMA_REGISTRY_PASSWORD);
-    consume_aws_config_from_options(format_encode_options);
-
-    let vec_column_desc = if is_debezium {
-        let conf = DebeziumAvroParserConfig::new(parser_config.encoding_config).await?;
-        conf.map_to_columns()?
-    } else {
-        let conf = AvroParserConfig::new(parser_config.encoding_config).await?;
-        conf.map_to_columns()?
-    };
-    Ok(vec_column_desc
-        .into_iter()
-        .map(|col| ColumnCatalog {
-            column_desc: col.into(),
-            is_hidden: false,
-        })
-        .collect_vec())
-}
-
-async fn extract_debezium_avro_table_pk_columns(
-    info: &StreamSourceInfo,
-    with_properties: &HashMap<String, String>,
-) -> Result<Vec<String>> {
-    let parser_config = SpecificParserConfig::new(info, with_properties)?;
-    let conf = DebeziumAvroParserConfig::new(parser_config.encoding_config).await?;
-    Ok(conf.extract_pks()?.drain(..).map(|c| c.name).collect())
-}
-
-/// Map a protobuf schema to a relational schema.
-async fn extract_protobuf_table_schema(
-    schema: &ProtobufSchema,
-    with_properties: &HashMap<String, String>,
-    format_encode_options: &mut BTreeMap<String, String>,
-) -> Result<Vec<ColumnCatalog>> {
-    let info = StreamSourceInfo {
-        proto_message_name: schema.message_name.0.clone(),
-        row_schema_location: schema.row_schema_location.0.clone(),
-        use_schema_registry: schema.use_schema_registry,
-        format: FormatType::Plain.into(),
-        row_encode: EncodeType::Protobuf.into(),
-        format_encode_options: format_encode_options.clone(),
-        ..Default::default()
-    };
-    let parser_config = SpecificParserConfig::new(&info, with_properties)?;
-    try_consume_string_from_options(format_encode_options, SCHEMA_REGISTRY_USERNAME);
-    try_consume_string_from_options(format_encode_options, SCHEMA_REGISTRY_PASSWORD);
-    consume_aws_config_from_options(format_encode_options);
-
-    let conf = ProtobufParserConfig::new(parser_config.encoding_config).await?;
-
-    let column_descs = conf.map_to_columns()?;
-
-    Ok(column_descs
-        .into_iter()
-        .map(|col| ColumnCatalog {
-            column_desc: col.into(),
-            is_hidden: false,
-        })
-        .collect_vec())
-}
+use crate::stream_fragmenter::GraphJobType;
 
 fn non_generated_sql_columns(columns: &[ColumnDef]) -> Vec<ColumnDef> {
     columns
@@ -210,6 +133,23 @@ fn try_consume_string_from_options(
     format_encode_options.remove(key).map(AstString)
 }
 
+fn try_consume_schema_registry_config_from_options(
+    format_encode_options: &mut BTreeMap<String, String>,
+) {
+    [
+        SCHEMA_REGISTRY_USERNAME,
+        SCHEMA_REGISTRY_PASSWORD,
+        SCHEMA_REGISTRY_MAX_DELAY_KEY,
+        SCHEMA_REGISTRY_BACKOFF_DURATION_KEY,
+        SCHEMA_REGISTRY_BACKOFF_FACTOR_KEY,
+        SCHEMA_REGISTRY_RETRIES_MAX_KEY,
+    ]
+    .iter()
+    .for_each(|key| {
+        try_consume_string_from_options(format_encode_options, key);
+    });
+}
+
 fn consume_string_from_options(
     format_encode_options: &mut BTreeMap<String, String>,
     key: &str,
@@ -223,358 +163,241 @@ fn consume_aws_config_from_options(format_encode_options: &mut BTreeMap<String, 
     format_encode_options.retain(|key, _| !key.starts_with("aws."))
 }
 
-pub fn get_json_schema_location(
-    format_encode_options: &mut BTreeMap<String, String>,
-) -> Result<Option<(AstString, bool)>> {
-    let schema_location = try_consume_string_from_options(format_encode_options, "schema.location");
-    let schema_registry = try_consume_string_from_options(format_encode_options, "schema.registry");
-    match (schema_location, schema_registry) {
-        (None, None) => Ok(None),
-        (None, Some(schema_registry)) => Ok(Some((schema_registry, true))),
-        (Some(schema_location), None) => Ok(Some((schema_location, false))),
-        (Some(_), Some(_)) => Err(RwError::from(ProtocolError(
-            "only need either the schema location or the schema registry".to_string(),
-        ))),
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateSourceType {
+    SharedCdc,
+    /// e.g., shared Kafka source
+    SharedNonCdc,
+    NonShared,
+    /// create table with connector
+    Table,
 }
 
-fn get_schema_location(
-    format_encode_options: &mut BTreeMap<String, String>,
-) -> Result<(AstString, bool)> {
-    let schema_location = try_consume_string_from_options(format_encode_options, "schema.location");
-    let schema_registry = try_consume_string_from_options(format_encode_options, "schema.registry");
-    match (schema_location, schema_registry) {
-        (None, None) => Err(RwError::from(ProtocolError(
-            "missing either a schema location or a schema registry".to_string(),
-        ))),
-        (None, Some(schema_registry)) => Ok((schema_registry, true)),
-        (Some(schema_location), None) => Ok((schema_location, false)),
-        (Some(_), Some(_)) => Err(RwError::from(ProtocolError(
-            "only need either the schema location or the schema registry".to_string(),
-        ))),
-    }
-}
-
-#[inline]
-fn get_name_strategy_or_default(name_strategy: Option<AstString>) -> Result<Option<i32>> {
-    match name_strategy {
-        None => Ok(None),
-        Some(name) => Ok(Some(name_strategy_from_str(name.0.as_str())
-            .ok_or_else(|| RwError::from(ProtocolError(format!("\
-            expect strategy name in topic_name_strategy, record_name_strategy and topic_record_name_strategy, but got {}", name))))? as i32)),
-    }
-}
-
-/// resolve the schema of the source from external schema file, return the relation's columns. see <https://www.risingwave.dev/docs/current/sql-create-source> for more information.
-/// return `(columns, source info)`
-pub(crate) async fn bind_columns_from_source(
-    session: &SessionImpl,
-    source_schema: &ConnectorSchema,
-    with_properties: &HashMap<String, String>,
-) -> Result<(Option<Vec<ColumnCatalog>>, StreamSourceInfo)> {
-    const MESSAGE_NAME_KEY: &str = "message";
-    const KEY_MESSAGE_NAME_KEY: &str = "key.message";
-    const NAME_STRATEGY_KEY: &str = "schema.registry.name.strategy";
-
-    let is_kafka: bool = is_kafka_connector(with_properties);
-    let format_encode_options = WithOptions::try_from(source_schema.row_options())?.into_inner();
-    let mut format_encode_options_to_consume = format_encode_options.clone();
-
-    fn get_key_message_name(options: &mut BTreeMap<String, String>) -> Option<String> {
-        consume_string_from_options(options, KEY_MESSAGE_NAME_KEY)
-            .map(|ele| Some(ele.0))
-            .unwrap_or(None)
-    }
-    fn get_sr_name_strategy_check(
-        options: &mut BTreeMap<String, String>,
-        use_sr: bool,
-    ) -> Result<Option<i32>> {
-        let name_strategy = get_name_strategy_or_default(try_consume_string_from_options(
-            options,
-            NAME_STRATEGY_KEY,
-        ))?;
-        if !use_sr && name_strategy.is_some() {
-            return Err(RwError::from(ProtocolError(
-                "schema registry name strategy only works with schema registry enabled".to_string(),
-            )));
-        }
-        Ok(name_strategy)
-    }
-
-    let mut stream_source_info = StreamSourceInfo {
-        format: format_to_prost(&source_schema.format) as i32,
-        row_encode: row_encode_to_prost(&source_schema.row_encode) as i32,
-        format_encode_options,
-        ..Default::default()
-    };
-
-    let columns = match (&source_schema.format, &source_schema.row_encode) {
-        (Format::Native, Encode::Native)
-        | (Format::Plain, Encode::Bytes)
-        | (Format::DebeziumMongo, Encode::Json) => None,
-        (Format::Plain, Encode::Protobuf) => {
-            let (row_schema_location, use_schema_registry) =
-                get_schema_location(&mut format_encode_options_to_consume)?;
-            let protobuf_schema = ProtobufSchema {
-                message_name: consume_string_from_options(
-                    &mut format_encode_options_to_consume,
-                    MESSAGE_NAME_KEY,
-                )?,
-                row_schema_location,
-                use_schema_registry,
-            };
-            let name_strategy = get_sr_name_strategy_check(
-                &mut format_encode_options_to_consume,
-                protobuf_schema.use_schema_registry,
-            )?;
-
-            stream_source_info.use_schema_registry = protobuf_schema.use_schema_registry;
-            stream_source_info.row_schema_location = protobuf_schema.row_schema_location.0.clone();
-            stream_source_info.proto_message_name = protobuf_schema.message_name.0.clone();
-            stream_source_info.key_message_name =
-                get_key_message_name(&mut format_encode_options_to_consume);
-            stream_source_info.name_strategy =
-                name_strategy.unwrap_or(PbSchemaRegistryNameStrategy::Unspecified as i32);
-
-            Some(
-                extract_protobuf_table_schema(
-                    &protobuf_schema,
-                    with_properties,
-                    &mut format_encode_options_to_consume,
-                )
-                .await?,
-            )
-        }
-        (format @ (Format::Plain | Format::Upsert | Format::Debezium), Encode::Avro) => {
-            let (row_schema_location, use_schema_registry) =
-                get_schema_location(&mut format_encode_options_to_consume)?;
-
-            if matches!(format, Format::Debezium) && !use_schema_registry {
-                return Err(RwError::from(ProtocolError(
-                    "schema location for DEBEZIUM_AVRO row format is not supported".to_string(),
-                )));
-            }
-
-            let message_name = try_consume_string_from_options(
-                &mut format_encode_options_to_consume,
-                MESSAGE_NAME_KEY,
-            );
-            let name_strategy = get_sr_name_strategy_check(
-                &mut format_encode_options_to_consume,
-                use_schema_registry,
-            )?;
-
-            stream_source_info.use_schema_registry = use_schema_registry;
-            stream_source_info.row_schema_location = row_schema_location.0.clone();
-            stream_source_info.proto_message_name = message_name.unwrap_or(AstString("".into())).0;
-            stream_source_info.key_message_name =
-                get_key_message_name(&mut format_encode_options_to_consume);
-            stream_source_info.name_strategy =
-                name_strategy.unwrap_or(PbSchemaRegistryNameStrategy::Unspecified as i32);
-
-            Some(
-                extract_avro_table_schema(
-                    &stream_source_info,
-                    with_properties,
-                    &mut format_encode_options_to_consume,
-                    matches!(format, Format::Debezium),
-                )
-                .await?,
-            )
-        }
-        (Format::Plain, Encode::Csv) => {
-            let chars =
-                consume_string_from_options(&mut format_encode_options_to_consume, "delimiter")?.0;
-            let delimiter =
-                get_delimiter(chars.as_str()).map_err(|e| RwError::from(e.to_string()))?;
-            let has_header = try_consume_string_from_options(
-                &mut format_encode_options_to_consume,
-                "without_header",
-            )
-            .map(|s| s.0 == "false")
-            .unwrap_or(true);
-
-            if is_kafka && has_header {
-                return Err(RwError::from(ProtocolError(
-                    "CSV HEADER is not supported when creating table with Kafka connector"
-                        .to_owned(),
-                )));
-            }
-
-            stream_source_info.csv_delimiter = delimiter as i32;
-            stream_source_info.csv_has_header = has_header;
-
-            None
-        }
-        (
-            Format::Plain | Format::Upsert | Format::Maxwell | Format::Canal | Format::Debezium,
-            Encode::Json,
-        ) => {
-            let schema_config = get_json_schema_location(&mut format_encode_options_to_consume)?;
-            stream_source_info.use_schema_registry =
-                json_schema_infer_use_schema_registry(&schema_config);
-
-            extract_json_table_schema(
-                &schema_config,
-                with_properties,
-                &mut format_encode_options_to_consume,
-            )
-            .await?
-        }
-        (format, encoding) => {
-            return Err(RwError::from(ProtocolError(format!(
-                "Unknown combination {:?} {:?}",
-                format, encoding
-            ))));
-        }
-    };
-
-    if !format_encode_options_to_consume.is_empty() {
-        let err_string = format!(
-            "Get unknown format_encode_options for {:?} {:?}: {}",
-            source_schema.format,
-            source_schema.row_encode,
-            format_encode_options_to_consume
-                .keys()
-                .map(|k| k.to_string())
-                .collect::<Vec<String>>()
-                .join(","),
-        );
-        session.notice_to_user(err_string);
-    }
-    Ok((columns, stream_source_info))
-}
-
-fn bind_columns_from_source_for_cdc(
-    session: &SessionImpl,
-    source_schema: &ConnectorSchema,
-    _with_properties: &HashMap<String, String>,
-) -> Result<(Option<Vec<ColumnCatalog>>, StreamSourceInfo)> {
-    let format_encode_options = WithOptions::try_from(source_schema.row_options())?.into_inner();
-    let mut format_encode_options_to_consume = format_encode_options.clone();
-
-    match (&source_schema.format, &source_schema.row_encode) {
-        (Format::Plain, Encode::Json) => (),
-        (format, encoding) => {
-            // Note: parser will also check this. Just be extra safe here
-            return Err(RwError::from(ProtocolError(format!(
-                "Row format for CDC connectors should be either omitted or set to `FORMAT PLAIN ENCODE JSON`, got: {:?} {:?}",
-                format, encoding
-            ))));
-        }
-    };
-
-    let columns = debezium_cdc_source_schema();
-    let schema_config = get_json_schema_location(&mut format_encode_options_to_consume)?;
-
-    let stream_source_info = StreamSourceInfo {
-        format: format_to_prost(&source_schema.format) as i32,
-        row_encode: row_encode_to_prost(&source_schema.row_encode) as i32,
-        format_encode_options,
-        use_schema_registry: json_schema_infer_use_schema_registry(&schema_config),
-        cdc_source_job: true,
-        ..Default::default()
-    };
-    if !format_encode_options_to_consume.is_empty() {
-        let err_string = format!(
-            "Get unknown format_encode_options for {:?} {:?}: {}",
-            source_schema.format,
-            source_schema.row_encode,
-            format_encode_options_to_consume
-                .keys()
-                .map(|k| k.to_string())
-                .collect::<Vec<String>>()
-                .join(","),
-        );
-        session.notice_to_user(err_string);
-    }
-    Ok((Some(columns), stream_source_info))
-}
-
-/// add connector-spec columns to the end of column catalog
-pub fn handle_addition_columns(
-    with_properties: &HashMap<String, String>,
-    mut additional_columns: Vec<(Ident, Option<Ident>)>,
-    columns: &mut Vec<ColumnCatalog>,
-) -> Result<()> {
-    let connector_name = get_connector(with_properties).unwrap(); // there must be a connector in source
-
-    let addition_col_list =
-        match get_connector_compatible_additional_columns(connector_name.as_str()) {
-            Some(cols) => cols,
-            // early return if there are no accepted additional columns for the connector
-            None => {
-                return if additional_columns.is_empty() {
-                    Ok(())
-                } else {
-                    Err(RwError::from(ProtocolError(format!(
-                        "Connector {} accepts no additional column but got {:?}",
-                        connector_name, additional_columns
-                    ))))
-                }
-            }
-        };
-    let gen_default_column_name = |connector_name: &str, addi_column_name: &str| {
-        format!("_rw_{}_{}", connector_name, addi_column_name)
-    };
-
-    let latest_col_id: ColumnId = columns
-        .iter()
-        .map(|col| col.column_desc.column_id)
-        .max()
-        .unwrap(); // there must be at least one column in the column catalog
-
-    for (col_name, gen_column_catalog_fn) in addition_col_list {
-        // always insert in spec order
-        if let Some(idx) = additional_columns
-            .iter()
-            .position(|(col, _)| col.real_value().eq_ignore_ascii_case(col_name))
+impl CreateSourceType {
+    /// Note: shouldn't be used for `ALTER SOURCE`, since session variables should not affect existing source. We should respect the original type instead.
+    pub fn for_newly_created(
+        session: &SessionImpl,
+        with_properties: &impl WithPropertiesExt,
+    ) -> Self {
+        if with_properties.is_shareable_cdc_connector() {
+            CreateSourceType::SharedCdc
+        } else if with_properties.is_shareable_non_cdc_connector()
+            && session
+                .env()
+                .streaming_config()
+                .developer
+                .enable_shared_source
+            && session.config().streaming_use_shared_source()
         {
-            let (_, alias) = additional_columns.remove(idx);
-            columns.push(gen_column_catalog_fn(
-                latest_col_id.next(),
-                alias
-                    .map(|alias| alias.real_value())
-                    .unwrap_or_else(|| gen_default_column_name(connector_name.as_str(), col_name))
-                    .as_str(),
-            ))
+            CreateSourceType::SharedNonCdc
+        } else {
+            CreateSourceType::NonShared
         }
     }
-    if !additional_columns.is_empty() {
-        return Err(RwError::from(ProtocolError(format!(
-            "Unknown additional columns {:?}",
-            additional_columns
-        ))));
+
+    pub fn for_replace(catalog: &SourceCatalog) -> Self {
+        if !catalog.info.is_shared() {
+            CreateSourceType::NonShared
+        } else if catalog.with_properties.is_shareable_cdc_connector() {
+            CreateSourceType::SharedCdc
+        } else {
+            CreateSourceType::SharedNonCdc
+        }
     }
 
-    Ok(())
+    pub fn is_shared(&self) -> bool {
+        matches!(
+            self,
+            CreateSourceType::SharedCdc | CreateSourceType::SharedNonCdc
+        )
+    }
 }
 
 /// Bind columns from both source and sql defined.
 pub(crate) fn bind_all_columns(
-    source_schema: &ConnectorSchema,
+    format_encode: &FormatEncodeOptions,
     cols_from_source: Option<Vec<ColumnCatalog>>,
     cols_from_sql: Vec<ColumnCatalog>,
     col_defs_from_sql: &[ColumnDef],
+    wildcard_idx: Option<usize>,
+    sql_column_strategy: SqlColumnStrategy,
 ) -> Result<Vec<ColumnCatalog>> {
     if let Some(cols_from_source) = cols_from_source {
-        if cols_from_sql.is_empty() {
-            Ok(cols_from_source)
-        } else {
-            // TODO(yuhao): https://github.com/risingwavelabs/risingwave/issues/12209
-            Err(RwError::from(ProtocolError(
-                format!("User-defined schema from SQL is not allowed with FORMAT {} ENCODE {}. \
-                Please refer to https://www.risingwave.dev/docs/current/sql-create-source/ for more information.", source_schema.format, source_schema.row_encode))))
+        // Need to check `col_defs` to see if a column is generated, as we haven't bind the
+        // `GeneratedColumnDesc` in `ColumnCatalog` yet.
+        let generated_cols_from_sql = cols_from_sql
+            .iter()
+            .filter(|c| {
+                col_defs_from_sql
+                    .iter()
+                    .find(|d| d.name.real_value() == c.name())
+                    .unwrap()
+                    .is_generated()
+            })
+            .cloned()
+            .collect_vec();
+
+        #[allow(clippy::collapsible_else_if)]
+        match sql_column_strategy {
+            // Ignore `cols_from_source`, follow `cols_from_sql` without checking.
+            SqlColumnStrategy::FollowUnchecked => {
+                assert!(
+                    wildcard_idx.is_none(),
+                    "wildcard still exists while strategy is Follows, not correctly purified?"
+                );
+                return Ok(cols_from_sql);
+            }
+
+            // Will merge `generated_cols_from_sql` into `cols_from_source`.
+            SqlColumnStrategy::Ignore => {}
+
+            SqlColumnStrategy::FollowChecked => {
+                let has_regular_cols_from_sql =
+                    generated_cols_from_sql.len() != cols_from_sql.len();
+
+                if has_regular_cols_from_sql {
+                    if wildcard_idx.is_some() {
+                        // (*, normal_column INT)
+                        return Err(RwError::from(NotSupported(
+                            "When there's a wildcard (\"*\"), \
+                             only generated columns are allowed in user-defined schema from SQL"
+                                .to_owned(),
+                            "Remove the non-generated columns".to_owned(),
+                        )));
+                    } else {
+                        // (normal_column INT)
+                        // Follow `cols_from_sql` with name & type checking.
+                        for col in &cols_from_sql {
+                            if generated_cols_from_sql.contains(col) {
+                                continue;
+                            }
+                            let Some(col_from_source) =
+                                cols_from_source.iter().find(|c| c.name() == col.name())
+                            else {
+                                return Err(RwError::from(ProtocolError(format!(
+                                    "Column \"{}\" is defined in SQL but not found in the source",
+                                    col.name()
+                                ))));
+                            };
+
+                            if col_from_source.data_type() != col.data_type() {
+                                return Err(RwError::from(ProtocolError(format!(
+                                    "Data type mismatch for column \"{}\". \
+                                     Defined in SQL as \"{}\", but found in the source as \"{}\"",
+                                    col.name(),
+                                    col.data_type(),
+                                    col_from_source.data_type()
+                                ))));
+                            }
+                        }
+                        return Ok(cols_from_sql);
+                    }
+                } else {
+                    if wildcard_idx.is_some() {
+                        // (*)
+                        // (*, generated_column INT)
+                        // Good, expand the wildcard later.
+                    } else {
+                        // ()
+                        // (generated_column INT)
+                        // Interpreted as if there's a wildcard for backward compatibility.
+                        // TODO: the behavior is not that consistent, making it impossible to ingest no
+                        //       columns from the source (though not useful in practice). Currently we
+                        //       just notice the user but we may want to interpret it as empty columns
+                        //       in the future.
+                        notice_to_user("\
+                            Neither wildcard (\"*\") nor regular (non-generated) columns appear in the user-defined schema from SQL. \
+                            For backward compatibility, all columns from the source will be included at the beginning. \
+                            For clarity, consider adding a wildcard (\"*\") to indicate where the columns from the source should be included, \
+                            or specifying the columns you want to include from the source.
+                        ");
+                    }
+                }
+            }
         }
+
+        // In some cases the wildcard may be absent:
+        // - plan based on a purified SQL
+        // - interpret `()` as `(*)` for backward compatibility (see notice above)
+        // Default to 0 to expand the wildcard at the beginning.
+        let wildcard_idx = wildcard_idx.unwrap_or(0).min(generated_cols_from_sql.len());
+
+        // Merge `generated_cols_from_sql` with `cols_from_source`.
+        let mut merged_cols = generated_cols_from_sql;
+        let merged_cols_r = merged_cols.split_off(wildcard_idx);
+        merged_cols.extend(cols_from_source);
+        merged_cols.extend(merged_cols_r);
+
+        Ok(merged_cols)
     } else {
-        // FIXME(yuhao): cols_from_sql should be None is no `()` is given.
-        if cols_from_sql.is_empty() {
-            return Err(RwError::from(ProtocolError(
-                "Schema definition is required, either from SQL or schema registry.".to_string(),
+        if wildcard_idx.is_some() {
+            return Err(RwError::from(NotSupported(
+                "Wildcard in user-defined schema is only allowed when there exists columns from external schema".to_owned(),
+                "Remove the wildcard or use a source with external schema".to_owned(),
             )));
         }
-        match (&source_schema.format, &source_schema.row_encode) {
+        let non_generated_sql_defined_columns = non_generated_sql_columns(col_defs_from_sql);
+
+        match (&format_encode.format, &format_encode.row_encode) {
             (Format::DebeziumMongo, Encode::Json) => {
+                let strong_schema = format_encode
+                    .row_options
+                    .iter()
+                    .find(|k| k.name.real_value().to_lowercase() == CDC_MONGODB_STRONG_SCHEMA_KEY)
+                    .map(|k| matches!(k.value, SqlOptionValue::Value(Value::Boolean(true))))
+                    .unwrap_or(false);
+
+                // strong schema requires a '_id' column at the first position with a specific type
+                if strong_schema {
+                    let (_, id_column) = non_generated_sql_defined_columns
+                        .iter()
+                        .enumerate()
+                        .find(|(idx, col)| *idx == 0 && col.name.real_value() == "_id")
+                        .ok_or_else(|| {
+                            RwError::from(ProtocolError(
+                                "The `_id` column of the source with row format DebeziumMongoJson must be defined as the first column in SQL".to_owned(),
+                            ))
+                        })?;
+
+                    let id_data_type = bind_data_type(id_column.data_type.as_ref().unwrap())?;
+                    if !matches!(
+                        id_data_type,
+                        DataType::Varchar | DataType::Int32 | DataType::Int64 | DataType::Jsonb
+                    ) {
+                        return Err(RwError::from(ProtocolError(
+                            "the `_id` column of the source with row format DebeziumMongoJson must be [Jsonb | Varchar | Int32 | Int64]".to_owned(),
+                        )));
+                    }
+
+                    let mut columns = Vec::with_capacity(non_generated_sql_defined_columns.len());
+                    columns.push(
+                        // id column
+                        ColumnCatalog {
+                            column_desc: ColumnDesc::named("_id", 0.into(), id_data_type),
+                            is_hidden: false,
+                        },
+                    );
+
+                    // bind rest of the columns
+                    for (idx, col) in non_generated_sql_defined_columns
+                        .into_iter()
+                        // skip the first column
+                        .skip(1)
+                        .enumerate()
+                    {
+                        columns.push(ColumnCatalog {
+                            column_desc: ColumnDesc::named(
+                                col.name.real_value(),
+                                (idx as i32).into(),
+                                bind_data_type(col.data_type.as_ref().unwrap())?,
+                            ),
+                            is_hidden: false,
+                        });
+                    }
+
+                    return Ok(columns);
+                }
+
                 let mut columns = vec![
                     ColumnCatalog {
                         column_desc: ColumnDesc::named("_id", 0.into(), DataType::Varchar),
@@ -585,8 +408,7 @@ pub(crate) fn bind_all_columns(
                         is_hidden: false,
                     },
                 ];
-                let non_generated_sql_defined_columns =
-                    non_generated_sql_columns(col_defs_from_sql);
+
                 if non_generated_sql_defined_columns.len() != 2
                     || non_generated_sql_defined_columns[0].name.real_value() != columns[0].name()
                     || non_generated_sql_defined_columns[1].name.real_value() != columns[1].name()
@@ -594,7 +416,7 @@ pub(crate) fn bind_all_columns(
                     return Err(RwError::from(ProtocolError(
                         "the not generated columns of the source with row format DebeziumMongoJson
         must be (_id [Jsonb | Varchar | Int32 | Int64], payload jsonb)."
-                            .to_string(),
+                            .to_owned(),
                     )));
                 }
                 // ok to unwrap since it was checked at `bind_sql_columns`
@@ -612,7 +434,7 @@ pub(crate) fn bind_all_columns(
                         return Err(RwError::from(ProtocolError(
                             "the `_id` column of the source with row format DebeziumMongoJson
         must be [Jsonb | Varchar | Int32 | Int64]"
-                                .to_string(),
+                                .to_owned(),
                         )));
                     }
                 }
@@ -628,40 +450,76 @@ pub(crate) fn bind_all_columns(
                     return Err(RwError::from(ProtocolError(
                         "the `payload` column of the source with row format DebeziumMongoJson
         must be Jsonb datatype"
-                            .to_string(),
+                            .to_owned(),
                     )));
                 }
                 Ok(columns)
             }
             (Format::Plain, Encode::Bytes) => {
-                if cols_from_sql.len() != 1 || cols_from_sql[0].data_type() != &DataType::Bytea {
-                    return Err(RwError::from(ProtocolError(
-                        "ENCODE BYTES only accepts one BYTEA type column".to_string(),
-                    )));
+                let err = Err(RwError::from(ProtocolError(
+                    "ENCODE BYTES only accepts one BYTEA type column".to_owned(),
+                )));
+                if non_generated_sql_defined_columns.len() == 1 {
+                    // ok to unwrap `data_type`` since it was checked at `bind_sql_columns`
+                    let col_data_type = bind_data_type(
+                        non_generated_sql_defined_columns[0]
+                            .data_type
+                            .as_ref()
+                            .unwrap(),
+                    )?;
+                    if col_data_type == DataType::Bytea {
+                        Ok(cols_from_sql)
+                    } else {
+                        err
+                    }
+                } else {
+                    err
                 }
-                Ok(cols_from_sql)
             }
             (_, _) => Ok(cols_from_sql),
         }
     }
 }
 
+/// TODO: perhaps put the hint in notice is better. The error message format might be not that reliable.
+fn hint_format_encode(format_encode: &FormatEncodeOptions) -> String {
+    format!(
+        r#"Hint: For FORMAT {0} ENCODE {1}, INCLUDE KEY must be specified and the key column must be used as primary key.
+example:
+    CREATE TABLE <table_name> ( PRIMARY KEY ([rw_key | <key_name>]) )
+    INCLUDE KEY [AS <key_name>]
+    WITH (...)
+    FORMAT {0} ENCODE {1}{2}
+"#,
+        format_encode.format,
+        format_encode.row_encode,
+        if format_encode.row_encode == Encode::Json || format_encode.row_encode == Encode::Bytes {
+            "".to_owned()
+        } else {
+            " (...)".to_owned()
+        }
+    )
+}
+
 /// Bind column from source. Add key column to table columns if necessary.
-/// Return (columns, pks)
+/// Return `pk_names`.
 pub(crate) async fn bind_source_pk(
-    source_schema: &ConnectorSchema,
+    format_encode: &FormatEncodeOptions,
     source_info: &StreamSourceInfo,
     columns: &mut [ColumnCatalog],
     sql_defined_pk_names: Vec<String>,
-    with_properties: &HashMap<String, String>,
+    with_properties: &WithOptionsSecResolved,
 ) -> Result<Vec<String>> {
     let sql_defined_pk = !sql_defined_pk_names.is_empty();
-    let key_column_name: Option<String> = {
+    let include_key_column_name: Option<String> = {
         // iter columns to check if contains additional columns from key part
         // return the key column names if exists
         columns.iter().find_map(|catalog| {
-            if catalog.column_desc.additional_column_type == AdditionalColumnType::Key {
-                Some(catalog.name().to_string())
+            if matches!(
+                catalog.column_desc.additional_column.column_type,
+                Some(AdditionalColumnType::Key(_))
+            ) {
+                Some(catalog.name().to_owned())
             } else {
                 None
             }
@@ -670,50 +528,52 @@ pub(crate) async fn bind_source_pk(
     let additional_column_names = columns
         .iter()
         .filter_map(|col| {
-            if (col.column_desc.additional_column_type != AdditionalColumnType::Unspecified)
-                && (col.column_desc.additional_column_type != AdditionalColumnType::Normal)
-            {
-                Some(col.name().to_string())
+            if col.column_desc.additional_column.column_type.is_some() {
+                Some(col.name().to_owned())
             } else {
                 None
             }
         })
         .collect_vec();
 
-    let res = match (&source_schema.format, &source_schema.row_encode) {
-        (Format::Native, Encode::Native) | (Format::Plain, _) => sql_defined_pk_names,
+    let res = match (&format_encode.format, &format_encode.row_encode) {
+        (Format::Native, Encode::Native) | (Format::None, Encode::None) | (Format::Plain, _) => {
+            sql_defined_pk_names
+        }
 
         // For all Upsert formats, we only accept one and only key column as primary key.
         // Additional KEY columns must be set in this case and must be primary key.
-        (Format::Upsert, encode @ Encode::Json | encode @ Encode::Avro) => {
-            if let Some(ref key_column_name) = key_column_name
+        (Format::Upsert, Encode::Json | Encode::Avro | Encode::Protobuf) => {
+            if let Some(ref key_column_name) = include_key_column_name
                 && sql_defined_pk
             {
-                if sql_defined_pk_names.len() != 1 {
-                    return Err(RwError::from(ProtocolError(format!(
-                        "upsert {:?} supports only one primary key column ({}).",
-                        encode, key_column_name
-                    ))));
-                }
+                // pk is set. check if it's valid
+
                 // the column name have been converted to real value in `handle_addition_columns`
                 // so we don't ignore ascii case here
-                if !key_column_name.eq(sql_defined_pk_names[0].as_str()) {
+                if sql_defined_pk_names.len() != 1
+                    || !key_column_name.eq(sql_defined_pk_names[0].as_str())
+                {
                     return Err(RwError::from(ProtocolError(format!(
-                        "upsert {}'s key column {} not match with sql defined primary key {}",
-                        encode, key_column_name, sql_defined_pk_names[0]
+                        "Only \"{}\" can be used as primary key\n\n{}",
+                        key_column_name,
+                        hint_format_encode(format_encode)
                     ))));
                 }
                 sql_defined_pk_names
             } else {
-                return if key_column_name.is_none() {
+                // pk not set, or even key not included
+                return if let Some(include_key_column_name) = include_key_column_name {
                     Err(RwError::from(ProtocolError(format!(
-                        "INCLUDE KEY clause must be set for FORMAT UPSERT ENCODE {:?}",
-                        encode
+                        "Primary key must be specified to {}\n\n{}",
+                        include_key_column_name,
+                        hint_format_encode(format_encode)
                     ))))
                 } else {
                     Err(RwError::from(ProtocolError(format!(
-                        "Primary key must be specified to {} when creating source with FORMAT UPSERT ENCODE {:?}",
-                        key_column_name.unwrap(), encode))))
+                        "INCLUDE KEY clause not set\n\n{}",
+                        hint_format_encode(format_encode)
+                    ))))
                 };
             }
         }
@@ -728,7 +588,7 @@ pub(crate) async fn bind_source_pk(
             if !sql_defined_pk {
                 return Err(RwError::from(ProtocolError(
                     "Primary key must be specified when creating source with FORMAT DEBEZIUM."
-                        .to_string(),
+                        .to_owned(),
                 )));
             }
             sql_defined_pk_names
@@ -761,16 +621,10 @@ pub(crate) async fn bind_source_pk(
             }
         }
         (Format::DebeziumMongo, Encode::Json) => {
-            if !additional_column_names.is_empty() {
-                return Err(RwError::from(ProtocolError(format!(
-                    "FORMAT DEBEZIUMMONGO forbids additional columns, but got {:?}",
-                    additional_column_names
-                ))));
-            }
             if sql_defined_pk {
                 sql_defined_pk_names
             } else {
-                vec!["_id".to_string()]
+                vec!["_id".to_owned()]
             }
         }
 
@@ -783,8 +637,7 @@ pub(crate) async fn bind_source_pk(
             }
             if !sql_defined_pk {
                 return Err(RwError::from(ProtocolError(
-    "Primary key must be specified when creating source with FORMAT MAXWELL ENCODE JSON."
-    .to_string(),
+    "Primary key must be specified when creating source with FORMAT MAXWELL ENCODE JSON.".to_owned(),
     )));
             }
             sql_defined_pk_names
@@ -799,8 +652,7 @@ pub(crate) async fn bind_source_pk(
             }
             if !sql_defined_pk {
                 return Err(RwError::from(ProtocolError(
-    "Primary key must be specified when creating source with FORMAT CANAL ENCODE JSON."
-    .to_string(),
+    "Primary key must be specified when creating source with FORMAT CANAL ENCODE JSON.".to_owned(),
     )));
             }
             sql_defined_pk_names
@@ -813,25 +665,6 @@ pub(crate) async fn bind_source_pk(
         }
     };
     Ok(res)
-}
-
-// Add a hidden column `_rw_kafka_timestamp` to each message from Kafka source.
-fn check_and_add_timestamp_column(
-    with_properties: &HashMap<String, String>,
-    columns: &mut Vec<ColumnCatalog>,
-) {
-    if is_kafka_connector(with_properties) {
-        let kafka_timestamp_column = ColumnCatalog {
-            column_desc: ColumnDesc::named(
-                KAFKA_TIMESTAMP_COLUMN_NAME,
-                ColumnId::placeholder(),
-                DataType::Timestamptz,
-            ),
-
-            is_hidden: true,
-        };
-        columns.push(kafka_timestamp_column);
-    }
 }
 
 pub(super) fn bind_source_watermark(
@@ -849,7 +682,7 @@ pub(super) fn bind_source_watermark(
             let col_name = source_watermark.column.real_value();
             let watermark_idx = binder.get_column_binding_index(name.clone(), &col_name)?;
 
-            let expr = binder.bind_expr(source_watermark.expr)?;
+            let expr = binder.bind_expr(&source_watermark.expr)?;
             let watermark_col_type = column_catalogs[watermark_idx].data_type();
             let watermark_expr_type = &expr.return_type();
             if watermark_col_type != watermark_expr_type {
@@ -868,225 +701,355 @@ pub(super) fn bind_source_watermark(
     Ok(watermark_descs)
 }
 
-// TODO: Better design if we want to support ENCODE KEY where we will have 4 dimensional array
-static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, Vec<Encode>>>> =
-    LazyLock::new(|| {
-        convert_args!(hashmap!(
-                KAFKA_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Json, Encode::Protobuf, Encode::Avro, Encode::Bytes, Encode::Csv],
-                    Format::Upsert => vec![Encode::Json, Encode::Avro],
-                    Format::Debezium => vec![Encode::Json, Encode::Avro],
-                    Format::Maxwell => vec![Encode::Json],
-                    Format::Canal => vec![Encode::Json],
-                    Format::DebeziumMongo => vec![Encode::Json],
-                ),
-                PULSAR_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Json, Encode::Protobuf, Encode::Avro, Encode::Bytes],
-                    Format::Upsert => vec![Encode::Json, Encode::Avro],
-                    Format::Debezium => vec![Encode::Json],
-                    Format::Maxwell => vec![Encode::Json],
-                    Format::Canal => vec![Encode::Json],
-                ),
-                KINESIS_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Json, Encode::Protobuf, Encode::Avro, Encode::Bytes],
-                    Format::Upsert => vec![Encode::Json, Encode::Avro],
-                    Format::Debezium => vec![Encode::Json],
-                    Format::Maxwell => vec![Encode::Json],
-                    Format::Canal => vec![Encode::Json],
-                ),
-                GOOGLE_PUBSUB_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Json, Encode::Protobuf, Encode::Avro, Encode::Bytes],
-                    Format::Debezium => vec![Encode::Json],
-                    Format::Maxwell => vec![Encode::Json],
-                    Format::Canal => vec![Encode::Json],
-                ),
-                NEXMARK_CONNECTOR => hashmap!(
-                    Format::Native => vec![Encode::Native],
-                    Format::Plain => vec![Encode::Bytes],
-                ),
-                DATAGEN_CONNECTOR => hashmap!(
-                    Format::Native => vec![Encode::Native],
-                    Format::Plain => vec![Encode::Bytes, Encode::Json],
-                ),
-                S3_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Csv, Encode::Json],
-                ),
-                OPENDAL_S3_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Csv, Encode::Json],
-                ),
-                GCS_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Csv, Encode::Json],
-                ),
-                POSIX_FS_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Csv],
-                ),
-                MYSQL_CDC_CONNECTOR => hashmap!(
-                    Format::Debezium => vec![Encode::Json],
-                    // support source stream job
-                    Format::Plain => vec![Encode::Json],
-                ),
-                POSTGRES_CDC_CONNECTOR => hashmap!(
-                    Format::Debezium => vec![Encode::Json],
-                    // support source stream job
-                    Format::Plain => vec![Encode::Json],
-                ),
-                CITUS_CDC_CONNECTOR => hashmap!(
-                    Format::Debezium => vec![Encode::Json],
-                ),
-                NATS_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Json],
-                ),
-                TEST_CONNECTOR => hashmap!(
-                    Format::Plain => vec![Encode::Json],
-                )
-        ))
-    });
-
-pub fn validate_compatibility(
-    source_schema: &ConnectorSchema,
-    props: &mut HashMap<String, String>,
-) -> Result<()> {
-    let connector = get_connector(props)
-        .ok_or_else(|| RwError::from(ProtocolError("missing field 'connector'".to_string())))?;
-
-    let compatible_formats = CONNECTORS_COMPATIBLE_FORMATS
-        .get(&connector)
-        .ok_or_else(|| {
-            RwError::from(ProtocolError(format!(
-                "connector {:?} is not supported, accept {:?}",
-                connector,
-                CONNECTORS_COMPATIBLE_FORMATS.keys()
-            )))
-        })?;
-    if connector != KAFKA_CONNECTOR {
-        let res = match (&source_schema.format, &source_schema.row_encode) {
-            (Format::Plain, Encode::Protobuf) | (Format::Plain, Encode::Avro) => {
-                let mut options = WithOptions::try_from(source_schema.row_options())?;
-                let (_, use_schema_registry) = get_schema_location(options.inner_mut())?;
-                use_schema_registry
-            }
-            (Format::Debezium, Encode::Avro) => true,
-            (_, _) => false,
-        };
-        if res {
-            return Err(RwError::from(ProtocolError(format!(
-                "The {} must be kafka when schema registry is used",
-                UPSTREAM_SOURCE_KEY
-            ))));
-        }
-    }
-
-    let compatible_encodes = compatible_formats
-        .get(&source_schema.format)
-        .ok_or_else(|| {
-            RwError::from(ProtocolError(format!(
-                "connector {} does not support format {:?}",
-                connector, source_schema.format
-            )))
-        })?;
-    if !compatible_encodes.contains(&source_schema.row_encode) {
-        return Err(RwError::from(ProtocolError(format!(
-            "connector {} does not support format {:?} with encode {:?}",
-            connector, source_schema.format, source_schema.row_encode
-        ))));
-    }
-
-    if connector == POSTGRES_CDC_CONNECTOR || connector == CITUS_CDC_CONNECTOR {
-        if !props.contains_key("slot.name") {
-            // Build a random slot name with UUID
-            // e.g. "rw_cdc_f9a3567e6dd54bf5900444c8b1c03815"
-            let uuid = uuid::Uuid::new_v4().to_string().replace('-', "");
-            props.insert("slot.name".into(), format!("rw_cdc_{}", uuid));
-        }
-        if !props.contains_key("schema.name") {
-            // Default schema name is "public"
-            props.insert("schema.name".into(), "public".into());
-        }
-        if !props.contains_key("publication.name") {
-            // Default publication name is "rw_publication"
-            props.insert("publication.name".into(), "rw_publication".into());
-        }
-        if !props.contains_key("publication.create.enable") {
-            // Default auto create publication if doesn't exist
-            props.insert("publication.create.enable".into(), "true".into());
-        }
-    }
-    Ok(())
-}
-
 /// Performs early stage checking in frontend to see if the schema of the given `columns` is
-/// compatible with the connector extracted from the properties. Currently this only works for
-/// `nexmark` connector since it's in chunk format.
+/// compatible with the connector extracted from the properties.
 ///
 /// One should only call this function after all properties of all columns are resolved, like
 /// generated column descriptors.
-pub(super) fn check_source_schema(
-    props: &HashMap<String, String>,
+pub(super) fn check_format_encode(
+    props: &WithOptionsSecResolved,
     row_id_index: Option<usize>,
     columns: &[ColumnCatalog],
 ) -> Result<()> {
-    let Some(connector) = get_connector(props) else {
+    let Some(connector) = props.get_connector() else {
         return Ok(());
     };
 
-    if connector != NEXMARK_CONNECTOR {
-        return Ok(());
-    }
-
-    let table_type = props
-        .get("nexmark.table.type")
-        .map(|t| t.to_ascii_lowercase());
-
-    let event_type = match table_type.as_deref() {
-        None => None,
-        Some("bid") => Some(EventType::Bid),
-        Some("auction") => Some(EventType::Auction),
-        Some("person") => Some(EventType::Person),
-        Some(t) => {
-            return Err(RwError::from(ProtocolError(format!(
-                "unsupported table type for nexmark source: {}",
-                t
-            ))))
-        }
-    };
-
-    // Ignore the generated columns and map the index of row_id column.
-    let user_defined_columns = columns.iter().filter(|c| !c.is_generated());
-    let row_id_index = if let Some(index) = row_id_index {
-        let col_id = columns[index].column_id();
-        user_defined_columns
-            .clone()
-            .position(|c| c.column_id() == col_id)
-            .unwrap()
-            .into()
+    if connector == NEXMARK_CONNECTOR {
+        check_nexmark_schema(props, row_id_index, columns)
     } else {
-        None
-    };
+        Ok(())
+    }
+}
 
-    let expected = get_event_data_types_with_names(event_type, row_id_index);
-    let user_defined = user_defined_columns
-        .map(|c| {
-            (
-                c.column_desc.name.to_ascii_lowercase(),
-                c.column_desc.data_type.to_owned(),
-            )
-        })
-        .collect_vec();
+pub fn bind_connector_props(
+    handler_args: &HandlerArgs,
+    format_encode: &FormatEncodeOptions,
+    is_create_source: bool,
+) -> Result<WithOptions> {
+    let mut with_properties = handler_args.with_options.clone().into_connector_props();
+    validate_compatibility(format_encode, &mut with_properties)?;
+    let create_cdc_source_job = with_properties.is_shareable_cdc_connector();
 
-    if expected != user_defined {
-        let cmp = pretty_assertions::Comparison::new(&expected, &user_defined);
+    if !is_create_source && with_properties.is_shareable_only_cdc_connector() {
         return Err(RwError::from(ProtocolError(format!(
-            "The schema of the nexmark source must specify all columns in order:\n{cmp}",
+            "connector {} does not support `CREATE TABLE`, please use `CREATE SOURCE` instead",
+            with_properties.get_connector().unwrap(),
         ))));
     }
-    Ok(())
+    if is_create_source && create_cdc_source_job {
+        if let Some(value) = with_properties.get(AUTO_SCHEMA_CHANGE_KEY)
+            && value.parse::<bool>().map_err(|_| {
+                ErrorCode::InvalidInputSyntax(format!(
+                    "invalid value of '{}' option",
+                    AUTO_SCHEMA_CHANGE_KEY
+                ))
+            })?
+        {
+            Feature::CdcAutoSchemaChange
+                .check_available()
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+
+        // set connector to backfill mode
+        with_properties.insert(CDC_SNAPSHOT_MODE_KEY.into(), CDC_SNAPSHOT_BACKFILL.into());
+        // enable cdc sharing mode, which will capture all tables in the given `database.name`
+        with_properties.insert(CDC_SHARING_MODE_KEY.into(), "true".into());
+        // enable transactional cdc
+        if with_properties.enable_transaction_metadata() {
+            with_properties.insert(CDC_TRANSACTIONAL_KEY.into(), "true".into());
+        }
+        with_properties.insert(
+            CDC_WAIT_FOR_STREAMING_START_TIMEOUT.into(),
+            handler_args
+                .session
+                .config()
+                .cdc_source_wait_streaming_start_timeout()
+                .to_string(),
+        );
+    }
+    if with_properties.is_mysql_cdc_connector() {
+        // Generate a random server id for mysql cdc source if needed
+        // `server.id` (in the range from 1 to 2^32 - 1). This value MUST be unique across whole replication
+        // group (that is, different from any other server id being used by any master or slave)
+        with_properties
+            .entry("server.id".to_owned())
+            .or_insert(rand::rng().random_range(1..u32::MAX).to_string());
+    }
+    Ok(with_properties)
+}
+
+/// When the schema can be inferred from external system (like schema registry),
+/// how to handle the regular columns (i.e., non-generated) defined in SQL?
+pub enum SqlColumnStrategy {
+    /// Follow all columns defined in SQL, ignore the columns from external system.
+    /// This ensures that no accidental side effect will change the schema.
+    ///
+    /// This is the behavior when re-planning the target table of `SINK INTO`.
+    FollowUnchecked,
+
+    /// Follow all column defined in SQL, check the columns from external system with name & type.
+    /// This ensures that no accidental side effect will change the schema.
+    ///
+    /// This is the behavior when creating a new table or source with a resolvable schema;
+    /// adding, or dropping columns on that table.
+    // TODO(purify): `ALTER SOURCE` currently has its own code path and does not check.
+    FollowChecked,
+
+    /// Merge the generated columns defined in SQL and columns from external system. If there
+    /// are also regular columns defined in SQL, ignore silently.
+    ///
+    /// This is the behavior when `REFRESH SCHEMA` atop the purified SQL.
+    Ignore,
+}
+
+/// Entrypoint for binding source connector.
+/// Common logic shared by `CREATE SOURCE` and `CREATE TABLE`.
+#[allow(clippy::too_many_arguments)]
+pub async fn bind_create_source_or_table_with_connector(
+    handler_args: HandlerArgs,
+    full_name: ObjectName,
+    format_encode: FormatEncodeOptions,
+    with_properties: WithOptions,
+    sql_columns_defs: &[ColumnDef],
+    constraints: Vec<TableConstraint>,
+    wildcard_idx: Option<usize>,
+    source_watermarks: Vec<SourceWatermark>,
+    columns_from_resolve_source: Option<Vec<ColumnCatalog>>,
+    source_info: StreamSourceInfo,
+    include_column_options: IncludeOption,
+    col_id_gen: &mut ColumnIdGenerator,
+    create_source_type: CreateSourceType,
+    source_rate_limit: Option<u32>,
+    sql_column_strategy: SqlColumnStrategy,
+) -> Result<SourceCatalog> {
+    let session = &handler_args.session;
+    let db_name: &str = &session.database();
+    let (schema_name, source_name) = Binder::resolve_schema_qualified_name(db_name, &full_name)?;
+    let (database_id, schema_id) =
+        session.get_database_and_schema_id_for_create(schema_name.clone())?;
+
+    let is_create_source = create_source_type != CreateSourceType::Table;
+    if !is_create_source && with_properties.is_iceberg_connector() {
+        return Err(ErrorCode::BindError(
+            "can't CREATE TABLE with iceberg connector\n\nHint: use CREATE SOURCE instead"
+                .to_owned(),
+        )
+        .into());
+    }
+
+    if is_create_source {
+        match format_encode.format {
+            Format::Upsert
+            | Format::Debezium
+            | Format::DebeziumMongo
+            | Format::Maxwell
+            | Format::Canal => {
+                return Err(ErrorCode::BindError(format!(
+                    "can't CREATE SOURCE with FORMAT {}.\n\nHint: use CREATE TABLE instead\n\n{}",
+                    format_encode.format,
+                    hint_format_encode(&format_encode)
+                ))
+                .into());
+            }
+            _ => {
+                // TODO: enhance error message for other formats
+            }
+        }
+    }
+
+    let sql_pk_names = bind_sql_pk_names(sql_columns_defs, bind_table_constraints(&constraints)?)?;
+
+    // FIXME: ideally we can support it, but current way of handling iceberg additional columns are problematic.
+    // They are treated as normal user columns, so they will be lost if we allow user to specify columns.
+    // See `extract_iceberg_columns`
+    if with_properties.is_iceberg_connector() && !sql_columns_defs.is_empty() {
+        return Err(RwError::from(InvalidInputSyntax(
+            r#"Schema is automatically inferred for iceberg source and should not be specified
+
+HINT: use `CREATE SOURCE <name> WITH (...)` instead of `CREATE SOURCE <name> (<columns>) WITH (...)`."#.to_owned(),
+        )));
+    }
+    let columns_from_sql = bind_sql_columns(sql_columns_defs, false)?;
+
+    let mut columns = bind_all_columns(
+        &format_encode,
+        columns_from_resolve_source,
+        columns_from_sql,
+        sql_columns_defs,
+        wildcard_idx,
+        sql_column_strategy,
+    )?;
+
+    // add additional columns before bind pk, because `format upsert` requires the key column
+    handle_addition_columns(
+        Some(&format_encode),
+        &with_properties,
+        include_column_options,
+        &mut columns,
+        false,
+    )?;
+
+    if columns.is_empty() {
+        return Err(RwError::from(ProtocolError(
+            "Schema definition is required, either from SQL or schema registry.".to_owned(),
+        )));
+    }
+
+    // compatible with the behavior that add a hidden column `_rw_kafka_timestamp` to each message from Kafka source
+    if is_create_source {
+        // must behind `handle_addition_columns`
+        check_and_add_timestamp_column(&with_properties, &mut columns);
+
+        // For shared sources, we will include partition and offset cols in the SourceExecutor's *output*, to be used by the SourceBackfillExecutor.
+        // For shared CDC source, the schema is different. See ColumnCatalog::debezium_cdc_source_cols(), CDC_BACKFILL_TABLE_ADDITIONAL_COLUMNS
+        if create_source_type == CreateSourceType::SharedNonCdc {
+            let (columns_exist, additional_columns) = source_add_partition_offset_cols(
+                &columns,
+                &with_properties.get_connector().unwrap(),
+                true, // col_id filled below at col_id_gen.generate
+            );
+            for (existed, c) in columns_exist.into_iter().zip_eq_fast(additional_columns) {
+                if !existed {
+                    columns.push(ColumnCatalog::hidden(c));
+                }
+            }
+        }
+    }
+
+    // resolve privatelink connection for Kafka
+    let mut with_properties = with_properties;
+    resolve_privatelink_in_with_option(&mut with_properties)?;
+
+    // check the system parameter `enforce_secret`
+    if session
+        .env()
+        .system_params_manager()
+        .get_params()
+        .load()
+        .enforce_secret()
+        && Feature::SecretManagement.check_available().is_ok()
+    {
+        // check enforce using secret for some props on cloud
+        ConnectorProperties::enforce_secret_source(&with_properties)?;
+    }
+
+    let (with_properties, connection_type, connector_conn_ref) =
+        resolve_connection_ref_and_secret_ref(
+            with_properties,
+            session,
+            Some(TelemetryDatabaseObject::Source),
+        )?;
+    ensure_connection_type_allowed(connection_type, &SOURCE_ALLOWED_CONNECTION_CONNECTOR)?;
+
+    // if not using connection, we don't need to check connector match connection type
+    if !matches!(connection_type, PbConnectionType::Unspecified) {
+        let Some(connector) = with_properties.get_connector() else {
+            return Err(RwError::from(ProtocolError(format!(
+                "missing field '{}' in WITH clause",
+                UPSTREAM_SOURCE_KEY
+            ))));
+        };
+        check_connector_match_connection_type(connector.as_str(), &connection_type)?;
+    }
+
+    let pk_names = bind_source_pk(
+        &format_encode,
+        &source_info,
+        &mut columns,
+        sql_pk_names,
+        &with_properties,
+    )
+    .await?;
+
+    if is_create_source && !pk_names.is_empty() {
+        return Err(ErrorCode::InvalidInputSyntax(
+            "Source does not support PRIMARY KEY constraint, please use \"CREATE TABLE\" instead"
+                .to_owned(),
+        )
+        .into());
+    }
+
+    // User may specify a generated or additional column with the same name as one from the external schema.
+    // Ensure duplicated column names are handled here.
+    if let Some(duplicated_name) = columns.iter().map(|c| c.name()).duplicates().next() {
+        return Err(ErrorCode::InvalidInputSyntax(format!(
+            "column \"{}\" specified more than once",
+            duplicated_name
+        ))
+        .into());
+    }
+
+    // XXX: why do we use col_id_gen here? It doesn't seem to be very necessary.
+    for c in &mut columns {
+        let original_data_type = c.data_type().clone();
+        col_id_gen.generate(c)?;
+        // TODO: Now we restore the data type for `CREATE SOURCE`, so that keep the nested field id unset.
+        //       This behavior is inconsistent with `CREATE TABLE`, and should be fixed once we refactor
+        //       `ALTER SOURCE` to also use `ColumnIdGenerator` in the future.
+        if is_create_source {
+            c.column_desc.data_type = original_data_type;
+        }
+    }
+    debug_assert_column_ids_distinct(&columns);
+
+    let (mut columns, pk_col_ids, row_id_index) =
+        bind_pk_and_row_id_on_relation(columns, pk_names, true)?;
+
+    let watermark_descs =
+        bind_source_watermark(session, source_name.clone(), source_watermarks, &columns)?;
+    // TODO(yuhao): allow multiple watermark on source.
+    assert!(watermark_descs.len() <= 1);
+
+    bind_sql_column_constraints(
+        session,
+        source_name.clone(),
+        &mut columns,
+        // TODO(st1page): pass the ref
+        sql_columns_defs,
+        &pk_col_ids,
+    )?;
+    check_format_encode(&with_properties, row_id_index, &columns)?;
+
+    let definition = handler_args.normalized_sql.clone();
+
+    let associated_table_id = if is_create_source {
+        None
+    } else {
+        Some(TableId::placeholder())
+    };
+    let source = SourceCatalog {
+        id: TableId::placeholder().table_id,
+        name: source_name,
+        schema_id,
+        database_id,
+        columns,
+        pk_col_ids,
+        append_only: row_id_index.is_some(),
+        owner: session.user_id(),
+        info: source_info,
+        row_id_index,
+        with_properties,
+        watermark_descs,
+        associated_table_id,
+        definition,
+        connection_id: connector_conn_ref,
+        created_at_epoch: None,
+        initialized_at_epoch: None,
+        version: INITIAL_SOURCE_VERSION_ID,
+        created_at_cluster_version: None,
+        initialized_at_cluster_version: None,
+        rate_limit: source_rate_limit,
+    };
+    Ok(source)
 }
 
 pub async fn handle_create_source(
-    handler_args: HandlerArgs,
+    mut handler_args: HandlerArgs,
     stmt: CreateSourceStatement,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session.clone();
+    let overwrite_options = OverwriteOptions::new(&mut handler_args);
 
     if let Either::Right(resp) = session.check_relation_name_duplicated(
         stmt.source_name.clone(),
@@ -1096,192 +1059,97 @@ pub async fn handle_create_source(
         return Ok(resp);
     }
 
-    let db_name = session.database();
-    let (schema_name, name) = Binder::resolve_schema_qualified_name(db_name, stmt.source_name)?;
-    let (database_id, schema_id) =
-        session.get_database_and_schema_id_for_create(schema_name.clone())?;
-
     if handler_args.with_options.is_empty() {
         return Err(RwError::from(InvalidInputSyntax(
-            "missing WITH clause".to_string(),
+            "missing WITH clause".to_owned(),
         )));
     }
 
-    let source_schema = stmt.source_schema.into_v2_with_warning();
+    let format_encode = stmt.format_encode.into_v2_with_warning();
+    let with_properties = bind_connector_props(&handler_args, &format_encode, true)?;
 
-    let mut with_properties = handler_args
-        .with_options
-        .clone()
-        .into_inner()
-        .into_iter()
-        .collect();
-    validate_compatibility(&source_schema, &mut with_properties)?;
+    let create_source_type = CreateSourceType::for_newly_created(&session, &*with_properties);
+    let (columns_from_resolve_source, source_info) = bind_columns_from_source(
+        &session,
+        &format_encode,
+        Either::Left(&with_properties),
+        create_source_type,
+    )
+    .await?;
+    let mut col_id_gen = ColumnIdGenerator::new_initial();
 
-    ensure_table_constraints_supported(&stmt.constraints)?;
-    let sql_pk_names = bind_sql_pk_names(&stmt.columns, &stmt.constraints)?;
+    if stmt.columns.iter().any(|col| {
+        col.options
+            .iter()
+            .any(|def| matches!(def.option, ColumnOption::NotNull))
+    }) {
+        return Err(RwError::from(InvalidInputSyntax(
+            "NOT NULL constraint is not supported in source schema".to_owned(),
+        )));
+    }
 
-    // gated the feature with a session variable
-    let create_cdc_source_job = if is_cdc_connector(&with_properties) {
-        CdcTableType::from_properties(&with_properties).can_backfill()
-    } else {
-        false
-    };
-
-    let (columns_from_resolve_source, source_info) = if create_cdc_source_job {
-        bind_columns_from_source_for_cdc(&session, &source_schema, &with_properties)?
-    } else {
-        bind_columns_from_source(&session, &source_schema, &with_properties).await?
-    };
-    let columns_from_sql = bind_sql_columns(&stmt.columns)?;
-
-    let mut columns = bind_all_columns(
-        &source_schema,
-        columns_from_resolve_source,
-        columns_from_sql,
+    let source_catalog = bind_create_source_or_table_with_connector(
+        handler_args.clone(),
+        stmt.source_name,
+        format_encode,
+        with_properties,
         &stmt.columns,
-    )?;
-    // add additional columns before bind pk, because `format upsert` requires the key column
-    handle_addition_columns(&with_properties, stmt.include_column_options, &mut columns)?;
-    let pk_names = bind_source_pk(
-        &source_schema,
-        &source_info,
-        &mut columns,
-        sql_pk_names,
-        &with_properties,
+        stmt.constraints,
+        stmt.wildcard_idx,
+        stmt.source_watermarks,
+        columns_from_resolve_source,
+        source_info,
+        stmt.include_column_options,
+        &mut col_id_gen,
+        create_source_type,
+        overwrite_options.source_rate_limit,
+        SqlColumnStrategy::FollowChecked,
     )
     .await?;
 
-    if create_cdc_source_job {
-        // set connector to backfill mode
-        with_properties.insert(CDC_SNAPSHOT_MODE_KEY.into(), CDC_SNAPSHOT_BACKFILL.into());
-        // enable cdc sharing mode, which will capture all tables in the given `database.name`
-        with_properties.insert(CDC_SHARING_MODE_KEY.into(), "true".into());
+    // If it is a temporary source, put it into SessionImpl.
+    if stmt.temporary {
+        if session.get_temporary_source(&source_catalog.name).is_some() {
+            return Err(CatalogError::duplicated("source", source_catalog.name.clone()).into());
+        }
+        session.create_temporary_source(source_catalog);
+        return Ok(PgResponse::empty_result(StatementType::CREATE_SOURCE));
     }
 
-    check_and_add_timestamp_column(&with_properties, &mut columns);
-
-    let mut col_id_gen = ColumnIdGenerator::new_initial();
-    for c in &mut columns {
-        c.column_desc.column_id = col_id_gen.generate(c.name())
-    }
-
-    if !pk_names.is_empty() {
-        return Err(ErrorCode::InvalidInputSyntax(
-            "Source does not support PRIMARY KEY constraint, please use \"CREATE TABLE\" instead"
-                .to_owned(),
-        )
-        .into());
-    }
-
-    let (mut columns, pk_column_ids, row_id_index) = bind_pk_on_relation(columns, pk_names)?;
-
-    debug_assert!(is_column_ids_dedup(&columns));
-
-    let watermark_descs =
-        bind_source_watermark(&session, name.clone(), stmt.source_watermarks, &columns)?;
-    // TODO(yuhao): allow multiple watermark on source.
-    assert!(watermark_descs.len() <= 1);
-
-    bind_sql_column_constraints(
-        &session,
-        name.clone(),
-        &mut columns,
-        stmt.columns,
-        &pk_column_ids,
-    )?;
-
-    check_source_schema(&with_properties, row_id_index, &columns)?;
-
-    let pk_column_ids = pk_column_ids.into_iter().map(Into::into).collect();
-
-    let mut with_options = WithOptions::new(with_properties);
-    // resolve privatelink connection for Kafka source
-    let connection_id =
-        resolve_privatelink_in_with_option(&mut with_options, &schema_name, &session)?;
-    let definition = handler_args.normalized_sql.clone();
-
-    let source = PbSource {
-        id: TableId::placeholder().table_id,
-        schema_id,
-        database_id,
-        name,
-        row_id_index: row_id_index.map(|idx| idx as u32),
-        columns: columns.iter().map(|c| c.to_protobuf()).collect_vec(),
-        pk_column_ids,
-        with_properties: with_options.into_inner().into_iter().collect(),
-        info: Some(source_info),
-        owner: session.user_id(),
-        watermark_descs,
-        definition,
-        connection_id,
-        initialized_at_epoch: None,
-        created_at_epoch: None,
-        optional_associated_table_id: None,
-        version: INITIAL_SOURCE_VERSION_ID,
-        initialized_at_cluster_version: None,
-        created_at_cluster_version: None,
-    };
+    let source = source_catalog.to_prost();
 
     let catalog_writer = session.catalog_writer()?;
 
-    if create_cdc_source_job {
-        // create a streaming job for the cdc source, which will mark as *singleton* in the Fragmenter
-        let graph = {
-            let context = OptimizerContext::from_handler_args(handler_args);
-            // cdc source is an append-only source in plain json format
-            let source_node = LogicalSource::new(
-                Some(Rc::new(SourceCatalog::from(&source))),
-                columns.clone(),
-                row_id_index,
-                false,
-                false,
-                context.into(),
-            )?;
-
-            // generate stream graph for cdc source job
-            let stream_plan = source_node.to_stream(&mut ToStreamContext::new(false))?;
-            let mut graph = build_graph(stream_plan);
-            graph.parallelism =
-                session
-                    .config()
-                    .streaming_parallelism()
-                    .map(|parallelism| Parallelism {
-                        parallelism: parallelism.get(),
-                    });
-            graph
-        };
+    if create_source_type.is_shared() {
+        let graph = generate_stream_graph_for_source(handler_args, source_catalog)?;
         catalog_writer
-            .create_source_with_graph(source, graph)
+            .create_source(source, Some(graph), stmt.if_not_exists)
             .await?;
     } else {
         // For other sources we don't create a streaming job
-        catalog_writer.create_source(source).await?;
+        catalog_writer
+            .create_source(source, None, stmt.if_not_exists)
+            .await?;
     }
 
     Ok(PgResponse::empty_result(StatementType::CREATE_SOURCE))
 }
 
-fn format_to_prost(format: &Format) -> FormatType {
-    match format {
-        Format::Native => FormatType::Native,
-        Format::Plain => FormatType::Plain,
-        Format::Upsert => FormatType::Upsert,
-        Format::Debezium => FormatType::Debezium,
-        Format::DebeziumMongo => FormatType::DebeziumMongo,
-        Format::Maxwell => FormatType::Maxwell,
-        Format::Canal => FormatType::Canal,
-    }
-}
-fn row_encode_to_prost(row_encode: &Encode) -> EncodeType {
-    match row_encode {
-        Encode::Native => EncodeType::Native,
-        Encode::Json => EncodeType::Json,
-        Encode::Avro => EncodeType::Avro,
-        Encode::Protobuf => EncodeType::Protobuf,
-        Encode::Csv => EncodeType::Csv,
-        Encode::Bytes => EncodeType::Bytes,
-        Encode::Template => EncodeType::Template,
-    }
+pub(super) fn generate_stream_graph_for_source(
+    handler_args: HandlerArgs,
+    source_catalog: SourceCatalog,
+) -> Result<PbStreamFragmentGraph> {
+    let context = OptimizerContext::from_handler_args(handler_args);
+    let source_node = LogicalSource::with_catalog(
+        Rc::new(source_catalog),
+        SourceNodeKind::CreateSharedSource,
+        context.into(),
+        None,
+    )?;
+
+    let stream_plan = source_node.to_stream(&mut ToStreamContext::new(false))?;
+    let graph = build_graph(stream_plan, Some(GraphJobType::Source))?;
+    Ok(graph)
 }
 
 #[cfg(test)]
@@ -1290,15 +1158,13 @@ pub mod tests {
     use std::sync::Arc;
 
     use risingwave_common::catalog::{
-        CDC_SOURCE_COLUMN_NUM, DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, OFFSET_COLUMN_NAME,
-        ROWID_PREFIX, TABLE_NAME_COLUMN_NAME,
+        DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, ROW_ID_COLUMN_NAME,
     };
-    use risingwave_common::types::DataType;
+    use risingwave_common::types::{DataType, StructType};
 
     use crate::catalog::root_catalog::SchemaPath;
     use crate::catalog::source_catalog::SourceCatalog;
-    use crate::handler::create_source::debezium_cdc_source_schema;
-    use crate::test_utils::{create_proto_file, LocalFrontend, PROTO_FILE_DATA};
+    use crate::test_utils::{LocalFrontend, PROTO_FILE_DATA, create_proto_file};
 
     const GET_COLUMN_FROM_CATALOG: fn(&Arc<SourceCatalog>) -> HashMap<&str, DataType> =
         |catalog: &Arc<SourceCatalog>| -> HashMap<&str, DataType> {
@@ -1333,21 +1199,24 @@ pub mod tests {
 
         let columns = GET_COLUMN_FROM_CATALOG(source);
 
-        let city_type = DataType::new_struct(
-            vec![DataType::Varchar, DataType::Varchar],
-            vec!["address".to_string(), "zipcode".to_string()],
-        );
+        let city_type = StructType::new(vec![
+            ("address", DataType::Varchar),
+            ("zipcode", DataType::Varchar),
+        ])
+        // .with_ids([5, 6].map(ColumnId::new))
+        .into();
         let expected_columns = maplit::hashmap! {
-            ROWID_PREFIX => DataType::Serial,
+            ROW_ID_COLUMN_NAME => DataType::Serial,
             "id" => DataType::Int32,
             "zipcode" => DataType::Int64,
             "rate" => DataType::Float32,
-            "country" => DataType::new_struct(
-                vec![DataType::Varchar,city_type,DataType::Varchar],
-                vec!["address".to_string(), "city".to_string(), "zipcode".to_string()],
-            ),
+            "country" => StructType::new(
+                vec![("address", DataType::Varchar),("city", city_type),("zipcode", DataType::Varchar)],
+            )
+            // .with_ids([3, 4, 7].map(ColumnId::new))
+            .into(),
         };
-        assert_eq!(columns, expected_columns);
+        assert_eq!(columns, expected_columns, "{columns:#?}");
     }
 
     #[tokio::test]
@@ -1418,13 +1287,13 @@ pub mod tests {
         );
 
         // Options are not merged into props.
-        assert!(source.with_properties.get("schema.location").is_none());
+        assert!(!source.with_properties.contains_key("schema.location"));
     }
 
     #[tokio::test]
     async fn test_multi_table_cdc_create_source_handler() {
         let sql =
-            "CREATE SOURCE t2 WITH (connector = 'mysql-cdc') FORMAT PLAIN ENCODE JSON".to_string();
+            "CREATE SOURCE t2 WITH (connector = 'mysql-cdc') FORMAT PLAIN ENCODE JSON".to_owned();
         let frontend = LocalFrontend::new(Default::default()).await;
         let session = frontend.session_ref();
 
@@ -1445,30 +1314,36 @@ pub mod tests {
             .columns
             .iter()
             .map(|col| (col.name(), col.data_type().clone()))
-            .collect::<HashMap<&str, DataType>>();
+            .collect::<Vec<(&str, DataType)>>();
 
-        let expected_columns = maplit::hashmap! {
-            ROWID_PREFIX => DataType::Serial,
-            "payload" => DataType::Jsonb,
-            OFFSET_COLUMN_NAME => DataType::Varchar,
-            TABLE_NAME_COLUMN_NAME => DataType::Varchar,
-        };
-        assert_eq!(columns, expected_columns);
-    }
-
-    #[tokio::test]
-    async fn test_cdc_source_job_schema() {
-        let columns = debezium_cdc_source_schema();
-        // make sure it doesn't broken by future PRs
-        assert_eq!(CDC_SOURCE_COLUMN_NUM, columns.len() as u32);
+        expect_test::expect![[r#"
+            [
+                (
+                    "payload",
+                    Jsonb,
+                ),
+                (
+                    "_rw_offset",
+                    Varchar,
+                ),
+                (
+                    "_rw_table_name",
+                    Varchar,
+                ),
+                (
+                    "_row_id",
+                    Serial,
+                ),
+            ]
+        "#]]
+        .assert_debug_eq(&columns);
     }
 
     #[tokio::test]
     async fn test_source_addition_columns() {
         // test derive include column for format plain
         let sql =
-            "CREATE SOURCE s (v1 int) include key as _rw_kafka_key with (connector = 'kafka') format plain encode json"
-                .to_string();
+            "CREATE SOURCE s (v1 int) include key as _rw_kafka_key with (connector = 'kafka') format plain encode json".to_owned();
         let frontend = LocalFrontend::new(Default::default()).await;
         frontend.run_sql(sql).await.unwrap();
         let session = frontend.session_ref();
@@ -1482,35 +1357,50 @@ pub mod tests {
             .unwrap();
         assert_eq!(source.name, "s");
 
-        let columns = GET_COLUMN_FROM_CATALOG(source);
-        let expect_columns = maplit::hashmap! {
-            ROWID_PREFIX => DataType::Serial,
-            "v1" => DataType::Int32,
-            "_rw_kafka_key" => DataType::Bytea,
-            // todo: kafka connector will automatically derive the column
-            // will change to a required field in the include clause
-            "_rw_kafka_timestamp" => DataType::Timestamptz,
-        };
-        assert_eq!(columns, expect_columns);
+        let columns = source
+            .columns
+            .iter()
+            .map(|col| (col.name(), col.data_type().clone()))
+            .collect::<Vec<(&str, DataType)>>();
 
-        // test derive include column for format upsert
-        let sql = "CREATE SOURCE s1 (v1 int) with (connector = 'kafka') format upsert encode json"
-            .to_string();
+        expect_test::expect![[r#"
+            [
+                (
+                    "v1",
+                    Int32,
+                ),
+                (
+                    "_rw_kafka_key",
+                    Bytea,
+                ),
+                (
+                    "_rw_kafka_timestamp",
+                    Timestamptz,
+                ),
+                (
+                    "_rw_kafka_partition",
+                    Varchar,
+                ),
+                (
+                    "_rw_kafka_offset",
+                    Varchar,
+                ),
+                (
+                    "_row_id",
+                    Serial,
+                ),
+            ]
+        "#]]
+        .assert_debug_eq(&columns);
+
+        let sql =
+            "CREATE SOURCE s3 (v1 int) include timestamp 'header1' as header_col with (connector = 'kafka') format plain encode json".to_owned();
         match frontend.run_sql(sql).await {
             Err(e) => {
                 assert_eq!(
                     e.to_string(),
-                    "Protocol error: INCLUDE KEY clause must be set for FORMAT UPSERT ENCODE Json"
+                    "Protocol error: Only header column can have inner field, but got \"timestamp\""
                 )
-            }
-            _ => unreachable!(),
-        }
-
-        let sql = "CREATE SOURCE s2 (v1 int) include key as _rw_kafka_key with (connector = 'kafka') format upsert encode json"
-            .to_string();
-        match frontend.run_sql(sql).await {
-            Err(e) => {
-                assert_eq!(e.to_string(), "Protocol error: Primary key must be specified to _rw_kafka_key when creating source with FORMAT UPSERT ENCODE Json")
             }
             _ => unreachable!(),
         }

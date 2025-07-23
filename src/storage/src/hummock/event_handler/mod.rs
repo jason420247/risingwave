@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use itertools::Itertools;
+use parking_lot::{RwLock, RwLockReadGuard};
+use risingwave_common::bitmap::Bitmap;
 use risingwave_common::catalog::TableId;
-use risingwave_hummock_sdk::HummockEpoch;
-use tokio::sync::{mpsc, oneshot};
+use risingwave_hummock_sdk::{HummockEpoch, HummockRawObjectId};
+use thiserror_ext::AsReport;
+use tokio::sync::oneshot;
 
-use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::HummockResult;
+use crate::hummock::shared_buffer::shared_buffer_batch::{SharedBufferBatch, SharedBufferBatchId};
 use crate::mem_table::ImmutableMemtable;
-use crate::store::{SealCurrentEpochOptions, SyncResult};
+use crate::store::SealCurrentEpochOptions;
 
 pub mod hummock_event_handler;
 pub mod refiller;
 pub mod uploader;
 
 pub use hummock_event_handler::HummockEventHandler;
+use risingwave_hummock_sdk::vector_index::VectorIndexAdd;
 use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
 
 use super::store::version::HummockReadVersion;
+use crate::hummock::event_handler::hummock_event_handler::HummockEventSender;
+use crate::hummock::event_handler::uploader::SyncedData;
 
 #[derive(Debug)]
 pub struct BufferWriteRequest {
@@ -44,7 +50,7 @@ pub struct BufferWriteRequest {
 #[derive(Debug)]
 pub enum HummockVersionUpdate {
     VersionDeltas(Vec<HummockVersionDelta>),
-    PinnedVersion(HummockVersion),
+    PinnedVersion(Box<HummockVersion>),
 }
 
 pub enum HummockEvent {
@@ -54,29 +60,34 @@ pub enum HummockEvent {
     /// An epoch is going to be synced. Once the event is processed, there will be no more flush
     /// task on this epoch. Previous concurrent flush task join handle will be returned by the join
     /// handle sender.
-    AwaitSyncEpoch {
-        new_sync_epoch: HummockEpoch,
-        sync_result_sender: oneshot::Sender<HummockResult<SyncResult>>,
+    SyncEpoch {
+        sync_result_sender: oneshot::Sender<HummockResult<SyncedData>>,
+        sync_table_epochs: Vec<(HummockEpoch, HashSet<TableId>)>,
     },
 
     /// Clear shared buffer and reset all states
-    Clear(oneshot::Sender<()>),
+    Clear(oneshot::Sender<()>, Option<HashSet<TableId>>),
 
     Shutdown,
 
-    VersionUpdate(HummockVersionUpdate),
+    ImmToUploader {
+        instance_id: SharedBufferBatchId,
+        imms: Vec<ImmutableMemtable>,
+    },
 
-    ImmToUploader(ImmutableMemtable),
-
-    SealEpoch {
+    StartEpoch {
         epoch: HummockEpoch,
-        is_checkpoint: bool,
+        table_ids: HashSet<TableId>,
+    },
+
+    InitEpoch {
+        instance_id: LocalInstanceId,
+        init_epoch: HummockEpoch,
     },
 
     LocalSealEpoch {
         instance_id: LocalInstanceId,
-        table_id: TableId,
-        epoch: HummockEpoch,
+        next_epoch: HummockEpoch,
         opts: SealCurrentEpochOptions,
     },
 
@@ -87,56 +98,78 @@ pub enum HummockEvent {
 
     RegisterReadVersion {
         table_id: TableId,
-        new_read_version_sender:
-            oneshot::Sender<(Arc<RwLock<HummockReadVersion>>, LocalInstanceGuard)>,
+        new_read_version_sender: oneshot::Sender<(HummockReadVersionRef, LocalInstanceGuard)>,
         is_replicated: bool,
+        vnodes: Arc<Bitmap>,
     },
 
     DestroyReadVersion {
-        table_id: TableId,
         instance_id: LocalInstanceId,
+    },
+
+    RegisterVectorWriter {
+        table_id: TableId,
+        init_epoch: HummockEpoch,
+    },
+
+    VectorWriterSealEpoch {
+        table_id: TableId,
+        next_epoch: HummockEpoch,
+        add: Option<VectorIndexAdd>,
+    },
+
+    DropVectorWriter {
+        table_id: TableId,
+    },
+
+    GetMinUncommittedObjectId {
+        result_tx: oneshot::Sender<Option<HummockRawObjectId>>,
     },
 }
 
 impl HummockEvent {
     fn to_debug_string(&self) -> String {
         match self {
-            HummockEvent::BufferMayFlush => "BufferMayFlush".to_string(),
+            HummockEvent::BufferMayFlush => "BufferMayFlush".to_owned(),
 
-            HummockEvent::AwaitSyncEpoch {
-                new_sync_epoch,
+            HummockEvent::SyncEpoch {
                 sync_result_sender: _,
-            } => format!("AwaitSyncEpoch epoch {} ", new_sync_epoch),
+                sync_table_epochs,
+            } => format!("AwaitSyncEpoch epoch {:?}", sync_table_epochs),
 
-            HummockEvent::Clear(_) => "Clear".to_string(),
-
-            HummockEvent::Shutdown => "Shutdown".to_string(),
-
-            HummockEvent::VersionUpdate(version_update_payload) => {
-                format!("VersionUpdate {:?}", version_update_payload)
+            HummockEvent::Clear(_, table_ids) => {
+                format!("Clear {:?}", table_ids)
             }
 
-            HummockEvent::ImmToUploader(imm) => {
-                format!("ImmToUploader {:?}", imm)
+            HummockEvent::Shutdown => "Shutdown".to_owned(),
+
+            HummockEvent::StartEpoch { epoch, table_ids } => {
+                format!("StartEpoch {} {:?}", epoch, table_ids)
             }
 
-            HummockEvent::SealEpoch {
-                epoch,
-                is_checkpoint,
-            } => format!(
-                "SealEpoch epoch {:?} is_checkpoint {:?}",
-                epoch, is_checkpoint
-            ),
+            HummockEvent::InitEpoch {
+                instance_id,
+                init_epoch,
+            } => {
+                format!("InitEpoch {} {}", instance_id, init_epoch)
+            }
+
+            HummockEvent::ImmToUploader { instance_id, imms } => {
+                format!(
+                    "ImmToUploader {} {:?}",
+                    instance_id,
+                    imms.iter().map(|imm| imm.batch_id()).collect_vec()
+                )
+            }
 
             HummockEvent::LocalSealEpoch {
-                epoch,
                 instance_id,
-                table_id,
+                next_epoch,
                 opts,
             } => {
                 format!(
-                    "LocalSealEpoch epoch: {}, table_id: {}, instance_id: {}, opts: {:?}",
-                    epoch, table_id.table_id, instance_id, opts
+                    "LocalSealEpoch next_epoch: {}, instance_id: {}, opts: {:?}",
+                    next_epoch, instance_id, opts
                 )
             }
 
@@ -144,21 +177,24 @@ impl HummockEvent {
                 table_id,
                 new_read_version_sender: _,
                 is_replicated,
+                vnodes: _,
             } => format!(
                 "RegisterReadVersion table_id {:?}, is_replicated: {:?}",
                 table_id, is_replicated
             ),
 
-            HummockEvent::DestroyReadVersion {
-                table_id,
-                instance_id,
-            } => format!(
-                "DestroyReadVersion table_id {:?} instance_id {:?}",
-                table_id, instance_id
-            ),
+            HummockEvent::DestroyReadVersion { instance_id } => {
+                format!("DestroyReadVersion instance_id {:?}", instance_id)
+            }
 
             #[cfg(any(test, feature = "test"))]
-            HummockEvent::FlushEvent(_) => "FlushEvent".to_string(),
+            HummockEvent::FlushEvent(_) => "FlushEvent".to_owned(),
+            HummockEvent::GetMinUncommittedObjectId { .. } => {
+                "GetMinUncommittedObjectId".to_owned()
+            }
+            HummockEvent::RegisterVectorWriter { .. } => "RegisterVectorWriter".to_owned(),
+            HummockEvent::VectorWriterSealEpoch { .. } => "VectorWriterSealEpoch".to_owned(),
+            HummockEvent::DropVectorWriter { .. } => "DropVectorWriter".to_owned(),
         }
     }
 }
@@ -172,31 +208,53 @@ impl std::fmt::Debug for HummockEvent {
 }
 
 pub type LocalInstanceId = u64;
-pub type ReadVersionMappingType =
-    RwLock<HashMap<TableId, HashMap<LocalInstanceId, Arc<RwLock<HummockReadVersion>>>>>;
+pub const TEST_LOCAL_INSTANCE_ID: LocalInstanceId = 233;
+pub type HummockReadVersionRef = Arc<RwLock<HummockReadVersion>>;
+pub type ReadVersionMappingType = HashMap<TableId, HashMap<LocalInstanceId, HummockReadVersionRef>>;
+pub type ReadOnlyReadVersionMapping = ReadOnlyRwLockRef<ReadVersionMappingType>;
+
+pub struct ReadOnlyRwLockRef<T>(Arc<RwLock<T>>);
+
+impl<T> Clone for ReadOnlyRwLockRef<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> ReadOnlyRwLockRef<T> {
+    pub fn new(inner: Arc<RwLock<T>>) -> Self {
+        Self(inner)
+    }
+
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        self.0.read()
+    }
+}
 
 pub struct LocalInstanceGuard {
     pub table_id: TableId,
     pub instance_id: LocalInstanceId,
-    event_sender: mpsc::UnboundedSender<HummockEvent>,
+    // Only send destroy event when event_sender when is_some
+    event_sender: Option<HummockEventSender>,
 }
 
 impl Drop for LocalInstanceGuard {
     fn drop(&mut self) {
-        // If sending fails, it means that event_handler and event_channel have been destroyed, no
-        // need to handle failure
-        self.event_sender
-            .send(HummockEvent::DestroyReadVersion {
-                table_id: self.table_id,
-                instance_id: self.instance_id,
-            })
-            .unwrap_or_else(|err| {
-                tracing::error!(
-                    "LocalInstanceGuard table_id {:?} instance_id {} Drop SendError {:?}",
-                    self.table_id,
-                    self.instance_id,
-                    err
-                )
-            })
+        if let Some(sender) = self.event_sender.take() {
+            // If sending fails, it means that event_handler and event_channel have been destroyed, no
+            // need to handle failure
+            sender
+                .send(HummockEvent::DestroyReadVersion {
+                    instance_id: self.instance_id,
+                })
+                .unwrap_or_else(|err| {
+                    tracing::debug!(
+                        error = %err.as_report(),
+                        table_id = %self.table_id,
+                        instance_id = self.instance_id,
+                        "LocalInstanceGuard Drop SendError",
+                    )
+                })
+        }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 use risingwave_hummock_sdk::{HummockContextId, HummockSstableObjectId};
 use risingwave_object_store::object::ObjectError;
 use risingwave_rpc_client::error::ToTonicStatus;
+use sea_orm::DbErr;
 use thiserror::Error;
 
 use crate::model::MetadataModelError;
-use crate::storage::MetaStoreError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -26,7 +26,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("invalid hummock context {0}")]
     InvalidContext(HummockContextId),
-    #[error("failed to access meta store: {0}")]
+    #[error("failed to access meta store")]
     MetaStore(
         #[source]
         #[backtrace]
@@ -44,6 +44,12 @@ pub enum Error {
     CompactionGroup(String),
     #[error("SST {0} is invalid")]
     InvalidSst(HummockSstableObjectId),
+    #[error("time travel")]
+    TimeTravel(
+        #[source]
+        #[backtrace]
+        anyhow::Error,
+    ),
     #[error(transparent)]
     Internal(
         #[from]
@@ -58,28 +64,15 @@ impl Error {
     }
 }
 
-impl From<MetaStoreError> for Error {
-    fn from(error: MetaStoreError) -> Self {
-        match error {
-            MetaStoreError::ItemNotFound(err) => anyhow::anyhow!(err).into(),
-            MetaStoreError::TransactionAbort() => {
-                // TODO: need more concrete error from meta store.
-                Error::Internal(anyhow::anyhow!("meta store transaction failed"))
-            }
-            // TODO: Currently MetaStoreError::Internal is equivalent to EtcdError, which
-            // includes both retryable and non-retryable. Need to expand MetaStoreError::Internal
-            // to more detail meta_store errors.
-            MetaStoreError::Internal(err) => Error::MetaStore(err),
-        }
+impl From<MetadataModelError> for Error {
+    fn from(err: MetadataModelError) -> Self {
+        anyhow::anyhow!(err).into()
     }
 }
 
-impl From<MetadataModelError> for Error {
-    fn from(err: MetadataModelError) -> Self {
-        match err {
-            MetadataModelError::MetaStoreError(e) => e.into(),
-            e => anyhow::anyhow!(e).into(),
-        }
+impl From<sea_orm::DbErr> for Error {
+    fn from(value: DbErr) -> Self {
+        MetadataModelError::from(value).into()
     }
 }
 

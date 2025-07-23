@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,36 +14,43 @@
 
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use futures_async_stream::try_stream;
 use itertools::Itertools;
 use prost::Message;
+use risingwave_common::bail;
+use risingwave_common::global_jvm::JVM;
+use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
 use risingwave_common::util::addr::HostAddr;
-use risingwave_jni_core::jvm_runtime::JVM;
-use risingwave_jni_core::{call_static_method, JniReceiverType, JniSenderType};
-use risingwave_pb::connector_service::{
-    GetEventStreamRequest, GetEventStreamResponse, SourceCommonParam,
-};
+use risingwave_jni_core::jvm_runtime::execute_with_jni_env;
+use risingwave_jni_core::{JniReceiverType, OwnedPointer, call_static_method};
+use risingwave_pb::connector_service::{GetEventStreamRequest, GetEventStreamResponse};
+use thiserror_ext::AsReport;
 use tokio::sync::mpsc;
 
+use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::ParserConfig;
 use crate::source::base::SourceMessage;
 use crate::source::cdc::{CdcProperties, CdcSourceType, CdcSourceTypeTrait, DebeziumCdcSplit};
 use crate::source::{
-    into_chunk_stream, BoxSourceWithStateStream, Column, CommonSplitReader, SourceContextRef,
-    SplitId, SplitMetaData, SplitReader,
+    BoxSourceChunkStream, Column, SourceContextRef, SplitId, SplitMetaData, SplitReader,
+    into_chunk_stream,
 };
 
 pub struct CdcSplitReader<T: CdcSourceTypeTrait> {
     source_id: u64,
+    #[expect(dead_code)]
     start_offset: Option<String>,
     // host address of worker node for a Citus cluster
+    #[expect(dead_code)]
     server_addr: Option<String>,
+    #[expect(dead_code)]
     conn_props: CdcProperties<T>,
-
+    #[expect(dead_code)]
     split_id: SplitId,
     // whether the full snapshot phase is done
+    #[expect(dead_code)]
     snapshot_done: bool,
     parser_config: ParserConfig,
     source_ctx: SourceContextRef,
@@ -64,21 +71,24 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
         parser_config: ParserConfig,
         source_ctx: SourceContextRef,
         _columns: Option<Vec<Column>>,
-    ) -> Result<Self> {
+    ) -> ConnectorResult<Self> {
         assert_eq!(splits.len(), 1);
         let split = splits.into_iter().next().unwrap();
         let split_id = split.id();
 
         let mut properties = conn_props.properties.clone();
 
+        let mut citus_server_addr = None;
         // For citus, we need to rewrite the `table.name` to capture sharding tables
         if matches!(T::source_type(), CdcSourceType::Citus)
-            && let Some(server_addr) = split.server_addr()
+            && let Some(ref citus_split) = split.citus_split
+            && let Some(ref server_addr) = citus_split.server_addr
         {
-            let host_addr = HostAddr::from_str(&server_addr)
-                .map_err(|err| anyhow!("invalid server address for cdc split. {}", err))?;
-            properties.insert("hostname".to_string(), host_addr.host);
-            properties.insert("port".to_string(), host_addr.port.to_string());
+            citus_server_addr = Some(server_addr.clone());
+            let host_addr =
+                HostAddr::from_str(server_addr).context("invalid server address for cdc split")?;
+            properties.insert("hostname".to_owned(), host_addr.host);
+            properties.insert("port".to_owned(), host_addr.port.to_string());
             // rewrite table name with suffix to capture all shards in the split
             let mut table_name = properties
                 .remove("table.name")
@@ -89,56 +99,60 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
 
         let source_id = split.split_id() as u64;
         let source_type = conn_props.get_source_type_pb();
-        let (mut tx, mut rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx, mut rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let jvm = JVM.get_or_init()?;
-
         let get_event_stream_request = GetEventStreamRequest {
             source_id,
             source_type: source_type as _,
             start_offset: split.start_offset().clone().unwrap_or_default(),
             properties,
             snapshot_done: split.snapshot_done(),
-            common_param: Some(SourceCommonParam {
-                is_multi_table_shared: conn_props.is_multi_table_shared,
-            }),
+            is_source_job: conn_props.is_cdc_source_job,
         };
 
         std::thread::spawn(move || {
-            let result: anyhow::Result<_> = try {
-                let env = jvm.attach_current_thread()?;
-                let get_event_stream_request_bytes =
-                    env.byte_array_from_slice(&Message::encode_to_vec(&get_event_stream_request))?;
-                (env, get_event_stream_request_bytes)
-            };
+            execute_with_jni_env(jvm, |env| {
+                let result: anyhow::Result<_> = try {
+                    let get_event_stream_request_bytes = env.byte_array_from_slice(
+                        &Message::encode_to_vec(&get_event_stream_request),
+                    )?;
+                    (env, get_event_stream_request_bytes)
+                };
 
-            let (mut env, get_event_stream_request_bytes) = match result {
-                Ok(inner) => inner,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(anyhow!(
-                        "err before calling runJniDbzSourceThread: {:?}",
-                        e
-                    )));
-                    return;
-                }
-            };
+                let (env, get_event_stream_request_bytes) = match result {
+                    Ok(inner) => inner,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(
+                            e.context("err before calling runJniDbzSourceThread")
+                        ));
+                        return Ok(());
+                    }
+                };
 
-            let result = call_static_method!(
-                env,
-                {com.risingwave.connector.source.core.JniDbzSourceHandler},
-                {void runJniDbzSourceThread(byte[] getEventStreamRequestBytes, long channelPtr)},
-                &get_event_stream_request_bytes,
-                &mut tx as *mut JniSenderType<GetEventStreamResponse>
-            );
+                // `runJniDbzSourceThread` will take ownership of `tx`, and release it later in
+                // `Java_com_risingwave_java_binding_Binding_cdcSourceSenderClose` via ref cleaner.
+                let tx: OwnedPointer<_> = tx.into();
 
-            match result {
-                Ok(_) => {
-                    tracing::info!(?source_id, "end of jni call runJniDbzSourceThread");
+                let result = call_static_method!(
+                    env,
+                    {com.risingwave.connector.source.core.JniDbzSourceHandler},
+                    {void runJniDbzSourceThread(byte[] getEventStreamRequestBytes, long channelPtr)},
+                    &get_event_stream_request_bytes,
+                    tx.into_pointer()
+                );
+
+                match result {
+                    Ok(_) => {
+                        tracing::info!(?source_id, "end of jni call runJniDbzSourceThread");
+                    }
+                    Err(e) => {
+                        tracing::error!(?source_id, error = %e.as_report(), "jni call error");
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(?source_id, "jni call error: {:?}", e);
-                }
-            }
+
+                Ok(())
+            })
         });
 
         // wait for the handshake message
@@ -152,13 +166,18 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
                 }
             };
             if !inited {
-                return Err(anyhow!("failed to start cdc connector"));
+                bail!(
+                    "failed to start cdc connector.\nHINT: increase `cdc_source_wait_streaming_start_timeout` session variable to a large value and retry."
+                );
             }
         }
         tracing::info!(?source_id, "cdc connector started");
 
-        match T::source_type() {
-            CdcSourceType::Mysql | CdcSourceType::Postgres => Ok(Self {
+        let instance = match T::source_type() {
+            CdcSourceType::Mysql
+            | CdcSourceType::Postgres
+            | CdcSourceType::Mongodb
+            | CdcSourceType::SqlServer => Self {
                 source_id: split.split_id() as u64,
                 start_offset: split.start_offset().clone(),
                 server_addr: None,
@@ -168,50 +187,57 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
                 parser_config,
                 source_ctx,
                 rx,
-            }),
-            CdcSourceType::Citus => Ok(Self {
+            },
+            CdcSourceType::Citus => Self {
                 source_id: split.split_id() as u64,
                 start_offset: split.start_offset().clone(),
-                server_addr: split.server_addr(),
+                server_addr: citus_server_addr,
                 conn_props,
                 split_id,
                 snapshot_done: split.snapshot_done(),
                 parser_config,
                 source_ctx,
                 rx,
-            }),
+            },
             CdcSourceType::Unspecified => {
                 unreachable!();
             }
-        }
+        };
+        Ok(instance)
     }
 
-    fn into_stream(self) -> BoxSourceWithStateStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
-        into_chunk_stream(self, parser_config, source_context)
+        into_chunk_stream(self.into_data_stream(), parser_config, source_context)
     }
 }
 
-impl<T: CdcSourceTypeTrait> CommonSplitReader for CdcSplitReader<T> {
-    #[try_stream(ok = Vec<SourceMessage>, error = anyhow::Error)]
+impl<T: CdcSourceTypeTrait> CdcSplitReader<T> {
+    #[try_stream(ok = Vec<SourceMessage>, error = ConnectorError)]
     async fn into_data_stream(self) {
-        let source_type = T::source_type();
         let mut rx = self.rx;
         let source_id = self.source_id.to_string();
-        let metrics = self.source_ctx.metrics.clone();
 
         while let Some(result) = rx.recv().await {
-            let GetEventStreamResponse { events, .. } = result?;
-            tracing::trace!("receive {} cdc events ", events.len());
-            metrics
-                .connector_source_rows_received
-                .with_label_values(&[source_type.as_str_name(), &source_id])
-                .inc_by(events.len() as u64);
-            let msgs = events.into_iter().map(SourceMessage::from).collect_vec();
-            yield msgs;
+            match result {
+                Ok(GetEventStreamResponse { events, .. }) => {
+                    tracing::trace!("receive {} cdc events ", events.len());
+                    let msgs = events.into_iter().map(SourceMessage::from).collect_vec();
+                    yield msgs;
+                }
+                Err(e) => {
+                    GLOBAL_ERROR_METRICS.user_source_error.report([
+                        "cdc_source".to_owned(),
+                        source_id.clone(),
+                        self.source_ctx.source_name.clone(),
+                        self.source_ctx.fragment_id.to_string(),
+                    ]);
+                    Err(e)?;
+                }
+            }
         }
 
-        Err(anyhow!("all senders are dropped"))?;
+        bail!("all senders are dropped");
     }
 }

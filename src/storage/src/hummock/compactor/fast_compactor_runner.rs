@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,23 +16,29 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicU64;
-use std::sync::{atomic, Arc};
+use std::sync::{Arc, atomic};
 use std::time::Instant;
 
-use await_tree::InstrumentAwait;
+use await_tree::{InstrumentAwait, SpanExt};
 use bytes::Bytes;
+use fail::fail_point;
 use itertools::Itertools;
+use risingwave_hummock_sdk::compact_task::CompactTask;
 use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::key_range::KeyRange;
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::table_stats::TableStats;
-use risingwave_hummock_sdk::{can_concat, compact_task_to_string, EpochWithGap, LocalSstableInfo};
-use risingwave_pb::hummock::{CompactTask, SstableInfo};
+use risingwave_hummock_sdk::{EpochWithGap, LocalSstableInfo, can_concat, compact_task_to_string};
 
-use crate::filter_key_extractor::FilterKeyExtractorImpl;
+use crate::compaction_catalog_manager::CompactionCatalogAgentRef;
 use crate::hummock::block_stream::BlockDataStream;
 use crate::hummock::compactor::task_progress::TaskProgress;
 use crate::hummock::compactor::{
-    CompactionStatistics, Compactor, CompactorContext, RemoteBuilderFactory, TaskConfig,
+    CompactionFilter, CompactionStatistics, Compactor, CompactorContext, MultiCompactionFilter,
+    RemoteBuilderFactory, TaskConfig,
+};
+use crate::hummock::iterator::{
+    NonPkPrefixSkipWatermarkState, PkPrefixSkipWatermarkState, SkipWatermarkState,
 };
 use crate::hummock::multi_builder::{CapacitySplitTableBuilder, TableBuilderFactory};
 use crate::hummock::sstable_store::SstableStoreRef;
@@ -47,7 +53,7 @@ use crate::monitor::{CompactorMetrics, StoreLocalStatistic};
 /// Iterates over the KV-pairs of an SST while downloading it.
 pub struct BlockStreamIterator {
     /// The downloading stream.
-    block_stream: BlockDataStream,
+    block_stream: Option<BlockDataStream>,
 
     next_block_index: usize,
 
@@ -55,6 +61,13 @@ pub struct BlockStreamIterator {
     sstable: TableHolder,
     iter: Option<BlockIterator>,
     task_progress: Arc<TaskProgress>,
+
+    // For block stream recreate
+    sstable_store: SstableStoreRef,
+    sstable_info: SstableInfo,
+    io_retry_times: usize,
+    max_io_retry_times: usize,
+    stats_ptr: Arc<AtomicU64>,
 }
 
 impl BlockStreamIterator {
@@ -74,35 +87,105 @@ impl BlockStreamIterator {
     /// The iterator reads at most `max_block_count` from the stream.
     pub fn new(
         sstable: TableHolder,
-        block_stream: BlockDataStream,
         task_progress: Arc<TaskProgress>,
+        sstable_store: SstableStoreRef,
+        sstable_info: SstableInfo,
+        max_io_retry_times: usize,
+        stats_ptr: Arc<AtomicU64>,
     ) -> Self {
         Self {
-            block_stream,
+            block_stream: None,
             next_block_index: 0,
             sstable,
             iter: None,
             task_progress,
+            sstable_store,
+            sstable_info,
+            io_retry_times: 0,
+            max_io_retry_times,
+            stats_ptr,
         }
     }
 
-    /// Wrapper function for `self.block_stream.next()` which allows us to measure the time needed.
-    async fn download_next_block(&mut self) -> HummockResult<Option<(Bytes, Vec<u8>, BlockMeta)>> {
-        let (data, _) = match self.block_stream.next_block_impl().await? {
-            None => return Ok(None),
-            Some(ret) => ret,
-        };
-        let meta = self.sstable.value().meta.block_metas[self.next_block_index].clone();
-        let filter_block = self
-            .sstable
-            .value()
-            .filter_reader
-            .get_block_raw_filter(self.next_block_index);
-        self.next_block_index += 1;
-        Ok(Some((data, filter_block, meta)))
+    async fn create_stream(&mut self) -> HummockResult<()> {
+        // Fast compact only support the single table compaction.(not split sst)
+        // So we don't need to filter the block_metas with table_id and key_range
+        let block_stream = self
+            .sstable_store
+            .get_stream_for_blocks(
+                self.sstable_info.object_id,
+                &self.sstable.meta.block_metas[self.next_block_index..],
+            )
+            .instrument_await("stream_iter_get_stream".verbose())
+            .await?;
+        self.block_stream = Some(block_stream);
+        Ok(())
     }
 
-    fn init_block_iter(&mut self, buf: Bytes, uncompressed_capacity: usize) -> HummockResult<()> {
+    /// Wrapper function for `self.block_stream.next()` which allows us to measure the time needed.
+    pub(crate) async fn download_next_block(
+        &mut self,
+    ) -> HummockResult<Option<(Bytes, Vec<u8>, BlockMeta)>> {
+        let now = Instant::now();
+        let _time_stat = scopeguard::guard(self.stats_ptr.clone(), |stats_ptr: Arc<AtomicU64>| {
+            let add = (now.elapsed().as_secs_f64() * 1000.0).ceil();
+            stats_ptr.fetch_add(add as u64, atomic::Ordering::Relaxed);
+        });
+        loop {
+            let ret = match &mut self.block_stream {
+                Some(block_stream) => block_stream.next_block_impl().await,
+                None => {
+                    self.create_stream().await?;
+                    continue;
+                }
+            };
+            match ret {
+                Ok(Some((data, _))) => {
+                    let meta = self.sstable.meta.block_metas[self.next_block_index].clone();
+                    let filter_block = self
+                        .sstable
+                        .filter_reader
+                        .get_block_raw_filter(self.next_block_index);
+                    self.next_block_index += 1;
+                    return Ok(Some((data, filter_block, meta)));
+                }
+
+                Ok(None) => break,
+
+                Err(e) => {
+                    if !e.is_object_error() || self.io_retry_times >= self.max_io_retry_times {
+                        return Err(e);
+                    }
+
+                    self.block_stream.take();
+                    self.io_retry_times += 1;
+                    fail_point!("create_stream_err");
+
+                    tracing::warn!(
+                        "fast compact retry create stream for sstable {} times, sstinfo={}",
+                        self.io_retry_times,
+                        format!(
+                            "object_id={}, sst_id={}, meta_offset={}, table_ids={:?}",
+                            self.sstable_info.object_id,
+                            self.sstable_info.sst_id,
+                            self.sstable_info.meta_offset,
+                            self.sstable_info.table_ids
+                        )
+                    );
+                }
+            }
+        }
+
+        self.next_block_index = self.sstable.meta.block_metas.len();
+        self.iter.take();
+        Ok(None)
+    }
+
+    pub(crate) fn init_block_iter(
+        &mut self,
+        buf: Bytes,
+        uncompressed_capacity: usize,
+    ) -> HummockResult<()> {
         let block = Block::decode(buf, uncompressed_capacity)?;
         let mut iter = BlockIterator::new(BlockHolder::from_owned_block(Box::new(block)));
         iter.seek_to_first();
@@ -111,25 +194,25 @@ impl BlockStreamIterator {
     }
 
     fn next_block_smallest(&self) -> &[u8] {
-        self.sstable.value().meta.block_metas[self.next_block_index]
+        self.sstable.meta.block_metas[self.next_block_index]
             .smallest_key
             .as_ref()
     }
 
     fn next_block_largest(&self) -> &[u8] {
-        if self.next_block_index + 1 < self.sstable.value().meta.block_metas.len() {
-            self.sstable.value().meta.block_metas[self.next_block_index + 1]
+        if self.next_block_index + 1 < self.sstable.meta.block_metas.len() {
+            self.sstable.meta.block_metas[self.next_block_index + 1]
                 .smallest_key
                 .as_ref()
         } else {
-            self.sstable.value().meta.largest_key.as_ref()
+            self.sstable.meta.largest_key.as_ref()
         }
     }
 
     fn current_block_largest(&self) -> Vec<u8> {
-        if self.next_block_index < self.sstable.value().meta.block_metas.len() {
+        if self.next_block_index < self.sstable.meta.block_metas.len() {
             let mut largest_key = FullKey::decode(
-                self.sstable.value().meta.block_metas[self.next_block_index]
+                self.sstable.meta.block_metas[self.next_block_index]
                     .smallest_key
                     .as_ref(),
             );
@@ -137,7 +220,7 @@ impl BlockStreamIterator {
             largest_key.epoch_with_gap = EpochWithGap::new_max_epoch();
             largest_key.encode()
         } else {
-            self.sstable.value().meta.largest_key.clone()
+            self.sstable.meta.largest_key.clone()
         }
     }
 
@@ -145,23 +228,27 @@ impl BlockStreamIterator {
         match self.iter.as_ref() {
             Some(iter) => iter.key(),
             None => FullKey::decode(
-                self.sstable.value().meta.block_metas[self.next_block_index]
+                self.sstable.meta.block_metas[self.next_block_index]
                     .smallest_key
                     .as_ref(),
             ),
         }
     }
 
-    fn is_valid(&self) -> bool {
-        self.iter.is_some() || self.next_block_index < self.sstable.value().meta.block_metas.len()
+    pub(crate) fn is_valid(&self) -> bool {
+        self.iter.is_some() || self.next_block_index < self.sstable.meta.block_metas.len()
+    }
+
+    #[cfg(test)]
+    #[cfg(feature = "failpoints")]
+    pub(crate) fn iter_mut(&mut self) -> &mut BlockIterator {
+        self.iter.as_mut().unwrap()
     }
 }
 
 impl Drop for BlockStreamIterator {
     fn drop(&mut self) {
-        self.task_progress
-            .num_pending_read_io
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.task_progress.dec_num_pending_read_io();
     }
 }
 
@@ -181,6 +268,8 @@ pub struct ConcatSstableIterator {
 
     stats: StoreLocalStatistic,
     task_progress: Arc<TaskProgress>,
+
+    max_io_retry_times: usize,
 }
 
 impl ConcatSstableIterator {
@@ -191,6 +280,7 @@ impl ConcatSstableIterator {
         sst_infos: Vec<SstableInfo>,
         sstable_store: SstableStoreRef,
         task_progress: Arc<TaskProgress>,
+        max_io_retry_times: usize,
     ) -> Self {
         Self {
             sstable_iter: None,
@@ -199,6 +289,7 @@ impl ConcatSstableIterator {
             sstable_store,
             task_progress,
             stats: StoreLocalStatistic::default(),
+            max_io_retry_times,
         }
     }
 
@@ -238,49 +329,44 @@ impl ConcatSstableIterator {
             let sstable = self
                 .sstable_store
                 .sstable(sstable_info, &mut self.stats)
-                .verbose_instrument_await("stream_iter_sstable")
+                .instrument_await("stream_iter_sstable".verbose())
                 .await?;
-            let stats_ptr = self.stats.remote_io_time.clone();
-            let now = Instant::now();
-            self.task_progress
-                .num_pending_read_io
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let block_stream = self
-                .sstable_store
-                .get_stream_for_blocks(sstable.value().id, &sstable.value().meta.block_metas)
-                .verbose_instrument_await("stream_iter_get_stream")
-                .await?;
+            self.task_progress.inc_num_pending_read_io();
 
-            // Determine time needed to open stream.
-            let add = (now.elapsed().as_secs_f64() * 1000.0).ceil();
-            stats_ptr.fetch_add(add as u64, atomic::Ordering::Relaxed);
-
-            let sstable_iter =
-                BlockStreamIterator::new(sstable, block_stream, self.task_progress.clone());
+            let sstable_iter = BlockStreamIterator::new(
+                sstable,
+                self.task_progress.clone(),
+                self.sstable_store.clone(),
+                sstable_info.clone(),
+                self.max_io_retry_times,
+                self.stats.remote_io_time.clone(),
+            );
             self.sstable_iter = Some(sstable_iter);
         }
         Ok(())
     }
 }
 
-pub struct CompactorRunner {
+pub struct CompactorRunner<C: CompactionFilter = MultiCompactionFilter> {
     left: Box<ConcatSstableIterator>,
     right: Box<ConcatSstableIterator>,
     task_id: u64,
     executor: CompactTaskExecutor<
         RemoteBuilderFactory<UnifiedSstableWriterFactory, BlockedXor16FilterBuilder>,
+        C,
     >,
     compression_algorithm: CompressionAlgorithm,
     metrics: Arc<CompactorMetrics>,
 }
 
-impl CompactorRunner {
+impl<C: CompactionFilter> CompactorRunner<C> {
     pub fn new(
         context: CompactorContext,
         task: CompactTask,
-        filter_key_extractor: Arc<FilterKeyExtractorImpl>,
-        object_id_getter: Box<dyn GetObjectId>,
+        compaction_catalog_agent_ref: CompactionCatalogAgentRef,
+        object_id_getter: Arc<dyn GetObjectId>,
         task_progress: Arc<TaskProgress>,
+        compaction_filter: C,
     ) -> Self {
         let mut options: SstableBuilderOptions = context.storage_opts.as_ref().into();
         let compression_algorithm: CompressionAlgorithm = task.compression_algorithm.into();
@@ -294,12 +380,13 @@ impl CompactorRunner {
             key_range,
             cache_policy: CachePolicy::NotFill,
             gc_delete_keys: task.gc_delete_keys,
-            watermark: task.watermark,
+            retain_multiple_version: false,
             stats_target_table_ids: Some(HashSet::from_iter(task.existing_table_ids.clone())),
-            task_type: task.task_type(),
-            is_target_l0_or_lbase: task.target_level == 0 || task.target_level == task.base_level,
+            task_type: task.task_type,
             table_vnode_partition: task.table_vnode_partition.clone(),
             use_block_based_filter: true,
+            table_schemas: Default::default(),
+            disable_drop_column_optimization: false,
         };
         let factory = UnifiedSstableWriterFactory::new(context.sstable_store.clone());
 
@@ -309,7 +396,7 @@ impl CompactorRunner {
             options,
             policy: task_config.cache_policy,
             remote_rpc_cost: get_id_time,
-            filter_key_extractor,
+            compaction_catalog_agent_ref: compaction_catalog_agent_ref.clone(),
             sstable_writer_factory: factory,
             _phantom: PhantomData,
         };
@@ -318,6 +405,10 @@ impl CompactorRunner {
             context.compactor_metrics.clone(),
             Some(task_progress.clone()),
             task_config.table_vnode_partition.clone(),
+            context
+                .storage_opts
+                .compactor_concurrent_uploading_sst_count,
+            compaction_catalog_agent_ref.clone(),
         );
         assert_eq!(
             task.input_ssts.len(),
@@ -331,15 +422,33 @@ impl CompactorRunner {
             task.input_ssts[0].table_infos.clone(),
             context.sstable_store.clone(),
             task_progress.clone(),
+            context.storage_opts.compactor_iter_max_io_retry_times,
         ));
         let right = Box::new(ConcatSstableIterator::new(
             task.input_ssts[1].table_infos.clone(),
             context.sstable_store,
             task_progress.clone(),
+            context.storage_opts.compactor_iter_max_io_retry_times,
         ));
 
+        // Can not consume the watermarks because the watermarks may be used by `check_compact_result`.
+        let state = PkPrefixSkipWatermarkState::from_safe_epoch_watermarks(
+            task.pk_prefix_table_watermarks.clone(),
+        );
+        let non_pk_prefix_state = NonPkPrefixSkipWatermarkState::from_safe_epoch_watermarks(
+            task.non_pk_prefix_table_watermarks.clone(),
+            compaction_catalog_agent_ref,
+        );
+
         Self {
-            executor: CompactTaskExecutor::new(sst_builder, task_config, task_progress),
+            executor: CompactTaskExecutor::new(
+                sst_builder,
+                task_config,
+                task_progress,
+                state,
+                non_pk_prefix_state,
+                compaction_filter,
+            ),
             left,
             right,
             task_id: task.task_id,
@@ -380,15 +489,7 @@ impl CompactorRunner {
                     }
                     let smallest_key =
                         FullKey::decode(first.current_sstable().next_block_smallest());
-                    if self
-                        .executor
-                        .last_key
-                        .user_key
-                        .as_ref()
-                        .eq(&smallest_key.user_key)
-                    {
-                        // If the last key is delete tombstone, we can not append the origin block
-                        // because it would cause a deleted key could be see by user again.
+                    if !self.executor.shall_copy_raw_block(&smallest_key) {
                         break;
                     }
                     let smallest_key = smallest_key.to_vec();
@@ -447,7 +548,7 @@ impl CompactorRunner {
         if rest_data.is_valid() {
             // compact rest keys of the current block.
             let sstable_iter = rest_data.sstable_iter.as_mut().unwrap();
-            let target_key = FullKey::decode(&sstable_iter.sstable.value().meta.largest_key);
+            let target_key = FullKey::decode(&sstable_iter.sstable.meta.largest_key);
             if let Some(iter) = sstable_iter.iter.as_mut() {
                 self.executor.run(iter, target_key).await?;
                 assert!(
@@ -468,8 +569,11 @@ impl CompactorRunner {
                 // If the last key is tombstone and it was deleted, the first key of this block must be deleted. So we can not move this block directly.
                 let need_deleted = self.executor.last_key.user_key.eq(&smallest_key.user_key)
                     && self.executor.last_key_is_delete;
-                if self.executor.builder.need_flush() || need_deleted {
-                    let largest_key = sstable_iter.sstable.value().meta.largest_key.clone();
+                if self.executor.builder.need_flush()
+                    || need_deleted
+                    || !self.executor.shall_copy_raw_block(&smallest_key.to_ref())
+                {
+                    let largest_key = sstable_iter.sstable.meta.largest_key.clone();
                     let target_key = FullKey::decode(&largest_key);
                     sstable_iter.init_block_iter(block, block_meta.uncompressed_size as usize)?;
                     let mut iter = sstable_iter.iter.take().unwrap();
@@ -495,10 +599,10 @@ impl CompactorRunner {
         }
         let mut total_read_bytes = 0;
         for sst in &self.left.sstables {
-            total_read_bytes += sst.file_size;
+            total_read_bytes += sst.sst_size;
         }
         for sst in &self.right.sstables {
-            total_read_bytes += sst.file_size;
+            total_read_bytes += sst.sst_size;
         }
         self.metrics
             .compact_fast_runner_bytes
@@ -511,50 +615,59 @@ impl CompactorRunner {
         );
 
         let statistic = self.executor.take_statistics();
-        let outputs = self.executor.builder.finish().await?;
-        let ssts = Compactor::report_progress(
+        let output_ssts = self.executor.builder.finish().await?;
+        Compactor::report_progress(
             self.metrics.clone(),
             Some(self.executor.task_progress.clone()),
-            outputs,
+            &output_ssts,
             false,
-        )
-        .await?;
-        let sst_infos = ssts.iter().map(|sst| sst.sst_info.clone()).collect_vec();
+        );
+        let sst_infos = output_ssts
+            .iter()
+            .map(|sst| sst.sst_info.clone())
+            .collect_vec();
         assert!(can_concat(&sst_infos));
-        Ok((ssts, statistic))
+        Ok((output_ssts, statistic))
     }
 }
 
-pub struct CompactTaskExecutor<F: TableBuilderFactory> {
+pub struct CompactTaskExecutor<F: TableBuilderFactory, C: CompactionFilter> {
     last_key: FullKey<Vec<u8>>,
     compaction_statistics: CompactionStatistics,
     last_table_id: Option<u32>,
     last_table_stats: TableStats,
-    watermark_can_see_last_key: bool,
     builder: CapacitySplitTableBuilder<F>,
     task_config: TaskConfig,
     task_progress: Arc<TaskProgress>,
+    skip_watermark_state: PkPrefixSkipWatermarkState,
     last_key_is_delete: bool,
     progress_key_num: u32,
+    non_pk_prefix_skip_watermark_state: NonPkPrefixSkipWatermarkState,
+    compaction_filter: C,
 }
 
-impl<F: TableBuilderFactory> CompactTaskExecutor<F> {
+impl<F: TableBuilderFactory, C: CompactionFilter> CompactTaskExecutor<F, C> {
     pub fn new(
         builder: CapacitySplitTableBuilder<F>,
         task_config: TaskConfig,
         task_progress: Arc<TaskProgress>,
+        skip_watermark_state: PkPrefixSkipWatermarkState,
+        non_pk_prefix_skip_watermark_state: NonPkPrefixSkipWatermarkState,
+        compaction_filter: C,
     ) -> Self {
         Self {
             builder,
             task_config,
             last_key: FullKey::default(),
-            watermark_can_see_last_key: false,
             last_key_is_delete: false,
             compaction_statistics: CompactionStatistics::default(),
             last_table_id: None,
             last_table_stats: TableStats::default(),
-            progress_key_num: 0,
             task_progress,
+            skip_watermark_state,
+            progress_key_num: 0,
+            non_pk_prefix_skip_watermark_state,
+            compaction_filter,
         }
     }
 
@@ -571,7 +684,6 @@ impl<F: TableBuilderFactory> CompactTaskExecutor<F> {
         if !self.last_key.is_empty() {
             self.last_key = FullKey::default();
         }
-        self.watermark_can_see_last_key = false;
         self.last_key_is_delete = false;
     }
 
@@ -591,6 +703,9 @@ impl<F: TableBuilderFactory> CompactTaskExecutor<F> {
         iter: &mut BlockIterator,
         target_key: FullKey<&[u8]>,
     ) -> HummockResult<()> {
+        self.skip_watermark_state.reset_watermark();
+        self.non_pk_prefix_skip_watermark_state.reset_watermark();
+
         while iter.is_valid() && iter.key().le(&target_key) {
             let is_new_user_key =
                 !self.last_key.is_empty() && iter.key().user_key != self.last_key.user_key.as_ref();
@@ -598,30 +713,34 @@ impl<F: TableBuilderFactory> CompactTaskExecutor<F> {
             self.may_report_process_key(1);
 
             let mut drop = false;
-            let epoch = iter.key().epoch_with_gap.pure_epoch();
             let value = HummockValue::from_slice(iter.value()).unwrap();
-            if is_new_user_key || self.last_key.is_empty() {
+            let is_first_or_new_user_key = is_new_user_key || self.last_key.is_empty();
+            if is_first_or_new_user_key {
                 self.last_key.set(iter.key());
-                self.watermark_can_see_last_key = false;
                 self.last_key_is_delete = false;
             }
-            if epoch <= self.task_config.watermark
+
+            // See note in `compactor_runner.rs`.
+            if !self.task_config.retain_multiple_version
                 && self.task_config.gc_delete_keys
                 && value.is_delete()
             {
                 drop = true;
                 self.last_key_is_delete = true;
-            } else if epoch < self.task_config.watermark && self.watermark_can_see_last_key {
+            } else if !self.task_config.retain_multiple_version && !is_first_or_new_user_key {
                 drop = true;
             }
 
-            if epoch <= self.task_config.watermark {
-                self.watermark_can_see_last_key = true;
+            if !drop && self.compaction_filter.should_delete(iter.key()) {
+                drop = true;
             }
 
-            if self.last_table_id.map_or(true, |last_table_id| {
-                last_table_id != self.last_key.user_key.table_id.table_id
-            }) {
+            if !drop && self.watermark_should_delete(&iter.key()) {
+                drop = true;
+                self.last_key_is_delete = true;
+            }
+
+            if self.last_table_id != Some(self.last_key.user_key.table_id.table_id) {
                 if let Some(last_table_id) = self.last_table_id.take() {
                     self.compaction_statistics
                         .delta_drop_stat
@@ -653,5 +772,30 @@ impl<F: TableBuilderFactory> CompactTaskExecutor<F> {
             iter.next();
         }
         Ok(())
+    }
+
+    pub fn shall_copy_raw_block(&mut self, smallest_key: &FullKey<&[u8]>) -> bool {
+        if self.last_key_is_delete && self.last_key.user_key.as_ref().eq(&smallest_key.user_key) {
+            // If the last key is delete tombstone, we can not append the origin block
+            // because it would cause a deleted key could be see by user again.
+            return false;
+        }
+
+        if self.watermark_should_delete(smallest_key) {
+            return false;
+        }
+
+        // Check compaction filter
+        if self.compaction_filter.should_delete(*smallest_key) {
+            return false;
+        }
+
+        true
+    }
+
+    fn watermark_should_delete(&mut self, key: &FullKey<&[u8]>) -> bool {
+        (self.skip_watermark_state.has_watermark() && self.skip_watermark_state.should_delete(key))
+            || (self.non_pk_prefix_skip_watermark_state.has_watermark()
+                && self.non_pk_prefix_skip_watermark_state.should_delete(key))
     }
 }

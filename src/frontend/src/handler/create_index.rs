@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -20,54 +21,59 @@ use either::Either;
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::acl::AclMode;
 use risingwave_common::catalog::{IndexId, TableDesc, TableId};
-use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_pb::catalog::{PbIndex, PbStreamJobStatus, PbTable};
-use risingwave_pb::stream_plan::stream_fragment_graph::Parallelism;
-use risingwave_pb::user::grant_privilege::Object;
+use risingwave_pb::catalog::{PbIndex, PbIndexColumnProperties, PbStreamJobStatus};
 use risingwave_sqlparser::ast;
 use risingwave_sqlparser::ast::{Ident, ObjectName, OrderByExpr};
 
 use super::RwPgResponse;
+use crate::TableCatalog;
 use crate::binder::Binder;
 use crate::catalog::root_catalog::SchemaPath;
-use crate::expr::{Expr, ExprImpl, InputRef};
-use crate::handler::privilege::ObjectCheckItem;
+use crate::catalog::{DatabaseId, SchemaId};
+use crate::error::{ErrorCode, Result};
+use crate::expr::{Expr, ExprImpl, ExprRewriter, InputRef};
 use crate::handler::HandlerArgs;
+use crate::optimizer::plan_expr_rewriter::ConstEvalRewriter;
 use crate::optimizer::plan_node::{Explain, LogicalProject, LogicalScan, StreamMaterialize};
 use crate::optimizer::property::{Cardinality, Distribution, Order, RequiredDist};
 use crate::optimizer::{OptimizerContext, OptimizerContextRef, PlanRef, PlanRoot};
 use crate::scheduler::streaming_manager::CreatingStreamingJobInfo;
 use crate::session::SessionImpl;
-use crate::stream_fragmenter::build_graph;
-use crate::TableCatalog;
+use crate::stream_fragmenter::{GraphJobType, build_graph};
 
-pub(crate) fn gen_create_index_plan(
+pub(crate) fn resolve_index_schema(
     session: &SessionImpl,
-    context: OptimizerContextRef,
     index_name: ObjectName,
     table_name: ObjectName,
-    columns: Vec<OrderByExpr>,
-    include: Vec<Ident>,
-    distributed_by: Vec<ast::Expr>,
-) -> Result<(PlanRef, PbTable, PbIndex)> {
-    let db_name = session.database();
-    let (schema_name, table_name) = Binder::resolve_schema_qualified_name(db_name, table_name)?;
+) -> Result<(String, Arc<TableCatalog>, String)> {
+    let db_name = &session.database();
+    let (schema_name, table_name) = Binder::resolve_schema_qualified_name(db_name, &table_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let index_table_name = Binder::resolve_index_name(index_name)?;
 
     let catalog_reader = session.env().catalog_reader();
-    let (table, schema_name) = {
-        let read_guard = catalog_reader.read_guard();
-        let (table, schema_name) =
-            read_guard.get_table_by_name(db_name, schema_path, &table_name)?;
-        (table.clone(), schema_name.to_string())
-    };
+    let read_guard = catalog_reader.read_guard();
+    let (table, schema_name) =
+        read_guard.get_created_table_by_name(db_name, schema_path, &table_name)?;
+    Ok((schema_name.to_owned(), table.clone(), index_table_name))
+}
+
+pub(crate) fn gen_create_index_plan(
+    session: &SessionImpl,
+    context: OptimizerContextRef,
+    schema_name: String,
+    table: Arc<TableCatalog>,
+    index_table_name: String,
+    columns: Vec<OrderByExpr>,
+    include: Vec<Ident>,
+    distributed_by: Vec<ast::Expr>,
+) -> Result<(PlanRef, TableCatalog, PbIndex)> {
+    let table_name = table.name.clone();
 
     if table.is_index() {
         return Err(
@@ -75,21 +81,27 @@ pub(crate) fn gen_create_index_plan(
         );
     }
 
-    session.check_privileges(&[ObjectCheckItem::new(
-        table.owner,
-        AclMode::Select,
-        Object::TableId(table.id.table_id),
-    )])?;
+    if !session.is_super_user() && session.user_id() != table.owner {
+        return Err(ErrorCode::PermissionDenied(format!(
+            "must be owner of table \"{}\"",
+            table.name
+        ))
+        .into());
+    }
 
     let mut binder = Binder::new_for_stream(session);
-    binder.bind_table(Some(&schema_name), &table_name, None)?;
+    binder.bind_table(Some(&schema_name), &table_name)?;
 
     let mut index_columns_ordered_expr = vec![];
     let mut include_columns_expr = vec![];
     let mut distributed_columns_expr = vec![];
     for column in columns {
         let order_type = OrderType::from_bools(column.asc, column.nulls_first);
-        let expr_impl = binder.bind_expr(column.expr)?;
+        let expr_impl = binder.bind_expr(&column.expr)?;
+        // Do constant folding and timezone transportation on expressions so that batch queries can match it in the same form.
+        let mut const_eval = ConstEvalRewriter { error: None };
+        let expr_impl = const_eval.rewrite_expr(expr_impl);
+        let expr_impl = context.session_timezone().rewrite_expr(expr_impl);
         match expr_impl {
             ExprImpl::InputRef(_) => {}
             ExprImpl::FunctionCall(_) => {
@@ -106,7 +118,7 @@ pub(crate) fn gen_create_index_plan(
                     "index columns should be columns or expressions".into(),
                     "use columns or expressions instead".into(),
                 )
-                .into())
+                .into());
             }
         }
         index_columns_ordered_expr.push((expr_impl, order_type));
@@ -126,13 +138,13 @@ pub(crate) fn gen_create_index_plan(
     } else {
         for column in include {
             let expr_impl =
-                binder.bind_expr(risingwave_sqlparser::ast::Expr::Identifier(column))?;
+                binder.bind_expr(&risingwave_sqlparser::ast::Expr::Identifier(column))?;
             include_columns_expr.push(expr_impl);
         }
     };
 
     for column in distributed_by {
-        let expr_impl = binder.bind_expr(column)?;
+        let expr_impl = binder.bind_expr(&column)?;
         distributed_columns_expr.push(expr_impl);
     }
 
@@ -176,21 +188,26 @@ pub(crate) fn gen_create_index_plan(
         .starts_with(&distributed_columns_expr)
     {
         return Err(ErrorCode::InvalidInputSyntax(
-            "Distributed by columns should be a prefix of index columns".to_string(),
+            "Distributed by columns should be a prefix of index columns".to_owned(),
         )
         .into());
     }
 
+    let (index_database_id, index_schema_id) =
+        session.get_database_and_schema_id_for_create(Some(schema_name))?;
+
     // Manually assemble the materialization plan for the index MV.
     let materialize = assemble_materialize(
         table_name,
+        index_database_id,
+        index_schema_id,
         table.clone(),
         context,
         index_table_name.clone(),
         &index_columns_ordered_expr,
         &include_columns_expr,
         // We use the first index column as distributed key by default if users
-        // haven't specify the distributed by columns.
+        // haven't specified the distributed by columns.
         if distributed_columns_expr.is_empty() {
             1
         } else {
@@ -199,29 +216,24 @@ pub(crate) fn gen_create_index_plan(
         table.cardinality,
     )?;
 
-    let (index_database_id, index_schema_id) =
-        session.get_database_and_schema_id_for_create(Some(schema_name))?;
-
-    let index_table = materialize.table();
-    let mut index_table_prost = index_table.to_prost(index_schema_id, index_database_id);
+    let mut index_table = materialize.table().clone();
     {
-        use risingwave_common::constants::hummock::PROPERTIES_RETENTION_SECOND_KEY;
-        let retention_second_string_key = PROPERTIES_RETENTION_SECOND_KEY.to_string();
-
         // Inherit table properties
-        table.properties.get(&retention_second_string_key).map(|v| {
-            index_table_prost
-                .properties
-                .insert(retention_second_string_key, v.clone())
-        });
+        index_table.retention_seconds = table.retention_seconds;
     }
 
-    index_table_prost.owner = session.user_id();
-    index_table_prost.dependent_relations = vec![table.id.table_id];
+    index_table.owner = table.owner;
 
     let index_columns_len = index_columns_ordered_expr.len() as u32;
+    let index_column_properties = index_columns_ordered_expr
+        .iter()
+        .map(|(_, order)| PbIndexColumnProperties {
+            is_desc: order.is_descending(),
+            nulls_first: order.nulls_are_first(),
+        })
+        .collect();
     let index_item = build_index_item(
-        index_table.table_desc().into(),
+        &index_table,
         table.name(),
         table_desc,
         index_columns_ordered_expr,
@@ -232,10 +244,11 @@ pub(crate) fn gen_create_index_plan(
         schema_id: index_schema_id,
         database_id: index_database_id,
         name: index_table_name,
-        owner: index_table_prost.owner,
+        owner: index_table.owner,
         index_table_id: TableId::placeholder().table_id,
         primary_table_id: table.id.table_id,
         index_item,
+        index_column_properties,
         index_columns_len,
         initialized_at_epoch: None,
         created_at_epoch: None,
@@ -252,11 +265,11 @@ pub(crate) fn gen_create_index_plan(
         ctx.trace(plan.explain_to_string());
     }
 
-    Ok((plan, index_table_prost, index_prost))
+    Ok((plan, index_table, index_prost))
 }
 
 fn build_index_item(
-    index_table_desc: Rc<TableDesc>,
+    index_table: &TableCatalog,
     primary_table_name: &str,
     primary_table_desc: Rc<TableDesc>,
     index_columns: Vec<(ExprImpl, OrderType)>,
@@ -275,9 +288,10 @@ fn build_index_item(
         .into_iter()
         .map(|(expr, _)| expr.to_expr_proto())
         .chain(
-            index_table_desc
+            index_table
                 .columns
                 .iter()
+                .map(|c| &c.column_desc)
                 .skip(index_columns_len)
                 .map(|x| {
                     let name = if x.name.starts_with(&primary_table_name_prefix) {
@@ -306,6 +320,8 @@ fn build_index_item(
 /// `distributed_by_columns_len` to represent distributed by columns
 fn assemble_materialize(
     table_name: String,
+    database_id: DatabaseId,
+    schema_id: SchemaId,
     table_catalog: Arc<TableCatalog>,
     context: OptimizerContextRef,
     index_name: String,
@@ -319,6 +335,7 @@ fn assemble_materialize(
     //   LogicalScan(table_desc)
 
     let definition = context.normalized_sql().to_owned();
+    let retention_seconds = table_catalog.retention_seconds.and_then(NonZeroU32::new);
 
     let logical_scan = LogicalScan::create(
         table_name,
@@ -326,7 +343,7 @@ fn assemble_materialize(
         // Index table has no indexes.
         vec![],
         context,
-        false,
+        None,
         cardinality,
     );
 
@@ -351,9 +368,9 @@ fn assemble_materialize(
                 .get(input_ref.index)
                 .unwrap()
                 .name()
-                .to_string(),
+                .to_owned(),
             ExprImpl::FunctionCall(func) => {
-                let func_name = func.func_type().as_str_name().to_string();
+                let func_name = func.func_type().as_str_name().to_owned();
                 let mut name = func_name.clone();
                 while !col_names.insert(name.clone()) {
                     count += 1;
@@ -370,14 +387,16 @@ fn assemble_materialize(
                     .get(input_ref.index)
                     .unwrap()
                     .name()
-                    .to_string(),
+                    .to_owned(),
                 _ => unreachable!(),
             }
         }))
         .collect_vec();
 
-    PlanRoot::new(
+    PlanRoot::new_with_logical_plan(
         logical_project,
+        // schema of logical_project is such that index columns come first.
+        // so we can use distributed_by_columns_len to represent distributed by columns indices.
         RequiredDist::PhysicalDist(Distribution::HashShard(
             (0..distributed_by_columns_len).collect(),
         )),
@@ -391,7 +410,13 @@ fn assemble_materialize(
         project_required_cols,
         out_names,
     )
-    .gen_index_plan(index_name, definition)
+    .gen_index_plan(
+        index_name,
+        database_id,
+        schema_id,
+        definition,
+        retention_seconds,
+    )
 }
 
 pub async fn handle_create_index(
@@ -406,40 +431,39 @@ pub async fn handle_create_index(
     let session = handler_args.session.clone();
 
     let (graph, index_table, index) = {
-        {
-            if let Either::Right(resp) = session.check_relation_name_duplicated(
-                index_name.clone(),
-                StatementType::CREATE_INDEX,
-                if_not_exists,
-            )? {
-                return Ok(resp);
-            }
+        let (schema_name, table, index_table_name) =
+            resolve_index_schema(&session, index_name, table_name)?;
+        let qualified_index_name = ObjectName(vec![
+            Ident::from_real_value(&schema_name),
+            Ident::from_real_value(&index_table_name),
+        ]);
+        if let Either::Right(resp) = session.check_relation_name_duplicated(
+            qualified_index_name,
+            StatementType::CREATE_INDEX,
+            if_not_exists,
+        )? {
+            return Ok(resp);
         }
 
         let context = OptimizerContext::from_handler_args(handler_args);
         let (plan, index_table, index) = gen_create_index_plan(
             &session,
             context.into(),
-            index_name.clone(),
-            table_name,
+            schema_name,
+            table,
+            index_table_name,
             columns,
             include,
             distributed_by,
         )?;
-        let mut graph = build_graph(plan);
-        graph.parallelism =
-            session
-                .config()
-                .streaming_parallelism()
-                .map(|parallelism| Parallelism {
-                    parallelism: parallelism.get(),
-                });
+        let graph = build_graph(plan, Some(GraphJobType::Index))?;
+
         (graph, index_table, index)
     };
 
     tracing::trace!(
         "name={}, graph=\n{}",
-        index_name,
+        index.name,
         serde_json::to_string_pretty(&graph).unwrap()
     );
 
@@ -456,7 +480,7 @@ pub async fn handle_create_index(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .create_index(index, index_table, graph)
+        .create_index(index, index_table.to_prost(), graph, if_not_exists)
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::CREATE_INDEX))

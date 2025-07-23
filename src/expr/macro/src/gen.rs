@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,23 +23,52 @@ use super::*;
 impl FunctionAttr {
     /// Expands the wildcard in function arguments or return type.
     pub fn expand(&self) -> Vec<Self> {
+        // handle variadic argument
+        if self
+            .args
+            .last()
+            .is_some_and(|arg| arg.starts_with("variadic"))
+        {
+            // expand:  foo(a, b, variadic anyarray)
+            // to:      foo(a, b, ...)
+            //        + foo_variadic(a, b, anyarray)
+            let mut attrs = Vec::new();
+            attrs.extend(
+                FunctionAttr {
+                    args: {
+                        let mut args = self.args.clone();
+                        *args.last_mut().unwrap() = "...".to_owned();
+                        args
+                    },
+                    ..self.clone()
+                }
+                .expand(),
+            );
+            attrs.extend(
+                FunctionAttr {
+                    name: format!("{}_variadic", self.name),
+                    args: {
+                        let mut args = self.args.clone();
+                        let last = args.last_mut().unwrap();
+                        *last = last.strip_prefix("variadic ").unwrap().into();
+                        args
+                    },
+                    ..self.clone()
+                }
+                .expand(),
+            );
+            return attrs;
+        }
         let args = self.args.iter().map(|ty| types::expand_type_wildcard(ty));
         let ret = types::expand_type_wildcard(&self.ret);
-        // multi_cartesian_product should emit an empty set if the input is empty.
-        let args_cartesian_product =
-            args.multi_cartesian_product()
-                .chain(match self.args.is_empty() {
-                    true => vec![vec![]],
-                    false => vec![],
-                });
         let mut attrs = Vec::new();
-        for (args, mut ret) in args_cartesian_product.cartesian_product(ret) {
+        for (args, mut ret) in args.multi_cartesian_product().cartesian_product(ret) {
             if ret == "auto" {
                 ret = types::min_compatible_type(&args);
             }
             let attr = FunctionAttr {
                 args: args.iter().map(|s| s.to_string()).collect(),
-                ret: ret.to_string(),
+                ret: ret.to_owned(),
                 ..self.clone()
             };
             attrs.push(attr);
@@ -47,11 +76,13 @@ impl FunctionAttr {
         attrs
     }
 
-    /// Generate the type infer function.
+    /// Generate the type infer function: `fn(&[DataType]) -> Result<DataType>`
     fn generate_type_infer_fn(&self) -> Result<TokenStream2> {
         if let Some(func) = &self.type_infer {
-            if func == "panic" {
-                return Ok(quote! { |_| panic!("type inference function is not implemented") });
+            if func == "unreachable" {
+                return Ok(
+                    quote! { |_| unreachable!("type inference for this function should be specially handled in frontend, and should not call sig.type_infer") },
+                );
             }
             // use the user defined type inference function
             return Ok(func.parse().unwrap());
@@ -63,7 +94,7 @@ impl FunctionAttr {
             }
             if let Some(i) = self.args.iter().position(|t| t == "anyarray") {
                 // infer as the element type of "anyarray" argument
-                return Ok(quote! { |args| Ok(args[#i].as_list().clone()) });
+                return Ok(quote! { |args| Ok(args[#i].as_list_element_type().clone()) });
             }
         } else if self.ret == "anyarray" {
             if let Some(i) = self.args.iter().position(|t| t == "anyarray") {
@@ -79,6 +110,17 @@ impl FunctionAttr {
                 // infer as the type of "struct" argument
                 return Ok(quote! { |args| Ok(args[#i].clone()) });
             }
+        } else if self.ret == "anymap" {
+            if let Some(i) = self.args.iter().position(|t| t == "anymap") {
+                // infer as the type of "anymap" argument
+                return Ok(quote! { |args| Ok(args[#i].clone()) });
+            }
+        } else if self.ret == "vector" {
+            if let Some(i) = self.args.iter().position(|t| t == "vector") {
+                // infer as the type of "vector" argument
+                // Example usage: `last_value(*) -> auto`
+                return Ok(quote! { |args| Ok(args[#i].clone()) });
+            }
         } else {
             // the return type is fixed
             let ty = data_type(&self.ret);
@@ -86,13 +128,17 @@ impl FunctionAttr {
         }
         Err(Error::new(
             Span::call_site(),
-            "type inference function is required",
+            "type inference function cannot be automatically derived. You should provide: `type_infer = \"|args| Ok(...)\"`",
         ))
     }
 
-    /// Generate a descriptor of the scalar or table function.
+    /// Generate a descriptor (`FuncSign`) of the scalar or table function.
     ///
     /// The types of arguments and return value should not contain wildcard.
+    ///
+    /// # Arguments
+    /// `build_fn`: whether the user provided a function is a build function.
+    /// (from the `#[build_function]` macro)
     pub fn generate_function_descriptor(
         &self,
         user_fn: &UserFunctionAttr,
@@ -120,18 +166,19 @@ impl FunctionAttr {
         } else if self.rewritten {
             quote! { |_, _| Err(ExprError::UnsupportedFunction(#name.into())) }
         } else {
+            // This is the core logic for `#[function]`
             self.generate_build_scalar_function(user_fn, true)?
         };
         let type_infer_fn = self.generate_type_infer_fn()?;
         let deprecated = self.deprecated;
 
         Ok(quote! {
-            #[risingwave_expr::codegen::ctor]
-            fn #ctor_name() {
+            #[risingwave_expr::codegen::linkme::distributed_slice(risingwave_expr::sig::FUNCTIONS)]
+            fn #ctor_name() -> risingwave_expr::sig::FuncSign {
                 use risingwave_common::types::{DataType, DataTypeName};
-                use risingwave_expr::sig::{_register, FuncSign, SigDataType, FuncBuilder};
+                use risingwave_expr::sig::{FuncSign, SigDataType, FuncBuilder};
 
-                unsafe { _register(FuncSign {
+                FuncSign {
                     name: risingwave_pb::expr::expr_node::Type::#pb_type.into(),
                     inputs_type: vec![#(#args),*],
                     variadic: #variadic,
@@ -139,7 +186,7 @@ impl FunctionAttr {
                     build: FuncBuilder::Scalar(#build_fn),
                     type_infer: #type_infer_fn,
                     deprecated: #deprecated,
-                }) };
+                }
             }
         })
     }
@@ -306,16 +353,51 @@ impl FunctionAttr {
             // no prebuilt argument
             (None, _) => quote! {},
         };
-        let variadic_args = variadic.then(|| quote! { variadic_row, });
+        let variadic_args = variadic.then(|| quote! { &variadic_row, });
         let context = user_fn.context.then(|| quote! { &self.context, });
         let writer = user_fn.write.then(|| quote! { &mut writer, });
         let await_ = user_fn.async_.then(|| quote! { .await });
+
+        let record_error = {
+            // Uniform arguments into `DatumRef`.
+            #[allow(clippy::disallowed_methods)] // allow zip
+            let inputs_args = inputs
+                .iter()
+                .zip(user_fn.args_option.iter())
+                .map(|(input, opt)| {
+                    if *opt {
+                        quote! { #input.map(|s| ScalarRefImpl::from(s)) }
+                    } else {
+                        quote! { Some(ScalarRefImpl::from(#input)) }
+                    }
+                });
+            let inputs_args = quote! {
+                let args: &[DatumRef<'_>] = &[#(#inputs_args),*];
+                let args = args.iter().copied();
+            };
+            let var_args = variadic.then(|| {
+                quote! {
+                    let args = args.chain(variadic_row.iter());
+                }
+            });
+
+            quote! {
+                #inputs_args
+                #var_args
+                errors.push(ExprError::function(
+                    stringify!(#fn_name),
+                    args,
+                    e,
+                ));
+            }
+        };
+
         // call the user defined function
         // inputs: [ Option<impl ScalarRef> ]
         let mut output = quote! { #fn_name #generic(
             #(#non_prebuilt_inputs,)*
-            #prebuilt_arg
             #variadic_args
+            #prebuilt_arg
             #context
             #writer
         ) #await_ };
@@ -329,22 +411,46 @@ impl FunctionAttr {
             ReturnTypeKind::Result => quote! {
                 match #output {
                     Ok(x) => Some(x),
-                    Err(e) => { errors.push(e); None }
+                    Err(e) => {
+                        #record_error
+                        None
+                    }
                 }
             },
             ReturnTypeKind::ResultOption => quote! {
                 match #output {
                     Ok(x) => x,
-                    Err(e) => { errors.push(e); None }
+                    Err(e) => {
+                        #record_error
+                        None
+                    }
                 }
             },
         };
         // if user function accepts non-option arguments, we assume the function
         // returns null on null input, so we need to unwrap the inputs before calling.
-        if !user_fn.arg_option {
+        if self.prebuild.is_some() {
             output = quote! {
                 match (#(#inputs,)*) {
                     (#(Some(#inputs),)*) => #output,
+                    _ => None,
+                }
+            };
+        } else {
+            #[allow(clippy::disallowed_methods)] // allow zip
+            let some_inputs = inputs
+                .iter()
+                .zip(user_fn.args_option.iter())
+                .map(|(input, opt)| {
+                    if *opt {
+                        quote! { #input }
+                    } else {
+                        quote! { Some(#input) }
+                    }
+                });
+            output = quote! {
+                match (#(#inputs,)*) {
+                    (#(#some_inputs,)*) => #output,
                     _ => None,
                 }
             };
@@ -430,10 +536,6 @@ impl FunctionAttr {
             }
         } else {
             // no optimization
-            let array_zip = match children_indices.len() {
-                0 => quote! { std::iter::repeat(()).take(input.capacity()) },
-                _ => quote! { multizip((#(#arrays.iter(),)*)) },
-            };
             let let_variadic = variadic.then(|| {
                 quote! {
                     let variadic_row = variadic_input.row_at_unchecked_vis(i);
@@ -443,18 +545,18 @@ impl FunctionAttr {
                 let mut builder = #builder_type::with_type(input.capacity(), self.context.return_type.clone());
 
                 if input.is_compacted() {
-                    for (i, (#(#inputs,)*)) in #array_zip.enumerate() {
+                    for i in 0..input.capacity() {
+                        #(let #inputs = unsafe { #arrays.value_at_unchecked(i) };)*
                         #let_variadic
                         #append_output
                     }
                 } else {
-                    // allow using `zip` for performance
-                    #[allow(clippy::disallowed_methods)]
-                    for (i, ((#(#inputs,)*), visible)) in #array_zip.zip(input.visibility().iter()).enumerate() {
-                        if !visible {
+                    for i in 0..input.capacity() {
+                        if unsafe { !input.visibility().is_set_unchecked(i) } {
                             builder.append_null();
                             continue;
                         }
+                        #(let #inputs = unsafe { #arrays.value_at_unchecked(i) };)*
                         #let_variadic
                         #append_output
                     }
@@ -470,7 +572,7 @@ impl FunctionAttr {
                 use std::sync::Arc;
                 use risingwave_common::array::*;
                 use risingwave_common::types::*;
-                use risingwave_common::buffer::Bitmap;
+                use risingwave_common::bitmap::Bitmap;
                 use risingwave_common::row::OwnedRow;
                 use risingwave_common::util::iter_util::ZipEqFast;
 
@@ -483,6 +585,7 @@ impl FunctionAttr {
                 let context = Context {
                     return_type,
                     arg_types: children.iter().map(|c| c.return_type()).collect(),
+                    variadic: #variadic,
                 };
 
                 #[derive(Debug)]
@@ -564,7 +667,7 @@ impl FunctionAttr {
             true => self.append_only,
         };
 
-        let pb_type = format_ident!("{}", utils::to_camel_case(&name));
+        let pb_kind = format_ident!("{}", utils::to_camel_case(&name));
         let ctor_name = match append_only {
             false => format_ident!("{}", self.ident_name()),
             true => format_ident!("{}_append_only", self.ident_name()),
@@ -597,13 +700,13 @@ impl FunctionAttr {
         let deprecated = self.deprecated;
 
         Ok(quote! {
-            #[risingwave_expr::codegen::ctor]
-            fn #ctor_name() {
+            #[risingwave_expr::codegen::linkme::distributed_slice(risingwave_expr::sig::FUNCTIONS)]
+            fn #ctor_name() -> risingwave_expr::sig::FuncSign {
                 use risingwave_common::types::{DataType, DataTypeName};
-                use risingwave_expr::sig::{_register, FuncSign, SigDataType, FuncBuilder};
+                use risingwave_expr::sig::{FuncSign, SigDataType, FuncBuilder};
 
-                unsafe { _register(FuncSign {
-                    name: risingwave_expr::aggregate::AggKind::#pb_type.into(),
+                FuncSign {
+                    name: risingwave_pb::expr::agg_call::PbKind::#pb_kind.into(),
                     inputs_type: vec![#(#args),*],
                     variadic: false,
                     ret_type: #ret,
@@ -615,7 +718,7 @@ impl FunctionAttr {
                     },
                     type_infer: #type_infer_fn,
                     deprecated: #deprecated,
-                }) };
+                }
             }
         })
     }
@@ -670,15 +773,15 @@ impl FunctionAttr {
         };
         let create_state = if custom_state.is_some() {
             quote! {
-                fn create_state(&self) -> AggregateState {
-                    AggregateState::Any(Box::<#state_type>::default())
+                fn create_state(&self) -> Result<AggregateState> {
+                    Ok(AggregateState::Any(Box::<#state_type>::default()))
                 }
             }
         } else if let Some(state) = &self.init_state {
             let state: TokenStream2 = state.parse().unwrap();
             quote! {
-                fn create_state(&self) -> AggregateState {
-                    AggregateState::Datum(Some(#state.into()))
+                fn create_state(&self) -> Result<AggregateState> {
+                    Ok(AggregateState::Datum(Some(#state.into())))
                 }
             }
         } else {
@@ -728,7 +831,7 @@ impl FunctionAttr {
             ReturnTypeKind::Result => quote! { Some(#next_state?) },
             ReturnTypeKind::ResultOption => quote! { #next_state? },
         };
-        if !user_fn.accumulate().arg_option {
+        if user_fn.accumulate().args_option.iter().all(|b| !b) {
             match self.args.len() {
                 0 => {
                     next_state = quote! {
@@ -822,8 +925,8 @@ impl FunctionAttr {
                 use risingwave_common::array::*;
                 use risingwave_common::types::*;
                 use risingwave_common::bail;
-                use risingwave_common::buffer::Bitmap;
-                use risingwave_common::estimate_size::EstimateSize;
+                use risingwave_common::bitmap::Bitmap;
+                use risingwave_common_estimate_size::EstimateSize;
 
                 use risingwave_expr::expr::Context;
                 use risingwave_expr::Result;
@@ -833,6 +936,7 @@ impl FunctionAttr {
                 let context = Context {
                     return_type: agg.return_type.clone(),
                     arg_types: agg.args.arg_types().to_owned(),
+                    variadic: false,
                 };
 
                 struct Agg {
@@ -928,12 +1032,12 @@ impl FunctionAttr {
         let deprecated = self.deprecated;
 
         Ok(quote! {
-            #[risingwave_expr::codegen::ctor]
-            fn #ctor_name() {
+            #[risingwave_expr::codegen::linkme::distributed_slice(risingwave_expr::sig::FUNCTIONS)]
+            fn #ctor_name() -> risingwave_expr::sig::FuncSign {
                 use risingwave_common::types::{DataType, DataTypeName};
-                use risingwave_expr::sig::{_register, FuncSign, SigDataType, FuncBuilder};
+                use risingwave_expr::sig::{FuncSign, SigDataType, FuncBuilder};
 
-                unsafe { _register(FuncSign {
+                FuncSign {
                     name: risingwave_pb::expr::table_function::Type::#pb_type.into(),
                     inputs_type: vec![#(#args),*],
                     variadic: false,
@@ -941,7 +1045,7 @@ impl FunctionAttr {
                     build: FuncBuilder::Table(#build_fn),
                     type_infer: #type_infer_fn,
                     deprecated: #deprecated,
-                }) };
+                }
             }
         })
     }
@@ -981,10 +1085,10 @@ impl FunctionAttr {
             .map(|ty| format_ident!("{}Builder", types::array_type(ty)))
             .collect_vec();
         let return_types = if return_types.len() == 1 {
-            vec![quote! { self.return_type.clone() }]
+            vec![quote! { self.context.return_type.clone() }]
         } else {
             (0..return_types.len())
-                .map(|i| quote! { self.return_type.as_struct().types().nth(#i).unwrap().clone() })
+                .map(|i| quote! { self.context.return_type.as_struct().types().nth(#i).unwrap().clone() })
                 .collect()
         };
         #[allow(clippy::disallowed_methods)]
@@ -1004,14 +1108,15 @@ impl FunctionAttr {
         } else {
             quote! {
                 let value_array = StructArray::new(
-                    self.return_type.as_struct().clone(),
+                    self.context.return_type.as_struct().clone(),
                     value_arrays.to_vec(),
                     Bitmap::ones(len),
                 ).into_ref();
             }
         };
+        let context = user_fn.context.then(|| quote! { &self.context, });
         let prebuilt_arg = match &self.prebuild {
-            Some(_) => quote! { &self.prebuilt_arg },
+            Some(_) => quote! { &self.prebuilt_arg, },
             None => quote! {},
         };
         let prebuilt_arg_type = match &self.prebuild {
@@ -1025,12 +1130,50 @@ impl FunctionAttr {
                 .expect("invalid prebuild syntax"),
             None => quote! { () },
         };
-        let iter = match user_fn.return_type_kind {
-            ReturnTypeKind::T => quote! { iter },
-            ReturnTypeKind::Option => quote! { if let Some(it) = iter { it } else { continue; } },
-            ReturnTypeKind::Result => quote! { iter? },
-            ReturnTypeKind::ResultOption => {
-                quote! { if let Some(it) = iter? { it } else { continue; } }
+        let iter = quote! { #fn_name(#(#inputs,)* #prebuilt_arg #context) };
+        let mut iter = match user_fn.return_type_kind {
+            ReturnTypeKind::T => quote! { #iter },
+            ReturnTypeKind::Option => quote! { match #iter {
+                Some(it) => it,
+                None => continue,
+            } },
+            ReturnTypeKind::Result => quote! { match #iter {
+                Ok(it) => it,
+                Err(e) => {
+                    index_builder.append(Some(i as i32));
+                    #(#builders.append_null();)*
+                    error_builder.append_display(Some(e.as_report()));
+                    continue;
+                }
+            } },
+            ReturnTypeKind::ResultOption => quote! { match #iter {
+                Ok(Some(it)) => it,
+                Ok(None) => continue,
+                Err(e) => {
+                    index_builder.append(Some(i as i32));
+                    #(#builders.append_null();)*
+                    error_builder.append_display(Some(e.as_report()));
+                    continue;
+                }
+            } },
+        };
+        // if user function accepts non-option arguments, we assume the function
+        // returns empty on null input, so we need to unwrap the inputs before calling.
+        #[allow(clippy::disallowed_methods)] // allow zip
+        let some_inputs = inputs
+            .iter()
+            .zip(user_fn.args_option.iter())
+            .map(|(input, opt)| {
+                if *opt {
+                    quote! { #input }
+                } else {
+                    quote! { Some(#input) }
+                }
+            });
+        iter = quote! {
+            match (#(#inputs,)*) {
+                (#(#some_inputs,)*) => #iter,
+                _ => continue,
             }
         };
         let iterator_item_type = user_fn.iterator_item_kind.clone().ok_or_else(|| {
@@ -1039,24 +1182,44 @@ impl FunctionAttr {
                 "expect `impl Iterator` in return type",
             )
         })?;
-        let output = match iterator_item_type {
-            ReturnTypeKind::T => quote! { Some(output) },
-            ReturnTypeKind::Option => quote! { output },
-            ReturnTypeKind::Result => quote! { Some(output?) },
-            ReturnTypeKind::ResultOption => quote! { output? },
+        let append_output = match iterator_item_type {
+            ReturnTypeKind::T => quote! {
+                let (#(#outputs),*) = output;
+                #(#builders.append(#optioned_outputs);)* error_builder.append_null();
+            },
+            ReturnTypeKind::Option => quote! { match output {
+                Some((#(#outputs),*)) => { #(#builders.append(#optioned_outputs);)* error_builder.append_null(); }
+                None => { #(#builders.append_null();)* error_builder.append_null(); }
+            } },
+            ReturnTypeKind::Result => quote! { match output {
+                Ok((#(#outputs),*)) => { #(#builders.append(#optioned_outputs);)* error_builder.append_null(); }
+                Err(e) => { #(#builders.append_null();)* error_builder.append_display(Some(e.as_report())); }
+            } },
+            ReturnTypeKind::ResultOption => quote! { match output {
+                Ok(Some((#(#outputs),*))) => { #(#builders.append(#optioned_outputs);)* error_builder.append_null(); }
+                Ok(None) => { #(#builders.append_null();)* error_builder.append_null(); }
+                Err(e) => { #(#builders.append_null();)* error_builder.append_display(Some(e.as_report())); }
+            } },
         };
 
         Ok(quote! {
             |return_type, chunk_size, children| {
                 use risingwave_common::array::*;
                 use risingwave_common::types::*;
-                use risingwave_common::buffer::Bitmap;
+                use risingwave_common::bitmap::Bitmap;
                 use risingwave_common::util::iter_util::ZipEqFast;
-                use risingwave_expr::expr::BoxedExpression;
+                use risingwave_expr::expr::{BoxedExpression, Context};
                 use risingwave_expr::{Result, ExprError};
                 use risingwave_expr::codegen::*;
 
                 risingwave_expr::ensure!(children.len() == #num_args);
+
+                let context = Context {
+                    return_type: return_type.clone(),
+                    arg_types: children.iter().map(|c| c.return_type()).collect(),
+                    variadic: false,
+                };
+
                 let mut iter = children.into_iter();
                 #(let #all_child = iter.next().unwrap();)*
                 #(
@@ -1070,7 +1233,7 @@ impl FunctionAttr {
 
                 #[derive(Debug)]
                 struct #struct_name {
-                    return_type: DataType,
+                    context: Context,
                     chunk_size: usize,
                     #(#child: BoxedExpression,)*
                     prebuilt_arg: #prebuilt_arg_type,
@@ -1078,7 +1241,7 @@ impl FunctionAttr {
                 #[async_trait]
                 impl risingwave_expr::table_function::TableFunction for #struct_name {
                     fn return_type(&self) -> DataType {
-                        self.return_type.clone()
+                        self.context.return_type.clone()
                     }
                     async fn eval<'a>(&'a self, input: &'a DataChunk) -> BoxStream<'a, Result<DataChunk>> {
                         self.eval_inner(input)
@@ -1094,22 +1257,26 @@ impl FunctionAttr {
 
                         let mut index_builder = I32ArrayBuilder::new(self.chunk_size);
                         #(let mut #builders = #builder_types::with_type(self.chunk_size, #return_types);)*
+                        let mut error_builder = Utf8ArrayBuilder::new(self.chunk_size);
 
-                        for (i, (row, visible)) in multizip((#(#arrays.iter(),)*)).zip_eq_fast(input.visibility().iter()).enumerate() {
-                            if let (#(Some(#inputs),)*) = row && visible {
-                                let iter = #fn_name(#(#inputs,)* #prebuilt_arg);
-                                for output in #iter {
-                                    index_builder.append(Some(i as i32));
-                                    match #output {
-                                        Some((#(#outputs),*)) => { #(#builders.append(#optioned_outputs);)* }
-                                        None => { #(#builders.append_null();)* }
-                                    }
+                        for i in 0..input.capacity() {
+                            if unsafe { !input.visibility().is_set_unchecked(i) } {
+                                continue;
+                            }
+                            #(let #inputs = unsafe { #arrays.value_at_unchecked(i) };)*
+                            for output in #iter {
+                                index_builder.append(Some(i as i32));
+                                #append_output
 
-                                    if index_builder.len() == self.chunk_size {
-                                        let len = index_builder.len();
-                                        let index_array = std::mem::replace(&mut index_builder, I32ArrayBuilder::new(self.chunk_size)).finish().into_ref();
-                                        let value_arrays = [#(std::mem::replace(&mut #builders, #builder_types::with_type(self.chunk_size, #return_types)).finish().into_ref()),*];
-                                        #build_value_array
+                                if index_builder.len() == self.chunk_size {
+                                    let len = index_builder.len();
+                                    let index_array = std::mem::replace(&mut index_builder, I32ArrayBuilder::new(self.chunk_size)).finish().into_ref();
+                                    let value_arrays = [#(std::mem::replace(&mut #builders, #builder_types::with_type(self.chunk_size, #return_types)).finish().into_ref()),*];
+                                    #build_value_array
+                                    let error_array = std::mem::replace(&mut error_builder, Utf8ArrayBuilder::new(self.chunk_size)).finish().into_ref();
+                                    if error_array.null_bitmap().any() {
+                                        yield DataChunk::new(vec![index_array, value_array, error_array], self.chunk_size);
+                                    } else {
                                         yield DataChunk::new(vec![index_array, value_array], self.chunk_size);
                                     }
                                 }
@@ -1121,13 +1288,18 @@ impl FunctionAttr {
                             let index_array = index_builder.finish().into_ref();
                             let value_arrays = [#(#builders.finish().into_ref()),*];
                             #build_value_array
-                            yield DataChunk::new(vec![index_array, value_array], len);
+                            let error_array = error_builder.finish().into_ref();
+                            if error_array.null_bitmap().any() {
+                                yield DataChunk::new(vec![index_array, value_array, error_array], len);
+                            } else {
+                                yield DataChunk::new(vec![index_array, value_array], len);
+                            }
                         }
                     }
                 }
 
                 Ok(Box::new(#struct_name {
-                    return_type,
+                    context,
                     chunk_size,
                     #(#child,)*
                     prebuilt_arg: #prebuilt_arg_value,
@@ -1141,6 +1313,8 @@ fn sig_data_type(ty: &str) -> TokenStream2 {
     match ty {
         "any" => quote! { SigDataType::Any },
         "anyarray" => quote! { SigDataType::AnyArray },
+        "anymap" => quote! { SigDataType::AnyMap },
+        "vector" => quote! { SigDataType::Vector },
         "struct" => quote! { SigDataType::AnyStruct },
         _ if ty.starts_with("struct") && ty.contains("any") => quote! { SigDataType::AnyStruct },
         _ => {
@@ -1159,6 +1333,12 @@ fn data_type(ty: &str) -> TokenStream2 {
         return quote! { DataType::Struct(#ty.parse().expect("invalid struct type")) };
     }
     let variant = format_ident!("{}", types::data_type(ty));
+    // TODO: enable the check
+    // assert!(
+    //     !matches!(ty, "any" | "anyarray" | "anymap" | "struct"),
+    //     "{ty}, {variant}"
+    // );
+
     quote! { DataType::#variant }
 }
 

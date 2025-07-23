@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement,
     TransactionTrait, Value,
 };
+use thiserror_ext::AsReport;
 use tokio::sync::watch;
 use tokio::sync::watch::Receiver;
 use tokio::time;
@@ -57,12 +58,14 @@ pub trait SqlDriver: Send + Sync + 'static {
     async fn update_heartbeat(&self, service_name: &str, id: &str) -> MetaResult<()>;
 
     async fn try_campaign(&self, service_name: &str, id: &str, ttl: i64)
-        -> MetaResult<ElectionRow>;
+    -> MetaResult<ElectionRow>;
     async fn leader(&self, service_name: &str) -> MetaResult<Option<ElectionRow>>;
 
     async fn candidates(&self, service_name: &str) -> MetaResult<Vec<ElectionRow>>;
 
     async fn resign(&self, service_name: &str, id: &str) -> MetaResult<()>;
+
+    async fn trim_candidates(&self, service_name: &str, timeout: i64) -> MetaResult<()>;
 }
 
 pub trait SqlDriverCommon {
@@ -262,6 +265,23 @@ DO
 
         Ok(())
     }
+
+    async fn trim_candidates(&self, service_name: &str, timeout: i64) -> MetaResult<()> {
+        self.conn
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                format!(
+                    r#"
+                    DELETE FROM {table} WHERE service = $1 AND DATETIME({table}.last_heartbeat, '+' || $2 || ' second') < CURRENT_TIMESTAMP;
+                    "#,
+                    table = Self::member_table_name()
+                ),
+                vec![Value::from(service_name), Value::from(timeout)],
+            ))
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -417,6 +437,23 @@ impl SqlDriver for MySqlDriver {
         .await?;
 
         txn.commit().await?;
+
+        Ok(())
+    }
+
+    async fn trim_candidates(&self, service_name: &str, timeout: i64) -> MetaResult<()> {
+        self.conn
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::MySql,
+                format!(
+                    r#"
+                    DELETE FROM {table} WHERE service = ? AND last_heartbeat < NOW() - INTERVAL ? SECOND;
+                    "#,
+                    table = Self::member_table_name()
+                ),
+                vec![Value::from(service_name), Value::from(timeout)],
+            ))
+            .await?;
 
         Ok(())
     }
@@ -578,6 +615,23 @@ impl SqlDriver for PostgresDriver {
 
         Ok(())
     }
+
+    async fn trim_candidates(&self, service_name: &str, timeout: i64) -> MetaResult<()> {
+        self.conn
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    r#"
+                    DELETE FROM {table} WHERE {table}.service = $1 AND {table}.last_heartbeat < NOW() - $2::INTERVAL;
+                    "#,
+                    table = Self::member_table_name()
+                ),
+                vec![Value::from(service_name), Value::from(timeout.to_string())],
+            ))
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -614,7 +668,7 @@ where
                             .update_heartbeat(META_ELECTION_KEY, id.as_str())
                             .await {
 
-                            tracing::debug!("keep alive for member {} failed {}", id, e);
+                            tracing::debug!(error = %e.as_report(), "keep alive for member {} failed", id);
                             continue
                         }
                     }
@@ -637,13 +691,15 @@ where
 
         let mut election_ticker = time::interval(Duration::from_secs(1));
 
+        let mut prev_leader = "".to_owned();
+
         loop {
             tokio::select! {
-                _ = election_ticker.tick() => {
-                    let election_row = self
-                        .driver
-                        .try_campaign(META_ELECTION_KEY, self.id.as_str(), ttl)
-                        .await?;
+                    _ = election_ticker.tick() => {
+                        let election_row = self
+                            .driver
+                            .try_campaign(META_ELECTION_KEY, self.id.as_str(), ttl)
+                            .await?;
 
                         assert_eq!(election_row.service, META_ELECTION_KEY);
 
@@ -651,14 +707,24 @@ where
                             if !is_leader{
                                 self.is_leader_sender.send_replace(true);
                                 is_leader = true;
+                            } else {
+                                self.is_leader_sender.send_replace(false);
                             }
                         } else if is_leader {
                             tracing::warn!("leader has been changed to {}", election_row.id);
                             break;
+                        } else if prev_leader != election_row.id {
+                            tracing::info!("leader is {}", election_row.id);
+                            prev_leader.clone_from(&election_row.id)
                         }
 
-                    timeout_ticker.reset();
-                }
+                        timeout_ticker.reset();
+
+                        if is_leader
+                            && let Err(e) = self.driver.trim_candidates(META_ELECTION_KEY, ttl * 2).await {
+                                tracing::warn!(error = %e.as_report(), "trim candidates failed");
+                            }
+                    }
                 _ = timeout_ticker.tick() => {
                     tracing::error!("member {} election timeout", self.id);
                     break;
@@ -669,7 +735,7 @@ where
                     if is_leader {
                         tracing::info!("leader {} resigning", self.id);
                         if let Err(e) = self.driver.resign(META_ELECTION_KEY, self.id.as_str()).await {
-                            tracing::warn!("resign failed {}", e);
+                            tracing::warn!(error = %e.as_report(), "resign failed");
                         }
                     }
 
@@ -714,7 +780,7 @@ where
             .collect())
     }
 
-    async fn is_leader(&self) -> bool {
+    fn is_leader(&self) -> bool {
         *self.is_leader_sender.borrow()
     }
 }
@@ -754,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_election() {
-        let id = "test_id".to_string();
+        let id = "test_id".to_owned();
         let conn = prepare_sqlite_env().await.unwrap();
 
         let provider = SqliteDriver { conn };
@@ -775,7 +841,7 @@ mod tests {
         loop {
             receiver.changed().await.unwrap();
             if *receiver.borrow() {
-                assert!(sql_election_client.is_leader().await);
+                assert!(sql_election_client.is_leader());
                 break;
             }
         }
@@ -807,7 +873,7 @@ mod tests {
         let mut is_leaders = vec![];
 
         for client in clients {
-            is_leaders.push(client.is_leader().await);
+            is_leaders.push(client.is_leader());
         }
 
         assert!(is_leaders.iter().filter(|&x| *x).count() <= 1);

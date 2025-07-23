@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,16 @@
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use risingwave_common::bail_not_implemented;
-use risingwave_common::error::{ErrorCode, Result, RwError};
 use risingwave_common::util::sort_util::ColumnOrder;
 
-use super::generic::TopNLimit;
+use super::generic::{GenericPlanRef, TopNLimit};
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchGroupTopN, ColPrunable, ExprRewritable, Logical,
-    PlanBase, PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamGroupTopN, StreamProject,
-    ToBatch, ToStream,
+    BatchGroupTopN, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef, PlanTreeNodeUnary,
+    PredicatePushdown, StreamGroupTopN, StreamProject, ToBatch, ToStream, gen_filter_and_pushdown,
+    generic,
 };
-use crate::expr::{ExprType, FunctionCall, InputRef};
+use crate::error::{ErrorCode, Result, RwError};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::{
     BatchTopN, ColumnPruningContext, LogicalProject, PredicatePushdownContext,
@@ -137,27 +136,9 @@ impl LogicalTopN {
         stream_input: PlanRef,
         dist_key: &[usize],
     ) -> Result<PlanRef> {
-        let input_fields = stream_input.schema().fields();
-
         // use projectiton to add a column for vnode, and use this column as group key.
-        let mut exprs: Vec<_> = input_fields
-            .iter()
-            .enumerate()
-            .map(|(idx, field)| InputRef::new(idx, field.data_type.clone()).into())
-            .collect();
-
-        exprs.push(
-            FunctionCall::new(
-                ExprType::Vnode,
-                dist_key
-                    .iter()
-                    .map(|idx| InputRef::new(*idx, input_fields[*idx].data_type()).into())
-                    .collect(),
-            )?
-            .into(),
-        );
-        let vnode_col_idx = exprs.len() - 1;
-        let project = StreamProject::new(generic::Project::new(exprs.clone(), stream_input));
+        let project = StreamProject::new(generic::Project::with_vnode_col(stream_input, dist_key));
+        let vnode_col_idx = project.base.schema().len() - 1;
 
         let limit_attr = TopNLimit::new(
             self.limit_attr().limit() + self.offset(),
@@ -184,9 +165,19 @@ impl LogicalTopN {
         let global_top_n = StreamTopN::new(global_top_n);
 
         // use another projection to remove the column we added before.
-        exprs.pop();
-        let project = StreamProject::new(generic::Project::new(exprs, global_top_n.into()));
+        assert_eq!(vnode_col_idx, global_top_n.base.schema().len() - 1);
+        let project = StreamProject::new(generic::Project::with_out_col_idx(
+            global_top_n.into(),
+            0..vnode_col_idx,
+        ));
         Ok(project.into())
+    }
+
+    pub fn clone_with_input_and_prefix(&self, input: PlanRef, prefix: Order) -> Self {
+        let mut core = self.core.clone();
+        core.input = input;
+        core.order = prefix.concat(core.order);
+        core.into()
     }
 }
 
@@ -201,7 +192,6 @@ impl PlanTreeNodeUnary for LogicalTopN {
         core.into()
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -323,12 +313,12 @@ impl ToStream for LogicalTopN {
     fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
         if self.offset() != 0 && self.limit_attr().limit() == LIMIT_ALL_COUNT {
             return Err(RwError::from(ErrorCode::InvalidInputSyntax(
-                "OFFSET without LIMIT in streaming mode".to_string(),
+                "OFFSET without LIMIT in streaming mode".to_owned(),
             )));
         }
         if self.limit_attr().limit() == 0 {
             return Err(RwError::from(ErrorCode::InvalidInputSyntax(
-                "LIMIT 0 in streaming mode".to_string(),
+                "LIMIT 0 in streaming mode".to_owned(),
             )));
         }
         Ok(if !self.group_key().is_empty() {
@@ -359,10 +349,10 @@ mod tests {
     use risingwave_common::types::DataType;
 
     use super::LogicalTopN;
+    use crate::PlanRef;
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::{ColPrunable, ColumnPruningContext, LogicalValues};
     use crate::optimizer::property::Order;
-    use crate::PlanRef;
 
     #[tokio::test]
     async fn test_prune_col() {

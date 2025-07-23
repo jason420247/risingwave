@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,15 +42,16 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
 
     private final boolean pubAutoCreate;
 
-    private static final String AWS_RDS_HOST = "rds.amazonaws.com";
+    private static final String AWS_RDS_HOST = "amazonaws.com";
     private final boolean isAwsRds;
 
     // Whether the properties to validate is shared by multiple tables.
     // If true, we will skip validation check for table
-    private final boolean isMultiTableShared;
+    private final boolean isCdcSourceJob;
+    private final int pgVersion;
 
     public PostgresValidator(
-            Map<String, String> userProps, TableSchema tableSchema, boolean isMultiTableShared)
+            Map<String, String> userProps, TableSchema tableSchema, boolean isCdcSourceJob)
             throws SQLException {
         this.userProps = userProps;
         this.tableSchema = tableSchema;
@@ -64,7 +65,11 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
         var password = userProps.get(DbzConnectorConfig.PASSWORD);
         this.jdbcConnection = DriverManager.getConnection(jdbcUrl, user, password);
 
-        this.isAwsRds = dbHost.contains(AWS_RDS_HOST);
+        this.isAwsRds =
+                dbHost.contains(AWS_RDS_HOST)
+                        || userProps
+                                .getOrDefault(DbzConnectorConfig.PG_TEST_ONLY_FORCE_RDS, "false")
+                                .equalsIgnoreCase("true");
         this.dbName = dbName;
         this.user = user;
         this.schemaName = userProps.get(DbzConnectorConfig.PG_SCHEMA_NAME);
@@ -74,19 +79,33 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
 
         this.pubAutoCreate =
                 userProps.get(DbzConnectorConfig.PG_PUB_CREATE).equalsIgnoreCase("true");
-        this.isMultiTableShared = isMultiTableShared;
+        this.isCdcSourceJob = isCdcSourceJob;
+        try {
+            this.pgVersion = jdbcConnection.getMetaData().getDatabaseMajorVersion();
+        } catch (SQLException e) {
+            throw ValidatorUtils.internalError(e.getMessage());
+        }
     }
 
     @Override
     public void validateDbConfig() {
-        // TODO: check database server version
-        try (var stmt = jdbcConnection.createStatement()) {
-            // check whether wal has been enabled
-            var res = stmt.executeQuery(ValidatorUtils.getSql("postgres.wal"));
-            while (res.next()) {
-                if (!res.getString(1).equals("logical")) {
-                    throw ValidatorUtils.invalidArgument(
-                            "Postgres wal_level should be 'logical'.\nPlease modify the config and restart your Postgres server.");
+        try {
+            // whenever a newer PG version is released, Debezium will take
+            // some time to support it. So even though 18 is not released yet, we put a version
+            // guard here.
+            if (pgVersion >= 18) {
+                throw ValidatorUtils.failedPrecondition(
+                        "Postgres major version should be less than or equal to 17.");
+            }
+
+            try (var stmt = jdbcConnection.createStatement()) {
+                // check whether wal has been enabled
+                var res = stmt.executeQuery(ValidatorUtils.getSql("postgres.wal"));
+                while (res.next()) {
+                    if (!res.getString(1).equals("logical")) {
+                        throw ValidatorUtils.invalidArgument(
+                                "Postgres wal_level should be 'logical'.\nPlease modify the config and restart your Postgres server.");
+                    }
                 }
             }
         } catch (SQLException e) {
@@ -136,6 +155,11 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
         }
     }
 
+    @Override
+    boolean isCdcSourceJob() {
+        return isCdcSourceJob;
+    }
+
     /** For Citus which is a distributed version of PG */
     public void validateDistributedTable() throws SQLException {
         try (var stmt =
@@ -152,7 +176,7 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
     }
 
     private void validateTableSchema() throws SQLException {
-        if (isMultiTableShared) {
+        if (isCdcSourceJob) {
             return;
         }
         try (var stmt = jdbcConnection.prepareStatement(ValidatorUtils.getSql("postgres.table"))) {
@@ -170,18 +194,14 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
         // check primary key
         // reference: https://wiki.postgresql.org/wiki/Retrieve_primary_key_columns
         try (var stmt = jdbcConnection.prepareStatement(ValidatorUtils.getSql("postgres.pk"))) {
-            stmt.setString(1, this.schemaName + "." + this.tableName);
+            stmt.setString(1, String.format("\"%s\".\"%s\"", this.schemaName, this.tableName));
             var res = stmt.executeQuery();
             var pkFields = new HashSet<String>();
             while (res.next()) {
                 var name = res.getString(1);
-                // RisingWave always use lower case for column name
-                pkFields.add(name.toLowerCase());
+                pkFields.add(name);
             }
-
-            if (!ValidatorUtils.isPrimaryKeyMatch(tableSchema, pkFields)) {
-                throw ValidatorUtils.invalidArgument("Primary key mismatch");
-            }
+            primaryKeyCheck(tableSchema, pkFields);
         }
 
         // Check whether source schema match table schema on upstream
@@ -218,28 +238,42 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
         }
     }
 
+    private static void primaryKeyCheck(TableSchema sourceSchema, Set<String> pkFields)
+            throws RuntimeException {
+        if (sourceSchema.getPrimaryKeys().size() != pkFields.size()) {
+            throw ValidatorUtils.invalidArgument(
+                    "Primary key mismatch: the SQL schema defines "
+                            + sourceSchema.getPrimaryKeys().size()
+                            + " primary key columns, but the source table in Postgres has "
+                            + pkFields.size()
+                            + " columns.");
+        }
+        for (var colName : sourceSchema.getPrimaryKeys()) {
+            if (!pkFields.contains(colName)) {
+                throw ValidatorUtils.invalidArgument(
+                        "Primary key mismatch: The primary key list of the source table in Postgres does not contain '"
+                                + colName
+                                + "'.\nHint: If your primary key contains uppercase letters, please ensure that the primary key in the DML of RisingWave uses the same uppercase format and is wrapped with double quotes (\"\").");
+            }
+        }
+    }
+
     private void validatePrivileges() throws SQLException {
         boolean isSuperUser = false;
         if (this.isAwsRds) {
             // check privileges for aws rds postgres
-            boolean hasReplicationRole;
+            boolean hasReplicationRole = false;
             try (var stmt =
                     jdbcConnection.prepareStatement(
                             ValidatorUtils.getSql("postgres.rds.role.check"))) {
                 stmt.setString(1, this.user);
+                stmt.setString(2, this.user);
                 var res = stmt.executeQuery();
-                var hashSet = new HashSet<String>();
                 while (res.next()) {
                     // check rds_superuser role or rds_replication role is granted
-                    var memberof = res.getArray("memberof");
-                    if (memberof != null) {
-                        var members = (String[]) memberof.getArray();
-                        hashSet.addAll(Arrays.asList(members));
-                    }
-                    LOG.info("rds memberof: {}", hashSet);
+                    isSuperUser = res.getBoolean(1);
+                    hasReplicationRole = res.getBoolean(2);
                 }
-                isSuperUser = hashSet.contains("rds_superuser");
-                hasReplicationRole = hashSet.contains("rds_replication");
             }
 
             if (!isSuperUser && !hasReplicationRole) {
@@ -280,16 +314,16 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
     }
 
     private void validateTablePrivileges(boolean isSuperUser) throws SQLException {
-        if (isSuperUser || isMultiTableShared) {
+        // cdc source job doesn't have table schema to validate, since its schema is fixed to jsonb
+        if (isSuperUser || isCdcSourceJob) {
             return;
         }
 
         try (var stmt =
                 jdbcConnection.prepareStatement(
                         ValidatorUtils.getSql("postgres.table_read_privilege.check"))) {
-            stmt.setString(1, this.schemaName);
-            stmt.setString(2, this.tableName);
-            stmt.setString(3, this.user);
+            stmt.setString(1, this.user);
+            stmt.setString(2, String.format("\"%s\".\"%s\"", this.schemaName, this.tableName));
             var res = stmt.executeQuery();
             while (res.next()) {
                 if (!res.getBoolean(1)) {
@@ -321,22 +355,22 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
             }
         }
 
-        if (!isPublicationExists) {
+        if (!isPublicationExists && !pubAutoCreate) {
             // We require a publication on upstream to publish table cdc events
-            if (!pubAutoCreate) {
-                throw ValidatorUtils.invalidArgument(
-                        "Publication '" + pubName + "' doesn't exist and auto create is disabled");
-            } else {
-                // createPublicationIfNeeded(Optional.empty());
-                LOG.info(
-                        "Publication '{}' doesn't exist, will be created in the process of streaming job.",
-                        this.pubName);
-            }
+            throw ValidatorUtils.invalidArgument(
+                    "Publication '" + pubName + "' doesn't exist and auto create is disabled");
         }
 
-        // If the source properties is shared by multiple tables, skip the following
+        // If the source properties is created by share source, skip the following
         // check of publication
-        if (isMultiTableShared) {
+        if (isCdcSourceJob) {
+            if (!isPublicationExists) {
+                LOG.info(
+                        "creating cdc source job: publication '{}' doesn't exist, creating...",
+                        pubName);
+                DbzSourceUtils.createPostgresPublicationInValidate(userProps);
+                LOG.info("creating cdc source job: publication '{}' created successfully", pubName);
+            }
             return;
         }
 
@@ -347,6 +381,111 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
                 isPartialPublicationEnabled = res.getBoolean(1);
             }
         }
+
+        List<String> partitions = new ArrayList<>();
+        try (var stmt =
+                jdbcConnection.prepareStatement(
+                        ValidatorUtils.getSql("postgres.partition_names"))) {
+            stmt.setString(1, schemaName);
+            stmt.setString(2, tableName);
+            var res = stmt.executeQuery();
+            while (res.next()) {
+                partitions.add(res.getString(1));
+            }
+        }
+
+        if (!partitions.isEmpty() && isPublicationExists) {
+            // `pubviaroot` in `pg_publication` is added after PG v13, before which PG does not
+            // allow adding partitioned table to a publication. So here, if partitions.isEmpty() is
+            // false, which means the PG version is >= v13, we can safely check the value of
+            // `pubviaroot` of the publication here.
+            boolean isPublicationViaRoot = false;
+            try (var stmt =
+                    jdbcConnection.prepareStatement(
+                            ValidatorUtils.getSql("postgres.publication_pubviaroot"))) {
+                stmt.setString(1, pubName);
+                var res = stmt.executeQuery();
+                if (res.next()) {
+                    isPublicationViaRoot = res.getBoolean(1);
+                }
+            }
+            if (!isPublicationViaRoot) {
+                // Make sure the publication are created with `publish_via_partition_root = true`,
+                // which is required by partitioned tables.
+                throw ValidatorUtils.invalidArgument(
+                        "Table '"
+                                + tableName
+                                + "' has partitions, which requires publication '"
+                                + pubName
+                                + "' to be created with `publish_via_partition_root = true`. \nHint: you can run `SELECT pubviaroot from pg_publication WHERE pubname = '"
+                                + pubName
+                                + "'` in the upstream Postgres to check.");
+            }
+        }
+        // Only after v13, PG allows adding a partitioned table to a publication. So, if the
+        // version is before v13, the tables in a publication are always partition leaves, we don't
+        // check their ancestors and descendants anymore.
+        if (isPublicationExists && pgVersion >= 13) {
+            List<String> family = new ArrayList<>();
+            boolean findRoot = false;
+            String currentPartition = tableName;
+            while (!findRoot) {
+                try (var stmt =
+                        jdbcConnection.prepareStatement(
+                                ValidatorUtils.getSql("postgres.partition_parent"))) {
+                    String schemaPartitionName =
+                            String.format("\"%s\".\"%s\"", this.schemaName, currentPartition);
+                    stmt.setString(1, schemaPartitionName);
+                    stmt.setString(2, schemaPartitionName);
+                    stmt.setString(3, schemaPartitionName);
+                    var res = stmt.executeQuery();
+                    if (res.next()) {
+                        String parent = res.getString(1);
+                        family.add(parent);
+                        currentPartition = parent;
+                    } else {
+                        findRoot = true;
+                    }
+                }
+            }
+            try (var stmt =
+                    jdbcConnection.prepareStatement(
+                            ValidatorUtils.getSql("postgres.partition_descendants"))) {
+                String schemaTableName =
+                        String.format("\"%s\".\"%s\"", this.schemaName, this.tableName);
+                stmt.setString(1, schemaTableName);
+                stmt.setString(2, schemaTableName);
+                var res = stmt.executeQuery();
+                while (res.next()) {
+                    String descendant = res.getString(1);
+                    family.add(descendant);
+                }
+            }
+            // The check here was added based on experimental observations. We found that if a table
+            // is added to a publication where its ancestor or descendant is already included, the
+            // table cannot be read data from the slot correctly. Therefore, we must verify whether
+            // its ancestors or descendants are already in the publication. If yes, we deny the
+            // request.
+            for (String relative : family) {
+                try (var stmt =
+                        jdbcConnection.prepareStatement(
+                                ValidatorUtils.getSql("postgres.partition_in_publication.check"))) {
+                    stmt.setString(1, schemaName);
+                    stmt.setString(2, relative);
+                    stmt.setString(3, pubName);
+                    var res = stmt.executeQuery();
+                    while (res.next()) {
+                        if (res.getBoolean(1)) {
+                            throw ValidatorUtils.invalidArgument(
+                                    String.format(
+                                            "The ancestor or descendant partition '%s' of the table partition '%s' is already covered in the publication '%s'. Please use a new publication for '%s'",
+                                            relative, tableName, pubName, tableName));
+                        }
+                    }
+                }
+            }
+        }
+
         // PG 15 and up supports partial publication of table
         // check whether publication covers all columns of the table schema
         if (isPartialPublicationEnabled) {
@@ -419,7 +558,7 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
     }
 
     private void validatePublicationPrivileges() throws SQLException {
-        if (isMultiTableShared) {
+        if (isCdcSourceJob) {
             throw ValidatorUtils.invalidArgument(
                     "The connector properties is shared by multiple tables unexpectedly");
         }
@@ -491,14 +630,15 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
     }
 
     protected void alterPublicationIfNeeded() throws SQLException {
-        if (isMultiTableShared) {
+        if (isCdcSourceJob) {
             throw ValidatorUtils.invalidArgument(
-                    "The connector properties is shared by multiple tables unexpectedly");
+                    "The connector properties is created by a shared source unexpectedly");
         }
 
         String alterPublicationSql =
                 String.format(
-                        "ALTER PUBLICATION %s ADD TABLE %s", pubName, schemaName + "." + tableName);
+                        "ALTER PUBLICATION %s ADD TABLE %s",
+                        pubName, String.format("\"%s\".\"%s\"", this.schemaName, this.tableName));
         try (var stmt = jdbcConnection.createStatement()) {
             LOG.info("Altered publication with statement: {}", alterPublicationSql);
             stmt.execute(alterPublicationSql);
@@ -525,8 +665,7 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
                 return val == Data.DataType.TypeName.INT64_VALUE;
             case "float":
             case "real":
-                return val == Data.DataType.TypeName.FLOAT_VALUE
-                        || val == Data.DataType.TypeName.DOUBLE_VALUE;
+                return val == Data.DataType.TypeName.FLOAT_VALUE;
             case "boolean":
                 return val == Data.DataType.TypeName.BOOLEAN_VALUE;
             case "double":
@@ -534,10 +673,32 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
                 return val == Data.DataType.TypeName.DOUBLE_VALUE;
             case "decimal":
             case "numeric":
-                return val == Data.DataType.TypeName.DECIMAL_VALUE;
+                return val == Data.DataType.TypeName.DECIMAL_VALUE
+                        // We allow user to map numeric into rw_int256 or varchar to avoid precision
+                        // loss in the conversion from pg-numeric to rw-numeric
+                        || val == Data.DataType.TypeName.INT256_VALUE
+                        || val == Data.DataType.TypeName.VARCHAR_VALUE;
             case "varchar":
             case "character varying":
+            case "uuid":
+            case "enum":
                 return val == Data.DataType.TypeName.VARCHAR_VALUE;
+            case "bytea":
+                return val == Data.DataType.TypeName.BYTEA_VALUE;
+            case "date":
+                return val == Data.DataType.TypeName.DATE_VALUE;
+            case "time":
+                return val == Data.DataType.TypeName.TIME_VALUE;
+            case "timestamp":
+            case "timestamp without time zone":
+                return val == Data.DataType.TypeName.TIMESTAMP_VALUE;
+            case "timestamptz":
+            case "timestamp with time zone":
+                return val == Data.DataType.TypeName.TIMESTAMPTZ_VALUE;
+            case "interval":
+                return val == Data.DataType.TypeName.INTERVAL_VALUE;
+            case "jsonb":
+                return val == Data.DataType.TypeName.JSONB_VALUE;
             default:
                 return true; // true for other uncovered types
         }

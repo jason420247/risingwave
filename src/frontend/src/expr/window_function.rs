@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +14,13 @@
 
 use itertools::Itertools;
 use risingwave_common::bail_not_implemented;
-use risingwave_common::error::{ErrorCode, RwError};
 use risingwave_common::types::DataType;
-use risingwave_expr::sig::FUNCTION_REGISTRY;
+use risingwave_expr::aggregate::AggType;
 use risingwave_expr::window_function::{Frame, WindowFuncKind};
 
 use super::{Expr, ExprImpl, OrderBy, RwResult};
+use crate::error::{ErrorCode, RwError};
+use crate::expr::infer_type;
 
 /// A window function performs a calculation across a set of table rows that are somehow related to
 /// the current row, according to the window spec `OVER (PARTITION BY .. ORDER BY ..)`.
@@ -30,8 +31,9 @@ use super::{Expr, ExprImpl, OrderBy, RwResult};
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct WindowFunction {
     pub kind: WindowFuncKind,
-    pub args: Vec<ExprImpl>,
     pub return_type: DataType,
+    pub args: Vec<ExprImpl>,
+    pub ignore_nulls: bool,
     pub partition_by: Vec<ExprImpl>,
     pub order_by: OrderBy,
     pub frame: Option<Frame>,
@@ -42,23 +44,25 @@ impl WindowFunction {
     /// `inputs`.
     pub fn new(
         kind: WindowFuncKind,
+        mut args: Vec<ExprImpl>,
+        ignore_nulls: bool,
         partition_by: Vec<ExprImpl>,
         order_by: OrderBy,
-        args: Vec<ExprImpl>,
         frame: Option<Frame>,
     ) -> RwResult<Self> {
-        let return_type = Self::infer_return_type(kind, &args)?;
+        let return_type = Self::infer_return_type(&kind, &mut args)?;
         Ok(Self {
             kind,
-            args,
             return_type,
+            args,
+            ignore_nulls,
             partition_by,
             order_by,
             frame,
         })
     }
 
-    fn infer_return_type(kind: WindowFuncKind, args: &[ExprImpl]) -> RwResult<DataType> {
+    fn infer_return_type(kind: &WindowFuncKind, args: &mut [ExprImpl]) -> RwResult<DataType> {
         use WindowFuncKind::*;
         match (kind, args) {
             (RowNumber, []) => Ok(DataType::Int64),
@@ -86,13 +90,13 @@ impl WindowFunction {
                 );
             }
 
-            (Aggregate(agg_kind), args) => {
-                let arg_types = args.iter().map(ExprImpl::return_type).collect::<Vec<_>>();
-                let return_type = FUNCTION_REGISTRY.get_return_type(agg_kind, &arg_types)?;
-                Ok(return_type)
-            }
+            (Aggregate(agg_type), args) => Ok(match agg_type {
+                AggType::Builtin(kind) => infer_type((*kind).into(), args)?,
+                AggType::UserDefined(udf) => udf.return_type.as_ref().unwrap().into(),
+                AggType::WrapScalar(expr) => expr.return_type.as_ref().unwrap().into(),
+            }),
 
-            _ => {
+            (_, args) => {
                 let args = args
                     .iter()
                     .map(|e| format!("{}", e.return_type()))
@@ -113,12 +117,13 @@ impl std::fmt::Debug for WindowFunction {
                 .field("kind", &self.kind)
                 .field("return_type", &self.return_type)
                 .field("args", &self.args)
+                .field("ignore_nulls", &self.ignore_nulls)
                 .field("partition_by", &self.partition_by)
                 .field("order_by", &format_args!("{}", self.order_by));
             if let Some(frame) = &self.frame {
                 builder.field("frame", &format_args!("{}", frame));
             } else {
-                builder.field("frame", &"None".to_string());
+                builder.field("frame", &"None".to_owned());
             }
             builder.finish()
         } else {

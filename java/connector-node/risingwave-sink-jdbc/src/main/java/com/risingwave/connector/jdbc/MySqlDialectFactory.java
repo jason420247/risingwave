@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,12 @@
 
 package com.risingwave.connector.jdbc;
 
+import java.util.List;
+
 public class MySqlDialectFactory implements JdbcDialectFactory {
 
     @Override
-    public JdbcDialect create(int[] columnSqlTypes) {
-        return new MySqlDialect();
+    public JdbcDialect create(List<Integer> columnSqlTypes, List<Integer> pkIndices) {
+        return new MySqlDialect(columnSqlTypes, pkIndices);
     }
 }

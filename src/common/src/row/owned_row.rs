@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,9 @@
 
 use std::mem;
 
+use risingwave_common_estimate_size::EstimateSize;
+
 use super::Row;
-use crate::estimate_size::EstimateSize;
 use crate::types::{
     DataType, Date, Datum, DatumRef, Decimal, Interval, ScalarImpl, Time, Timestamp, ToDatumRef,
 };
@@ -75,7 +76,7 @@ impl OwnedRow {
                     DataType::Int64 => x.parse::<i64>().unwrap().into(),
                     DataType::Float32 => x.parse::<f32>().unwrap().into(),
                     DataType::Float64 => x.parse::<f64>().unwrap().into(),
-                    DataType::Varchar => x.to_string().into(),
+                    DataType::Varchar => x.to_owned().into(),
                     DataType::Boolean => x.parse::<bool>().unwrap().into(),
                     DataType::Date => x.parse::<Date>().unwrap().into(),
                     DataType::Time => x.parse::<Time>().unwrap().into(),
@@ -110,7 +111,7 @@ impl Row for OwnedRow {
 
     #[inline]
     unsafe fn datum_at_unchecked(&self, index: usize) -> DatumRef<'_> {
-        self.0.get_unchecked(index).to_datum_ref()
+        unsafe { self.0.get_unchecked(index).to_datum_ref() }
     }
 
     #[inline]
@@ -181,7 +182,7 @@ mod tests {
 
     use super::*;
     use crate::row::RowExt;
-    use crate::types::{DataType as Ty, Interval, ScalarImpl};
+    use crate::types::DataType as Ty;
     use crate::util::hash_util::Crc32FastBuilder;
 
     #[test]

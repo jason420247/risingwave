@@ -34,6 +34,7 @@ go/bin/
 src/**/target
 src/**/target_tarpaulin
 target/
+target-bisector-*/
 src/proto/
 src/prost/src/*.rs
 src/prost/src/sim/*.rs
@@ -44,6 +45,9 @@ src/prost/src/sim/*.rs
 src/log/
 # srcy-tags
 **/srcy-tags.vi
+
+# rustc ice
+rustc-ice-*
 
 # ctags
 **/tags
@@ -70,11 +74,26 @@ e2e_test/generated/*
 scale-test.tar.zst
 simulation-it-test.tar.zst
 
-
 # hummock-trace
 .trace
 
 # spark binary
 e2e_test/iceberg/spark-*-bin*
+e2e_test/iceberg/metastore_db
 
 **/poetry.lock
+
+**/*.sqlite
+**/*.sqlite-journal
+
+*.slt*.temp
+
+.direnv/
+
+# mdbook
+book
+
+dhat-heap.json
+
+rustc-ice-*.txt
+.claude/settings.local.json

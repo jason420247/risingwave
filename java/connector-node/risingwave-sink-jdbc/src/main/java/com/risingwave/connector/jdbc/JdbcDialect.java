@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -109,5 +109,9 @@ public interface JdbcDialect {
 
     void bindInsertIntoStatement(
             PreparedStatement stmt, Connection conn, TableSchema tableSchema, SinkRow row)
+            throws SQLException;
+
+    /** Bind the values of primary key fields to the {@code DELETE} statement. */
+    void bindDeleteStatement(PreparedStatement stmt, TableSchema tableSchema, SinkRow row)
             throws SQLException;
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,10 @@ use itertools::Itertools;
 use risingwave_common::catalog::{Field, IndexId, Schema};
 use risingwave_common::util::epoch::Epoch;
 use risingwave_common::util::sort_util::ColumnOrder;
-use risingwave_pb::catalog::{PbIndex, PbStreamJobStatus};
+use risingwave_pb::catalog::{PbIndex, PbIndexColumnProperties, PbStreamJobStatus};
 
 use crate::catalog::{DatabaseId, OwnedByUserCatalog, SchemaId, TableCatalog};
-use crate::expr::{Expr, ExprDisplay, ExprImpl, FunctionCall};
+use crate::expr::{Expr, ExprDisplay, ExprImpl, ExprRewriter as _, FunctionCall};
 use crate::user::UserId;
 
 #[derive(Clone, Debug, Educe)]
@@ -36,9 +36,13 @@ pub struct IndexCatalog {
 
     /// Only `InputRef` and `FuncCall` type index is supported Now.
     /// The index of `InputRef` is the column index of the primary table.
-    /// The index_item size is equal to the index table columns size
+    /// The `index_item` size is equal to the index table columns size
     /// The input args of `FuncCall` is also the column index of the primary table.
     pub index_item: Vec<ExprImpl>,
+
+    /// The properties of the index columns.
+    /// <https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-INFO-INDEX-COLUMN-PROPS>
+    pub index_column_properties: Vec<PbIndexColumnProperties>,
 
     pub index_table: Arc<TableCatalog>,
 
@@ -77,9 +81,9 @@ impl IndexCatalog {
         let index_item: Vec<ExprImpl> = index_prost
             .index_item
             .iter()
-            .map(ExprImpl::from_expr_proto)
-            .try_collect()
-            .unwrap();
+            .map(|expr| ExprImpl::from_expr_proto(expr).unwrap())
+            .map(|expr| item_rewriter::CompositeCastEliminator.rewrite_expr(expr))
+            .collect();
 
         let primary_to_secondary_mapping: BTreeMap<usize, usize> = index_item
             .iter()
@@ -112,6 +116,7 @@ impl IndexCatalog {
             id: index_prost.id.into(),
             name: index_prost.name.clone(),
             index_item,
+            index_column_properties: index_prost.index_column_properties.clone(),
             index_table: Arc::new(index_table.clone()),
             primary_table: Arc::new(primary_table.clone()),
             primary_to_secondary_mapping,
@@ -179,6 +184,7 @@ impl IndexCatalog {
                 .iter()
                 .map(|expr| expr.to_expr_proto())
                 .collect_vec(),
+            index_column_properties: self.index_column_properties.clone(),
             index_columns_len: self.index_columns_len,
             initialized_at_epoch: self.initialized_at_epoch.map(|e| e.0),
             created_at_epoch: self.created_at_epoch.map(|e| e.0),
@@ -186,6 +192,11 @@ impl IndexCatalog {
             initialized_at_cluster_version: self.initialized_at_cluster_version.clone(),
             created_at_cluster_version: self.created_at_cluster_version.clone(),
         }
+    }
+
+    /// Get the column properties of the index column.
+    pub fn get_column_properties(&self, column_idx: usize) -> Option<PbIndexColumnProperties> {
+        self.index_column_properties.get(column_idx).cloned()
     }
 
     pub fn get_column_def(&self, column_idx: usize) -> Option<String> {
@@ -219,7 +230,7 @@ impl IndexCatalog {
             .iter()
             .filter(|x| !index_table.columns[x.column_index].is_hidden)
             .map(|x| {
-                let index_column_name = index_table.columns[x.column_index].name().to_string();
+                let index_column_name = index_table.columns[x.column_index].name().to_owned();
                 format!("{} {}", index_column_name, x.order_type)
             })
             .collect_vec();
@@ -236,13 +247,13 @@ impl IndexCatalog {
             .enumerate()
             .filter(|(i, _)| !pk_column_index_set.contains(i))
             .filter(|(_, x)| !x.is_hidden)
-            .map(|(_, x)| x.name().to_string())
+            .map(|(_, x)| x.name().to_owned())
             .collect_vec();
 
         let distributed_by_columns = index_table
             .distribution_key
             .iter()
-            .map(|&x| index_table.columns[x].name().to_string())
+            .map(|&x| index_table.columns[x].name().to_owned())
             .collect_vec();
 
         IndexDisplay {
@@ -262,5 +273,109 @@ pub struct IndexDisplay {
 impl OwnedByUserCatalog for IndexCatalog {
     fn owner(&self) -> UserId {
         self.index_table.owner
+    }
+}
+
+mod item_rewriter {
+    use risingwave_pb::expr::expr_node;
+
+    use crate::expr::{Expr, ExprImpl, ExprRewriter, FunctionCall};
+
+    /// Rewrite the expression of index item to eliminate `CompositeCast`, if any. This is needed
+    /// if the type of a column was changed and there's functional index on it.
+    ///
+    /// # Example
+    ///
+    /// Imagine there's a table created with `CREATE TABLE t (v struct<a int, b int>)`.
+    /// Then we create an index on it with `CREATE INDEX idx ON t ((v).a)`, which will create an
+    /// index item `Field(InputRef(0), 0)`.
+    ///
+    /// If we alter the column with `ALTER TABLE t ALTER COLUMN v TYPE struct<x varchar, a int>`,
+    /// the meta service will wrap the `InputRef(0)` with a `CompositeCast` to maintain the correct
+    /// return type. The index item will now become `Field(CompositeCast(InputRef(0)), 0)`.
+    ///
+    /// `CompositeCast` is for internal use only, and cannot be constructed or executed. To allow
+    /// this functional index to work and be matched with user queries, we need to eliminate it
+    /// here. By comparing the input and output types of `CompositeCast` and matching the field id,
+    /// we can find the real `Field` index and rewrite it to `Field(InputRef(0), 1)`.
+    ///
+    /// Note that if the field is dropped, we will leave the index item as is. This makes the index
+    /// item invalid, and it will never be matched and used.
+    pub struct CompositeCastEliminator;
+
+    impl ExprRewriter for CompositeCastEliminator {
+        fn rewrite_function_call(&mut self, func_call: FunctionCall) -> ExprImpl {
+            let (func_type, inputs, ret) = func_call.decompose();
+
+            // Flatten consecutive `CompositeCast`.
+            if func_type == expr_node::Type::CompositeCast {
+                let child = inputs[0].clone();
+
+                if let Some(child) = child.as_function_call()
+                    && child.func_type() == expr_node::Type::CompositeCast
+                {
+                    let new_child = child.inputs()[0].clone();
+
+                    // If the type already matches, no need to wrap again.
+                    // Recursively eliminate more composite cast by calling rewrite again.
+                    if new_child.return_type() == ret {
+                        return self.rewrite_expr(new_child);
+                    } else {
+                        let new_composite_cast =
+                            FunctionCall::new_unchecked(func_type, vec![new_child], ret);
+                        return self.rewrite_function_call(new_composite_cast);
+                    }
+                }
+            }
+            // Rewrite `Field(CompositeCast(x), y)` to `Field(x, y')`.
+            // TODO: also support rewriting `ArrayAccess` and `MapAccess`.
+            else if func_type == expr_node::Type::Field {
+                let child = inputs[0].clone();
+
+                if let Some(child) = child.as_function_call()
+                    && child.func_type() == expr_node::Type::CompositeCast
+                {
+                    let index = (inputs[1].clone().into_literal().unwrap())
+                        .get_data()
+                        .clone()
+                        .unwrap()
+                        .into_int32();
+
+                    let struct_type = child.return_type().into_struct();
+                    let field_id = struct_type
+                        .id_at(index as usize)
+                        .expect("ids should be set");
+
+                    // Unwrap the composite cast.
+                    let new_child = child.inputs()[0].clone();
+                    let new_struct_type = new_child.return_type().into_struct();
+
+                    let Some(new_index) = new_struct_type
+                        .ids()
+                        .expect("ids should be set")
+                        .position(|x| x == field_id)
+                    else {
+                        // Previously we have index on this field, but now it's dropped.
+                        // As a result, this entire index item becomes invalid.
+                        // Simply leave it as is. Users cannot construct a `CompositeCast` (which is
+                        // not user-facing), thus this index item will never be matched and used.
+                        return FunctionCall::new_unchecked(func_type, inputs, ret).into();
+                    };
+                    let new_index = ExprImpl::literal_int(new_index as i32);
+
+                    let new_inputs = vec![new_child, new_index];
+                    let new_field_call = FunctionCall::new_unchecked(func_type, new_inputs, ret);
+
+                    // Recursively eliminate more composite cast by calling rewrite again.
+                    return self.rewrite_function_call(new_field_call);
+                }
+            }
+
+            let inputs = inputs
+                .into_iter()
+                .map(|expr| self.rewrite_expr(expr))
+                .collect();
+            FunctionCall::new_unchecked(func_type, inputs, ret).into()
+        }
     }
 }

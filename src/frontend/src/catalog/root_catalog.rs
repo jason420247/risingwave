@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,24 +16,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use risingwave_common::catalog::{CatalogVersion, FunctionId, IndexId, TableId};
+use risingwave_common::catalog::{FunctionId, IndexId, StreamJobStatus, TableId};
 use risingwave_common::session_config::{SearchPath, USER_NAME_WILD_CARD};
 use risingwave_common::types::DataType;
 use risingwave_connector::sink::catalog::SinkCatalog;
 use risingwave_pb::catalog::{
-    PbConnection, PbDatabase, PbFunction, PbIndex, PbSchema, PbSink, PbSource, PbTable, PbView,
+    PbConnection, PbDatabase, PbFunction, PbIndex, PbSchema, PbSecret, PbSink, PbSource,
+    PbSubscription, PbTable, PbView,
 };
 use risingwave_pb::hummock::HummockVersionStats;
 
 use super::function_catalog::FunctionCatalog;
 use super::source_catalog::SourceCatalog;
+use super::subscription_catalog::{SubscriptionCatalog, SubscriptionState};
 use super::view_catalog::ViewCatalog;
-use super::{CatalogError, CatalogResult, ConnectionId, SinkId, SourceId, ViewId};
+use super::{
+    CatalogError, CatalogResult, ConnectionId, SecretId, SinkId, SourceId, SubscriptionId, ViewId,
+};
 use crate::catalog::connection_catalog::ConnectionCatalog;
 use crate::catalog::database_catalog::DatabaseCatalog;
 use crate::catalog::schema_catalog::SchemaCatalog;
+use crate::catalog::secret_catalog::SecretCatalog;
 use crate::catalog::system_catalog::{
-    get_sys_tables_in_schema, get_sys_views_in_schema, SystemTableCatalog,
+    SystemTableCatalog, get_sys_tables_in_schema, get_sys_views_in_schema,
 };
 use crate::catalog::table_catalog::TableCatalog;
 use crate::catalog::{DatabaseId, IndexCatalog, SchemaId};
@@ -42,7 +47,7 @@ use crate::expr::{Expr, ExprImpl};
 #[derive(Copy, Clone)]
 pub enum SchemaPath<'a> {
     Name(&'a str),
-    /// (search_path, user_name).
+    /// (`search_path`, `user_name`).
     Path(&'a SearchPath, &'a str),
 }
 
@@ -93,7 +98,6 @@ impl<'a> SchemaPath<'a> {
 ///       - table/sink/source/index/view catalog
 ///        - column catalog
 pub struct Catalog {
-    version: CatalogVersion,
     database_by_name: HashMap<String, DatabaseCatalog>,
     db_name_by_id: HashMap<DatabaseId, String>,
     /// all table catalogs in the cluster identified by universal unique table id.
@@ -105,7 +109,6 @@ pub struct Catalog {
 impl Default for Catalog {
     fn default() -> Self {
         Self {
-            version: 0,
             database_by_name: HashMap::new(),
             db_name_by_id: HashMap::new(),
             table_by_id: HashMap::new(),
@@ -141,23 +144,21 @@ impl Catalog {
             .unwrap()
             .create_schema(proto);
 
-        if let Some(sys_tables) = get_sys_tables_in_schema(proto.name.as_str()) {
-            sys_tables.into_iter().for_each(|sys_table| {
-                self.get_database_mut(proto.database_id)
-                    .unwrap()
-                    .get_schema_mut(proto.id)
-                    .unwrap()
-                    .create_sys_table(sys_table);
-            });
+        for sys_table in get_sys_tables_in_schema(proto.name.as_str()) {
+            self.get_database_mut(proto.database_id)
+                .unwrap()
+                .get_schema_mut(proto.id)
+                .unwrap()
+                .create_sys_table(sys_table);
         }
-        if let Some(sys_views) = get_sys_views_in_schema(proto.name.as_str()) {
-            sys_views.into_iter().for_each(|sys_view| {
-                self.get_database_mut(proto.database_id)
-                    .unwrap()
-                    .get_schema_mut(proto.id)
-                    .unwrap()
-                    .create_sys_view(sys_view);
-            });
+        for mut sys_view in get_sys_views_in_schema(proto.name.as_str()) {
+            sys_view.database_id = proto.database_id;
+            sys_view.schema_id = proto.id;
+            self.get_database_mut(proto.database_id)
+                .unwrap()
+                .get_schema_mut(proto.id)
+                .unwrap()
+                .create_sys_view(Arc::new(sys_view));
         }
     }
 
@@ -193,6 +194,22 @@ impl Catalog {
             .get_schema_mut(proto.schema_id)
             .unwrap()
             .create_sink(proto);
+    }
+
+    pub fn create_subscription(&mut self, proto: &PbSubscription) {
+        self.get_database_mut(proto.database_id)
+            .unwrap()
+            .get_schema_mut(proto.schema_id)
+            .unwrap()
+            .create_subscription(proto);
+    }
+
+    pub fn create_secret(&mut self, proto: &PbSecret) {
+        self.get_database_mut(proto.database_id)
+            .unwrap()
+            .get_schema_mut(proto.schema_id)
+            .unwrap()
+            .create_secret(proto);
     }
 
     pub fn create_view(&mut self, proto: &PbView) {
@@ -251,6 +268,25 @@ impl Catalog {
         }
     }
 
+    pub fn update_secret(&mut self, proto: &PbSecret) {
+        let database = self.get_database_mut(proto.database_id).unwrap();
+        let schema = database.get_schema_mut(proto.schema_id).unwrap();
+        let secret_id = SecretId::new(proto.id);
+        if schema.get_secret_by_id(&secret_id).is_some() {
+            schema.update_secret(proto);
+        } else {
+            // Enter this branch when schema is changed by `ALTER ... SET SCHEMA ...` statement.
+            schema.create_secret(proto);
+            database
+                .iter_schemas_mut()
+                .find(|schema| {
+                    schema.id() != proto.schema_id && schema.get_secret_by_id(&secret_id).is_some()
+                })
+                .unwrap()
+                .drop_secret(secret_id);
+        }
+    }
+
     pub fn drop_database(&mut self, db_id: DatabaseId) {
         let name = self.db_name_by_id.remove(&db_id).unwrap();
         let database = self.database_by_name.remove(&name).unwrap();
@@ -284,7 +320,7 @@ impl Catalog {
                 .iter_schemas_mut()
                 .find(|schema| {
                     schema.id() != proto.schema_id
-                        && schema.get_table_by_id(&proto.id.into()).is_some()
+                        && schema.get_created_table_by_id(&proto.id.into()).is_some()
                 })
                 .unwrap()
                 .drop_table(proto.id.into());
@@ -301,7 +337,7 @@ impl Catalog {
         let old_database_name = self.db_name_by_id.get(&id).unwrap().to_owned();
         if old_database_name != name {
             let mut database = self.database_by_name.remove(&old_database_name).unwrap();
-            database.name = name.clone();
+            database.name.clone_from(&name);
             database.owner = proto.owner;
             self.database_by_name.insert(name.clone(), database);
             self.db_name_by_id.insert(id, name);
@@ -309,6 +345,8 @@ impl Catalog {
             let database = self.get_database_mut(id).unwrap();
             database.name = name;
             database.owner = proto.owner;
+            database.barrier_interval_ms = proto.barrier_interval_ms;
+            database.checkpoint_frequency = proto.checkpoint_frequency;
         }
     }
 
@@ -371,6 +409,14 @@ impl Catalog {
             .drop_sink(sink_id);
     }
 
+    pub fn drop_secret(&mut self, db_id: DatabaseId, schema_id: SchemaId, secret_id: SecretId) {
+        self.get_database_mut(db_id)
+            .unwrap()
+            .get_schema_mut(schema_id)
+            .unwrap()
+            .drop_secret(secret_id);
+    }
+
     pub fn update_sink(&mut self, proto: &PbSink) {
         let database = self.get_database_mut(proto.database_id).unwrap();
         let schema = database.get_schema_mut(proto.schema_id).unwrap();
@@ -386,6 +432,38 @@ impl Catalog {
                 })
                 .unwrap()
                 .drop_sink(proto.id);
+        }
+    }
+
+    pub fn drop_subscription(
+        &mut self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        subscription_id: SubscriptionId,
+    ) {
+        self.get_database_mut(db_id)
+            .unwrap()
+            .get_schema_mut(schema_id)
+            .unwrap()
+            .drop_subscription(subscription_id);
+    }
+
+    pub fn update_subscription(&mut self, proto: &PbSubscription) {
+        let database = self.get_database_mut(proto.database_id).unwrap();
+        let schema = database.get_schema_mut(proto.schema_id).unwrap();
+        if schema.get_subscription_by_id(&proto.id).is_some() {
+            schema.update_subscription(proto);
+        } else {
+            // Enter this branch when schema is changed by `ALTER ... SET SCHEMA ...` statement.
+            schema.create_subscription(proto);
+            database
+                .iter_schemas_mut()
+                .find(|schema| {
+                    schema.id() != proto.schema_id
+                        && schema.get_subscription_by_id(&proto.id).is_some()
+                })
+                .unwrap()
+                .drop_subscription(proto.id);
         }
     }
 
@@ -464,7 +542,7 @@ impl Catalog {
     pub fn get_database_by_name(&self, db_name: &str) -> CatalogResult<&DatabaseCatalog> {
         self.database_by_name
             .get(db_name)
-            .ok_or_else(|| CatalogError::NotFound("database", db_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("database", db_name.to_owned()))
     }
 
     pub fn get_database_by_id(&self, db_id: &DatabaseId) -> CatalogResult<&DatabaseCatalog> {
@@ -474,15 +552,28 @@ impl Catalog {
             .ok_or_else(|| CatalogError::NotFound("db_id", db_id.to_string()))?;
         self.database_by_name
             .get(db_name)
-            .ok_or_else(|| CatalogError::NotFound("database", db_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("database", db_name.clone()))
+    }
+
+    pub fn find_schema_secret_by_secret_id(
+        &self,
+        db_name: &str,
+        secret_id: SecretId,
+    ) -> CatalogResult<(String, String)> {
+        let db = self.get_database_by_name(db_name)?;
+        let schema_secret = db
+            .iter_schemas()
+            .find_map(|schema| {
+                schema
+                    .get_secret_by_id(&secret_id)
+                    .map(|secret| (schema.name(), secret.name.clone()))
+            })
+            .ok_or_else(|| CatalogError::NotFound("secret", secret_id.to_string()))?;
+        Ok(schema_secret)
     }
 
     pub fn get_all_schema_names(&self, db_name: &str) -> CatalogResult<Vec<String>> {
         Ok(self.get_database_by_name(db_name)?.get_all_schema_names())
-    }
-
-    pub fn get_all_schema_info(&self, db_name: &str) -> CatalogResult<Vec<PbSchema>> {
-        Ok(self.get_database_by_name(db_name)?.get_all_schema_info())
     }
 
     pub fn iter_schemas(
@@ -507,11 +598,11 @@ impl Catalog {
     ) -> CatalogResult<&SchemaCatalog> {
         self.get_database_by_name(db_name)?
             .get_schema_by_name(schema_name)
-            .ok_or_else(|| CatalogError::NotFound("schema", schema_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("schema", schema_name.to_owned()))
     }
 
     pub fn get_table_name_by_id(&self, table_id: TableId) -> CatalogResult<String> {
-        self.get_table_by_id(&table_id)
+        self.get_any_table_by_id(&table_id)
             .map(|table| table.name.clone())
     }
 
@@ -523,17 +614,6 @@ impl Catalog {
         self.get_database_by_id(db_id)?
             .get_schema_by_id(schema_id)
             .ok_or_else(|| CatalogError::NotFound("schema_id", schema_id.to_string()))
-    }
-
-    pub fn get_source_by_id(
-        &self,
-        db_id: &DatabaseId,
-        schema_id: &SchemaId,
-        source_id: &SourceId,
-    ) -> CatalogResult<&Arc<SourceCatalog>> {
-        self.get_schema_by_id(db_id, schema_id)?
-            .get_source_by_id(source_id)
-            .ok_or_else(|| CatalogError::NotFound("source_id", source_id.to_string()))
     }
 
     /// Refer to [`SearchPath`].
@@ -555,8 +635,23 @@ impl Catalog {
         }
         Err(CatalogError::NotFound(
             "first valid schema",
-            "no schema has been selected to create in".to_string(),
+            "no schema has been selected to create in".to_owned(),
         ))
+    }
+
+    pub fn get_source_by_id<'a>(
+        &self,
+        db_name: &'a str,
+        schema_path: SchemaPath<'a>,
+        source_id: &SourceId,
+    ) -> CatalogResult<(&Arc<SourceCatalog>, &'a str)> {
+        schema_path
+            .try_find(|schema_name| {
+                Ok(self
+                    .get_schema_by_name(db_name, schema_name)?
+                    .get_source_by_id(source_id))
+            })?
+            .ok_or_else(|| CatalogError::NotFound("source", source_id.to_string()))
     }
 
     pub fn get_table_by_name<'a>(
@@ -564,59 +659,78 @@ impl Catalog {
         db_name: &str,
         schema_path: SchemaPath<'a>,
         table_name: &str,
+        bind_creating: bool,
     ) -> CatalogResult<(&Arc<TableCatalog>, &'a str)> {
         schema_path
             .try_find(|schema_name| {
                 Ok(self
                     .get_schema_by_name(db_name, schema_name)?
-                    .get_table_by_name(table_name))
+                    .get_table_by_name(table_name, bind_creating))
             })?
-            .ok_or_else(|| CatalogError::NotFound("table", table_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("table", table_name.to_owned()))
     }
 
-    pub fn get_table_by_id(&self, table_id: &TableId) -> CatalogResult<&Arc<TableCatalog>> {
+    /// Used to get `TableCatalog` for Materialized Views, Tables and Indexes.
+    /// Retrieves all tables, created or creating.
+    pub fn get_any_table_by_name<'a>(
+        &self,
+        db_name: &str,
+        schema_path: SchemaPath<'a>,
+        table_name: &str,
+    ) -> CatalogResult<(&Arc<TableCatalog>, &'a str)> {
+        self.get_table_by_name(db_name, schema_path, table_name, true)
+    }
+
+    /// Used to get `TableCatalog` for Materialized Views, Tables and Indexes.
+    /// Retrieves only created tables.
+    pub fn get_created_table_by_name<'a>(
+        &self,
+        db_name: &str,
+        schema_path: SchemaPath<'a>,
+        table_name: &str,
+    ) -> CatalogResult<(&Arc<TableCatalog>, &'a str)> {
+        self.get_table_by_name(db_name, schema_path, table_name, false)
+    }
+
+    pub fn get_any_table_by_id(&self, table_id: &TableId) -> CatalogResult<&Arc<TableCatalog>> {
         self.table_by_id
             .get(table_id)
             .ok_or_else(|| CatalogError::NotFound("table id", table_id.to_string()))
     }
 
     /// This function is similar to `get_table_by_id` expect that a table must be in a given database.
-    pub fn get_table_by_id_with_db(
+    pub fn get_created_table_by_id_with_db(
         &self,
         db_name: &str,
         table_id: u32,
     ) -> CatalogResult<&Arc<TableCatalog>> {
         let table_id = TableId::from(table_id);
         for schema in self.get_database_by_name(db_name)?.iter_schemas() {
-            if let Some(table) = schema.get_table_by_id(&table_id) {
+            if let Some(table) = schema.get_created_table_by_id(&table_id) {
                 return Ok(table);
             }
         }
         Err(CatalogError::NotFound("table id", table_id.to_string()))
     }
 
-    pub fn get_schema_by_table_id(
-        &self,
-        db_name: &str,
-        table_id: &TableId,
-    ) -> CatalogResult<&SchemaCatalog> {
-        self.database_by_name
-            .get(db_name)
-            .and_then(|db| db.find_schema_containing_table_id(table_id))
-            .ok_or_else(|| CatalogError::NotFound("schema with table", table_id.to_string()))
+    pub fn iter_tables(&self) -> impl Iterator<Item = &Arc<TableCatalog>> {
+        self.table_by_id.values()
+    }
+
+    pub fn iter_backfilling_internal_tables(&self) -> impl Iterator<Item = &Arc<TableCatalog>> {
+        self.table_by_id
+            .values()
+            .filter(|t| t.is_internal_table() && !t.is_created())
     }
 
     // Used by test_utils only.
     pub fn alter_table_name_by_id(&mut self, table_id: &TableId, table_name: &str) {
-        let (mut database_id, mut schema_id) = (0, 0);
         let mut found = false;
         for database in self.database_by_name.values() {
             if !found {
                 for schema in database.iter_schemas() {
-                    if schema.iter_table().any(|t| t.id() == *table_id) {
+                    if schema.iter_user_table().any(|t| t.id() == *table_id) {
                         found = true;
-                        database_id = database.id();
-                        schema_id = schema.id();
                         break;
                     }
                 }
@@ -624,11 +738,8 @@ impl Catalog {
         }
 
         if found {
-            let mut table = self
-                .get_table_by_id(table_id)
-                .unwrap()
-                .to_prost(schema_id, database_id);
-            table.name = table_name.to_string();
+            let mut table = self.get_any_table_by_id(table_id).unwrap().to_prost();
+            table.name = table_name.to_owned();
             self.update_table(&table);
         }
     }
@@ -650,10 +761,9 @@ impl Catalog {
         schema_name: &str,
         table_name: &str,
     ) -> CatalogResult<&Arc<SystemTableCatalog>> {
-        self.get_schema_by_name(db_name, schema_name)
-            .unwrap()
+        self.get_schema_by_name(db_name, schema_name)?
             .get_system_table_by_name(table_name)
-            .ok_or_else(|| CatalogError::NotFound("table", table_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("table", table_name.to_owned()))
     }
 
     pub fn get_source_by_name<'a>(
@@ -668,7 +778,7 @@ impl Catalog {
                     .get_schema_by_name(db_name, schema_name)?
                     .get_source_by_name(source_name))
             })?
-            .ok_or_else(|| CatalogError::NotFound("source", source_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("source", source_name.to_owned()))
     }
 
     pub fn get_sink_by_name<'a>(
@@ -676,14 +786,48 @@ impl Catalog {
         db_name: &str,
         schema_path: SchemaPath<'a>,
         sink_name: &str,
+        bind_creating: bool,
     ) -> CatalogResult<(&Arc<SinkCatalog>, &'a str)> {
         schema_path
             .try_find(|schema_name| {
                 Ok(self
                     .get_schema_by_name(db_name, schema_name)?
-                    .get_sink_by_name(sink_name))
+                    .get_sink_by_name(sink_name, bind_creating))
             })?
-            .ok_or_else(|| CatalogError::NotFound("sink", sink_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("sink", sink_name.to_owned()))
+    }
+
+    pub fn get_any_sink_by_name<'a>(
+        &self,
+        db_name: &str,
+        schema_path: SchemaPath<'a>,
+        sink_name: &str,
+    ) -> CatalogResult<(&Arc<SinkCatalog>, &'a str)> {
+        self.get_sink_by_name(db_name, schema_path, sink_name, true)
+    }
+
+    pub fn get_created_sink_by_name<'a>(
+        &self,
+        db_name: &str,
+        schema_path: SchemaPath<'a>,
+        sink_name: &str,
+    ) -> CatalogResult<(&Arc<SinkCatalog>, &'a str)> {
+        self.get_sink_by_name(db_name, schema_path, sink_name, false)
+    }
+
+    pub fn get_subscription_by_name<'a>(
+        &self,
+        db_name: &str,
+        schema_path: SchemaPath<'a>,
+        subscription_name: &str,
+    ) -> CatalogResult<(&Arc<SubscriptionCatalog>, &'a str)> {
+        schema_path
+            .try_find(|schema_name| {
+                Ok(self
+                    .get_schema_by_name(db_name, schema_name)?
+                    .get_subscription_by_name(subscription_name))
+            })?
+            .ok_or_else(|| CatalogError::NotFound("subscription", subscription_name.to_owned()))
     }
 
     pub fn get_index_by_name<'a>(
@@ -698,7 +842,7 @@ impl Catalog {
                     .get_schema_by_name(db_name, schema_name)?
                     .get_index_by_name(index_name))
             })?
-            .ok_or_else(|| CatalogError::NotFound("index", index_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("index", index_name.to_owned()))
     }
 
     pub fn get_index_by_id(
@@ -727,7 +871,7 @@ impl Catalog {
                     .get_schema_by_name(db_name, schema_name)?
                     .get_view_by_name(view_name))
             })?
-            .ok_or_else(|| CatalogError::NotFound("view", view_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("view", view_name.to_owned()))
     }
 
     pub fn get_view_by_id(&self, db_name: &str, view_id: u32) -> CatalogResult<Arc<ViewCatalog>> {
@@ -737,6 +881,37 @@ impl Catalog {
             }
         }
         Err(CatalogError::NotFound("view", view_id.to_string()))
+    }
+
+    pub fn get_secret_by_name<'a>(
+        &self,
+        db_name: &str,
+        schema_path: SchemaPath<'a>,
+        secret_name: &str,
+    ) -> CatalogResult<(&Arc<SecretCatalog>, &'a str)> {
+        schema_path
+            .try_find(|schema_name| {
+                Ok(self
+                    .get_schema_by_name(db_name, schema_name)?
+                    .get_secret_by_name(secret_name))
+            })?
+            .ok_or_else(|| CatalogError::NotFound("secret", secret_name.to_owned()))
+    }
+
+    pub fn get_connection_by_id(
+        &self,
+        db_name: &str,
+        connection_id: ConnectionId,
+    ) -> CatalogResult<&Arc<ConnectionCatalog>> {
+        for schema in self.get_database_by_name(db_name)?.iter_schemas() {
+            if let Some(conn) = schema.get_connection_by_id(&connection_id) {
+                return Ok(conn);
+            }
+        }
+        Err(CatalogError::NotFound(
+            "connection",
+            connection_id.to_string(),
+        ))
     }
 
     pub fn get_connection_by_name<'a>(
@@ -751,7 +926,7 @@ impl Catalog {
                     .get_schema_by_name(db_name, schema_name)?
                     .get_connection_by_name(connection_name))
             })?
-            .ok_or_else(|| CatalogError::NotFound("connection", connection_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("connection", connection_name.to_owned()))
     }
 
     pub fn get_function_by_name_inputs<'a>(
@@ -820,7 +995,7 @@ impl Catalog {
                     .get_schema_by_name(db_name, schema_name)?
                     .get_functions_by_name(function_name))
             })?
-            .ok_or_else(|| CatalogError::NotFound("function", function_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("function", function_name.to_owned()))
     }
 
     /// Check if the name duplicates with existing table, materialized view or source.
@@ -832,26 +1007,44 @@ impl Catalog {
     ) -> CatalogResult<()> {
         let schema = self.get_schema_by_name(db_name, schema_name)?;
 
-        if let Some(table) = schema.get_table_by_name(relation_name) {
+        if let Some(table) = schema.get_any_table_by_name(relation_name) {
+            let is_creating = table.stream_job_status == StreamJobStatus::Creating;
             if table.is_index() {
-                Err(CatalogError::Duplicated("index", relation_name.to_string()))
+                Err(CatalogError::Duplicated(
+                    "index",
+                    relation_name.to_owned(),
+                    is_creating,
+                ))
             } else if table.is_mview() {
                 Err(CatalogError::Duplicated(
                     "materialized view",
-                    relation_name.to_string(),
+                    relation_name.to_owned(),
+                    is_creating,
                 ))
             } else {
-                Err(CatalogError::Duplicated("table", relation_name.to_string()))
+                Err(CatalogError::Duplicated(
+                    "table",
+                    relation_name.to_owned(),
+                    is_creating,
+                ))
             }
         } else if schema.get_source_by_name(relation_name).is_some() {
+            Err(CatalogError::duplicated("source", relation_name.to_owned()))
+        } else if let Some(sink) = schema.get_any_sink_by_name(relation_name) {
             Err(CatalogError::Duplicated(
-                "source",
-                relation_name.to_string(),
+                "sink",
+                relation_name.to_owned(),
+                !sink.is_created(),
             ))
-        } else if schema.get_sink_by_name(relation_name).is_some() {
-            Err(CatalogError::Duplicated("sink", relation_name.to_string()))
         } else if schema.get_view_by_name(relation_name).is_some() {
-            Err(CatalogError::Duplicated("view", relation_name.to_string()))
+            Err(CatalogError::duplicated("view", relation_name.to_owned()))
+        } else if let Some(subscription) = schema.get_subscription_by_name(relation_name) {
+            let is_not_created = subscription.subscription_state != SubscriptionState::Created;
+            Err(CatalogError::Duplicated(
+                "subscription",
+                relation_name.to_owned(),
+                is_not_created,
+            ))
         } else {
             Ok(())
         }
@@ -874,7 +1067,7 @@ impl Catalog {
                 "{function_name}({})",
                 arg_types.iter().map(|t| t.to_string()).join(",")
             );
-            Err(CatalogError::Duplicated("function", name))
+            Err(CatalogError::duplicated("function", name))
         } else {
             Ok(())
         }
@@ -890,23 +1083,28 @@ impl Catalog {
         let schema = self.get_schema_by_name(db_name, schema_name)?;
 
         if schema.get_connection_by_name(connection_name).is_some() {
-            Err(CatalogError::Duplicated(
+            Err(CatalogError::duplicated(
                 "connection",
-                connection_name.to_string(),
+                connection_name.to_owned(),
             ))
         } else {
             Ok(())
         }
     }
 
-    /// Get the catalog cache's catalog version.
-    pub fn version(&self) -> u64 {
-        self.version
-    }
+    pub fn check_secret_name_duplicated(
+        &self,
+        db_name: &str,
+        schema_name: &str,
+        secret_name: &str,
+    ) -> CatalogResult<()> {
+        let schema = self.get_schema_by_name(db_name, schema_name)?;
 
-    /// Set the catalog cache's catalog version.
-    pub fn set_version(&mut self, catalog_version: CatalogVersion) {
-        self.version = catalog_version;
+        if schema.get_secret_by_name(secret_name).is_some() {
+            Err(CatalogError::duplicated("secret", secret_name.to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn table_stats(&self) -> &HummockVersionStats {
@@ -942,7 +1140,7 @@ impl Catalog {
                 #[allow(clippy::manual_map)]
                 if let Some(item) = schema.get_system_table_by_name(class_name) {
                     Ok(Some(item.id().into()))
-                } else if let Some(item) = schema.get_table_by_name(class_name) {
+                } else if let Some(item) = schema.get_created_table_by_name(class_name) {
                     Ok(Some(item.id().into()))
                 } else if let Some(item) = schema.get_index_by_name(class_name) {
                     Ok(Some(item.id.into()))
@@ -955,6 +1153,6 @@ impl Catalog {
                 }
             })?
             .map(|(id, _)| id)
-            .ok_or_else(|| CatalogError::NotFound("class", class_name.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("class", class_name.to_owned()))
     }
 }

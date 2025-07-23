@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use fixedbitset::FixedBitSet;
@@ -22,7 +22,8 @@ use risingwave_common::util::iter_util::ZipEqFast;
 
 use super::{GenericPlanNode, GenericPlanRef};
 use crate::expr::{
-    assert_input_ref, Expr, ExprDisplay, ExprImpl, ExprRewriter, ExprVisitor, InputRef,
+    Expr, ExprDisplay, ExprImpl, ExprRewriter, ExprType, ExprVisitor, FunctionCall, InputRef,
+    assert_input_ref,
 };
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::property::FunctionalDependencySet;
@@ -49,6 +50,8 @@ fn check_expr_type(expr: &ExprImpl) -> std::result::Result<(), &'static str> {
 #[allow(clippy::manual_non_exhaustive)]
 pub struct Project<PlanRef> {
     pub exprs: Vec<ExprImpl>,
+    /// Mapping from expr index to field name. May not contain all exprs.
+    pub field_names: BTreeMap<usize, String>,
     pub input: PlanRef,
     // we need some check when construct the `Project::new`
     _private: (),
@@ -79,25 +82,28 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Project<PlanRef> {
             .enumerate()
             .map(|(i, expr)| {
                 // Get field info from o2i.
-                let (name, sub_fields, type_name) = match o2i.try_map(i) {
+                let name = match o2i.try_map(i) {
                     Some(input_idx) => {
-                        let field = input_schema.fields()[input_idx].clone();
-                        (field.name, field.sub_fields, field.type_name)
+                        if let Some(name) = self.field_names.get(&i) {
+                            name.clone()
+                        } else {
+                            input_schema.fields()[input_idx].name.clone()
+                        }
                     }
                     None => match expr {
-                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => (
-                            format!("{:?}", ExprDisplay { expr, input_schema }),
-                            vec![],
-                            String::new(),
-                        ),
-                        _ => (
-                            format!("$expr{}", ctx.next_expr_display_id()),
-                            vec![],
-                            String::new(),
-                        ),
+                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => {
+                            format!("{:?}", ExprDisplay { expr, input_schema })
+                        }
+                        _ => {
+                            if let Some(name) = self.field_names.get(&i) {
+                                name.clone()
+                            } else {
+                                format!("$expr{}", ctx.next_expr_display_id())
+                            }
+                        }
                     },
                 };
-                Field::with_struct(expr.return_type(), name, sub_fields, type_name)
+                Field::with_name(expr.return_type(), name)
             })
             .collect();
         Schema { fields }
@@ -132,6 +138,7 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         }
         Project {
             exprs,
+            field_names: Default::default(),
             input,
             _private: (),
         }
@@ -176,6 +183,32 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
             .map(|index| InputRef::new(index, input_schema[index].data_type()).into())
             .collect();
         Self::new(exprs, input)
+    }
+
+    /// Creates a `Project` with an additional `_vnode` column at the end of the schema.
+    pub fn with_vnode_col(input: PlanRef, dist_key: &[usize]) -> Self {
+        let input_fields = input.schema().fields();
+        let mut new_exprs: Vec<_> = input_fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| InputRef::new(idx, field.data_type.clone()).into())
+            .collect();
+        new_exprs.push(
+            FunctionCall::new(
+                ExprType::Vnode,
+                dist_key
+                    .iter()
+                    .map(|idx| InputRef::new(*idx, input_fields[*idx].data_type()).into())
+                    .collect(),
+            )
+            .expect("Vnode function call should be valid here")
+            .into(),
+        );
+        let vnode_expr_idx = new_exprs.len() - 1;
+
+        let mut new = Self::new(new_exprs, input);
+        new.field_names.insert(vnode_expr_idx, "_vnode".to_owned());
+        new
     }
 
     pub fn decompose(self) -> (Vec<ExprImpl>, PlanRef) {
@@ -259,6 +292,41 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
+    }
+
+    pub(crate) fn likely_produces_noop_updates(&self) -> bool {
+        struct HasJsonbAccess {
+            has: bool,
+        }
+
+        impl ExprVisitor for HasJsonbAccess {
+            fn visit_function_call(&mut self, func_call: &FunctionCall) {
+                if matches!(
+                    func_call.func_type(),
+                    ExprType::JsonbAccess
+                        | ExprType::JsonbAccessStr
+                        | ExprType::JsonbExtractPath
+                        | ExprType::JsonbExtractPathVariadic
+                        | ExprType::JsonbExtractPathText
+                        | ExprType::JsonbExtractPathTextVariadic
+                        | ExprType::JsonbPathExists
+                        | ExprType::JsonbPathMatch
+                        | ExprType::JsonbPathQueryArray
+                        | ExprType::JsonbPathQueryFirst
+                ) {
+                    self.has = true;
+                }
+            }
+        }
+
+        self.exprs.iter().any(|expr| {
+            // When there's a jsonb access in the `Project`, it's very likely that the query is
+            // extracting some fields from a jsonb payload column. In this case, a change from the
+            // input jsonb payload may not change the output of the `Project`.
+            let mut visitor = HasJsonbAccess { has: false };
+            visitor.visit_expr(expr);
+            visitor.has
+        })
     }
 }
 

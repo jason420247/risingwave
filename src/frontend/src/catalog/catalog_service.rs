@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
-use risingwave_common::catalog::{CatalogVersion, FunctionId, IndexId};
-use risingwave_common::error::Result;
-use risingwave_common::util::column_index_mapping::ColIndexMapping;
-use risingwave_pb::catalog::{
-    PbComment, PbCreateType, PbDatabase, PbFunction, PbIndex, PbSchema, PbSink, PbSource, PbTable,
-    PbView,
+use risingwave_common::catalog::{
+    AlterDatabaseParam, CatalogVersion, FunctionId, IndexId, ObjectId,
 };
-use risingwave_pb::ddl_service::alter_owner_request::Object;
+use risingwave_hummock_sdk::HummockVersionId;
+use risingwave_pb::catalog::{
+    PbComment, PbCreateType, PbDatabase, PbFunction, PbIndex, PbSchema, PbSink, PbSource,
+    PbSubscription, PbTable, PbView,
+};
+use risingwave_pb::ddl_service::replace_job_plan::{
+    ReplaceJob, ReplaceMaterializedView, ReplaceSource, ReplaceTable,
+};
 use risingwave_pb::ddl_service::{
-    alter_name_request, alter_set_schema_request, create_connection_request, PbReplaceTablePlan,
-    PbTableJobType, ReplaceTablePlan,
+    PbReplaceJobPlan, PbTableJobType, ReplaceJobPlan, TableJobType, WaitVersion,
+    alter_name_request, alter_owner_request, alter_set_schema_request, alter_swap_rename_request,
+    create_connection_request,
 };
 use risingwave_pb::meta::PbTableParallelism;
 use risingwave_pb::stream_plan::StreamFragmentGraph;
@@ -35,7 +40,10 @@ use risingwave_rpc_client::MetaClient;
 use tokio::sync::watch::Receiver;
 
 use super::root_catalog::Catalog;
-use super::{DatabaseId, TableId};
+use super::{DatabaseId, SecretId, TableId};
+use crate::error::Result;
+use crate::scheduler::HummockSnapshotManagerRef;
+use crate::session::current::notice_to_user;
 use crate::user::UserId;
 
 pub type CatalogReadGuard = ArcRwLockReadGuard<RawRwLock, Catalog>;
@@ -43,6 +51,7 @@ pub type CatalogReadGuard = ArcRwLockReadGuard<RawRwLock, Catalog>;
 /// [`CatalogReader`] can read catalog from local catalog and force the holder can not modify it.
 #[derive(Clone)]
 pub struct CatalogReader(Arc<RwLock<Catalog>>);
+
 impl CatalogReader {
     pub fn new(inner: Arc<RwLock<Catalog>>) -> Self {
         CatalogReader(inner)
@@ -60,7 +69,14 @@ impl CatalogReader {
 /// [observer](`crate::observer::FrontendObserverNode`).
 #[async_trait::async_trait]
 pub trait CatalogWriter: Send + Sync {
-    async fn create_database(&self, db_name: &str, owner: UserId) -> Result<()>;
+    async fn create_database(
+        &self,
+        db_name: &str,
+        owner: UserId,
+        resource_group: &str,
+        barrier_interval_ms: Option<u32>,
+        checkpoint_frequency: Option<u64>,
+    ) -> Result<()>;
 
     async fn create_schema(
         &self,
@@ -69,9 +85,18 @@ pub trait CatalogWriter: Send + Sync {
         owner: UserId,
     ) -> Result<()>;
 
-    async fn create_view(&self, view: PbView) -> Result<()>;
+    async fn create_view(&self, view: PbView, dependencies: HashSet<ObjectId>) -> Result<()>;
 
     async fn create_materialized_view(
+        &self,
+        table: PbTable,
+        graph: StreamFragmentGraph,
+        dependencies: HashSet<ObjectId>,
+        specific_resource_group: Option<String>,
+        if_not_exists: bool,
+    ) -> Result<()>;
+
+    async fn replace_materialized_view(
         &self,
         table: PbTable,
         graph: StreamFragmentGraph,
@@ -83,6 +108,8 @@ pub trait CatalogWriter: Send + Sync {
         table: PbTable,
         graph: StreamFragmentGraph,
         job_type: PbTableJobType,
+        if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
     ) -> Result<()>;
 
     async fn replace_table(
@@ -90,32 +117,36 @@ pub trait CatalogWriter: Send + Sync {
         source: Option<PbSource>,
         table: PbTable,
         graph: StreamFragmentGraph,
-        mapping: ColIndexMapping,
+        job_type: TableJobType,
     ) -> Result<()>;
 
-    async fn alter_source_column(&self, source: PbSource) -> Result<()>;
+    async fn replace_source(&self, source: PbSource, graph: StreamFragmentGraph) -> Result<()>;
 
     async fn create_index(
         &self,
         index: PbIndex,
         table: PbTable,
         graph: StreamFragmentGraph,
+        if_not_exists: bool,
     ) -> Result<()>;
 
-    async fn create_source(&self, source: PbSource) -> Result<()>;
-
-    async fn create_source_with_graph(
+    async fn create_source(
         &self,
         source: PbSource,
-        graph: StreamFragmentGraph,
+        graph: Option<StreamFragmentGraph>,
+        if_not_exists: bool,
     ) -> Result<()>;
 
     async fn create_sink(
         &self,
         sink: PbSink,
         graph: StreamFragmentGraph,
-        affected_table_change: Option<PbReplaceTablePlan>,
+        affected_table_change: Option<PbReplaceJobPlan>,
+        dependencies: HashSet<ObjectId>,
+        if_not_exists: bool,
     ) -> Result<()>;
+
+    async fn create_subscription(&self, subscription: PbSubscription) -> Result<()>;
 
     async fn create_function(&self, function: PbFunction) -> Result<()>;
 
@@ -126,6 +157,15 @@ pub trait CatalogWriter: Send + Sync {
         schema_id: u32,
         owner_id: u32,
         connection: create_connection_request::Payload,
+    ) -> Result<()>;
+
+    async fn create_secret(
+        &self,
+        secret_name: String,
+        database_id: u32,
+        schema_id: u32,
+        owner_id: u32,
+        payload: Vec<u8>,
     ) -> Result<()>;
 
     async fn comment_on(&self, comment: PbComment) -> Result<()>;
@@ -147,12 +187,14 @@ pub trait CatalogWriter: Send + Sync {
         &self,
         sink_id: u32,
         cascade: bool,
-        affected_table_change: Option<PbReplaceTablePlan>,
+        affected_table_change: Option<PbReplaceJobPlan>,
     ) -> Result<()>;
+
+    async fn drop_subscription(&self, subscription_id: u32, cascade: bool) -> Result<()>;
 
     async fn drop_database(&self, database_id: u32) -> Result<()>;
 
-    async fn drop_schema(&self, schema_id: u32) -> Result<()>;
+    async fn drop_schema(&self, schema_id: u32, cascade: bool) -> Result<()>;
 
     async fn drop_index(&self, index_id: IndexId, cascade: bool) -> Result<()>;
 
@@ -160,29 +202,55 @@ pub trait CatalogWriter: Send + Sync {
 
     async fn drop_connection(&self, connection_id: u32) -> Result<()>;
 
-    async fn alter_table_name(&self, table_id: u32, table_name: &str) -> Result<()>;
+    async fn drop_secret(&self, secret_id: SecretId) -> Result<()>;
 
-    async fn alter_view_name(&self, view_id: u32, view_name: &str) -> Result<()>;
+    async fn alter_secret(
+        &self,
+        secret_id: u32,
+        secret_name: String,
+        database_id: u32,
+        schema_id: u32,
+        owner_id: u32,
+        payload: Vec<u8>,
+    ) -> Result<()>;
 
-    async fn alter_index_name(&self, index_id: u32, index_name: &str) -> Result<()>;
+    async fn alter_name(
+        &self,
+        object_id: alter_name_request::Object,
+        object_name: &str,
+    ) -> Result<()>;
 
-    async fn alter_sink_name(&self, sink_id: u32, sink_name: &str) -> Result<()>;
+    async fn alter_owner(&self, object: alter_owner_request::Object, owner_id: u32) -> Result<()>;
 
-    async fn alter_source_name(&self, source_id: u32, source_name: &str) -> Result<()>;
+    /// Replace the source in the catalog.
+    async fn alter_source(&self, source: PbSource) -> Result<()>;
 
-    async fn alter_schema_name(&self, schema_id: u32, schema_name: &str) -> Result<()>;
+    async fn alter_parallelism(
+        &self,
+        job_id: u32,
+        parallelism: PbTableParallelism,
+        deferred: bool,
+    ) -> Result<()>;
 
-    async fn alter_database_name(&self, database_id: u32, database_name: &str) -> Result<()>;
-
-    async fn alter_owner(&self, object: Object, owner_id: u32) -> Result<()>;
-
-    async fn alter_parallelism(&self, table_id: u32, parallelism: PbTableParallelism)
-        -> Result<()>;
+    async fn alter_resource_group(
+        &self,
+        table_id: u32,
+        resource_group: Option<String>,
+        deferred: bool,
+    ) -> Result<()>;
 
     async fn alter_set_schema(
         &self,
         object: alter_set_schema_request::Object,
         new_schema_id: u32,
+    ) -> Result<()>;
+
+    async fn alter_swap_rename(&self, object: alter_swap_rename_request::Object) -> Result<()>;
+
+    async fn alter_database_param(
+        &self,
+        database_id: DatabaseId,
+        param: AlterDatabaseParam,
     ) -> Result<()>;
 }
 
@@ -190,17 +258,28 @@ pub trait CatalogWriter: Send + Sync {
 pub struct CatalogWriterImpl {
     meta_client: MetaClient,
     catalog_updated_rx: Receiver<CatalogVersion>,
+    hummock_snapshot_manager: HummockSnapshotManagerRef,
 }
 
 #[async_trait::async_trait]
 impl CatalogWriter for CatalogWriterImpl {
-    async fn create_database(&self, db_name: &str, owner: UserId) -> Result<()> {
+    async fn create_database(
+        &self,
+        db_name: &str,
+        owner: UserId,
+        resource_group: &str,
+        barrier_interval_ms: Option<u32>,
+        checkpoint_frequency: Option<u64>,
+    ) -> Result<()> {
         let version = self
             .meta_client
             .create_database(PbDatabase {
-                name: db_name.to_string(),
+                name: db_name.to_owned(),
                 id: 0,
                 owner,
+                resource_group: resource_group.to_owned(),
+                barrier_interval_ms,
+                checkpoint_frequency,
             })
             .await?;
         self.wait_version(version).await
@@ -216,7 +295,7 @@ impl CatalogWriter for CatalogWriterImpl {
             .meta_client
             .create_schema(PbSchema {
                 id: 0,
-                name: schema_name.to_string(),
+                name: schema_name.to_owned(),
                 database_id: db_id,
                 owner,
             })
@@ -229,11 +308,20 @@ impl CatalogWriter for CatalogWriterImpl {
         &self,
         table: PbTable,
         graph: StreamFragmentGraph,
+        dependencies: HashSet<ObjectId>,
+        specific_resource_group: Option<String>,
+        if_not_exists: bool,
     ) -> Result<()> {
         let create_type = table.get_create_type().unwrap_or(PbCreateType::Foreground);
         let version = self
             .meta_client
-            .create_materialized_view(table, graph)
+            .create_materialized_view(
+                table,
+                graph,
+                dependencies,
+                specific_resource_group,
+                if_not_exists,
+            )
             .await?;
         if matches!(create_type, PbCreateType::Foreground) {
             self.wait_version(version).await?
@@ -241,8 +329,28 @@ impl CatalogWriter for CatalogWriterImpl {
         Ok(())
     }
 
-    async fn create_view(&self, view: PbView) -> Result<()> {
-        let version = self.meta_client.create_view(view).await?;
+    async fn replace_materialized_view(
+        &self,
+        table: PbTable,
+        graph: StreamFragmentGraph,
+    ) -> Result<()> {
+        // TODO: this is a dummy implementation for debugging only.
+        notice_to_user(format!("table: {table:#?}"));
+        notice_to_user(format!("graph: {graph:#?}"));
+
+        let version = self
+            .meta_client
+            .replace_job(
+                graph,
+                ReplaceJob::ReplaceMaterializedView(ReplaceMaterializedView { table: Some(table) }),
+            )
+            .await?;
+
+        self.wait_version(version).await
+    }
+
+    async fn create_view(&self, view: PbView, dependencies: HashSet<ObjectId>) -> Result<()> {
+        let version = self.meta_client.create_view(view, dependencies).await?;
         self.wait_version(version).await
     }
 
@@ -251,8 +359,12 @@ impl CatalogWriter for CatalogWriterImpl {
         index: PbIndex,
         table: PbTable,
         graph: StreamFragmentGraph,
+        if_not_exists: bool,
     ) -> Result<()> {
-        let version = self.meta_client.create_index(index, table, graph).await?;
+        let version = self
+            .meta_client
+            .create_index(index, table, graph, if_not_exists)
+            .await?;
         self.wait_version(version).await
     }
 
@@ -262,16 +374,13 @@ impl CatalogWriter for CatalogWriterImpl {
         table: PbTable,
         graph: StreamFragmentGraph,
         job_type: PbTableJobType,
+        if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
     ) -> Result<()> {
         let version = self
             .meta_client
-            .create_table(source, table, graph, job_type)
+            .create_table(source, table, graph, job_type, if_not_exists, dependencies)
             .await?;
-        self.wait_version(version).await
-    }
-
-    async fn alter_source_column(&self, source: PbSource) -> Result<()> {
-        let version = self.meta_client.alter_source_column(source).await?;
         self.wait_version(version).await
     }
 
@@ -280,28 +389,44 @@ impl CatalogWriter for CatalogWriterImpl {
         source: Option<PbSource>,
         table: PbTable,
         graph: StreamFragmentGraph,
-        mapping: ColIndexMapping,
+        job_type: TableJobType,
     ) -> Result<()> {
         let version = self
             .meta_client
-            .replace_table(source, table, graph, mapping)
+            .replace_job(
+                graph,
+                ReplaceJob::ReplaceTable(ReplaceTable {
+                    source,
+                    table: Some(table),
+                    job_type: job_type as _,
+                }),
+            )
             .await?;
         self.wait_version(version).await
     }
 
-    async fn create_source(&self, source: PbSource) -> Result<()> {
-        let version = self.meta_client.create_source(source).await?;
+    async fn replace_source(&self, source: PbSource, graph: StreamFragmentGraph) -> Result<()> {
+        let version = self
+            .meta_client
+            .replace_job(
+                graph,
+                ReplaceJob::ReplaceSource(ReplaceSource {
+                    source: Some(source),
+                }),
+            )
+            .await?;
         self.wait_version(version).await
     }
 
-    async fn create_source_with_graph(
+    async fn create_source(
         &self,
         source: PbSource,
-        graph: StreamFragmentGraph,
+        graph: Option<StreamFragmentGraph>,
+        if_not_exists: bool,
     ) -> Result<()> {
         let version = self
             .meta_client
-            .create_source_with_graph(source, graph)
+            .create_source(source, graph, if_not_exists)
             .await?;
         self.wait_version(version).await
     }
@@ -310,12 +435,25 @@ impl CatalogWriter for CatalogWriterImpl {
         &self,
         sink: PbSink,
         graph: StreamFragmentGraph,
-        affected_table_change: Option<ReplaceTablePlan>,
+        affected_table_change: Option<ReplaceJobPlan>,
+        dependencies: HashSet<ObjectId>,
+        if_not_exists: bool,
     ) -> Result<()> {
         let version = self
             .meta_client
-            .create_sink(sink, graph, affected_table_change)
+            .create_sink(
+                sink,
+                graph,
+                affected_table_change,
+                dependencies,
+                if_not_exists,
+            )
             .await?;
+        self.wait_version(version).await
+    }
+
+    async fn create_subscription(&self, subscription: PbSubscription) -> Result<()> {
+        let version = self.meta_client.create_subscription(subscription).await?;
         self.wait_version(version).await
     }
 
@@ -341,6 +479,21 @@ impl CatalogWriter for CatalogWriterImpl {
                 owner_id,
                 connection,
             )
+            .await?;
+        self.wait_version(version).await
+    }
+
+    async fn create_secret(
+        &self,
+        secret_name: String,
+        database_id: u32,
+        schema_id: u32,
+        owner_id: u32,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let version = self
+            .meta_client
+            .create_secret(secret_name, database_id, schema_id, owner_id, payload)
             .await?;
         self.wait_version(version).await
     }
@@ -385,11 +538,19 @@ impl CatalogWriter for CatalogWriterImpl {
         &self,
         sink_id: u32,
         cascade: bool,
-        affected_table_change: Option<ReplaceTablePlan>,
+        affected_table_change: Option<ReplaceJobPlan>,
     ) -> Result<()> {
         let version = self
             .meta_client
             .drop_sink(sink_id, cascade, affected_table_change)
+            .await?;
+        self.wait_version(version).await
+    }
+
+    async fn drop_subscription(&self, subscription_id: u32, cascade: bool) -> Result<()> {
+        let version = self
+            .meta_client
+            .drop_subscription(subscription_id, cascade)
             .await?;
         self.wait_version(version).await
     }
@@ -404,8 +565,8 @@ impl CatalogWriter for CatalogWriterImpl {
         self.wait_version(version).await
     }
 
-    async fn drop_schema(&self, schema_id: u32) -> Result<()> {
-        let version = self.meta_client.drop_schema(schema_id).await?;
+    async fn drop_schema(&self, schema_id: u32, cascade: bool) -> Result<()> {
+        let version = self.meta_client.drop_schema(schema_id, cascade).await?;
         self.wait_version(version).await
     }
 
@@ -419,66 +580,21 @@ impl CatalogWriter for CatalogWriterImpl {
         self.wait_version(version).await
     }
 
-    async fn alter_table_name(&self, table_id: u32, table_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(alter_name_request::Object::TableId(table_id), table_name)
-            .await?;
+    async fn drop_secret(&self, secret_id: SecretId) -> Result<()> {
+        let version = self.meta_client.drop_secret(secret_id).await?;
         self.wait_version(version).await
     }
 
-    async fn alter_view_name(&self, view_id: u32, view_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(alter_name_request::Object::ViewId(view_id), view_name)
-            .await?;
+    async fn alter_name(
+        &self,
+        object_id: alter_name_request::Object,
+        object_name: &str,
+    ) -> Result<()> {
+        let version = self.meta_client.alter_name(object_id, object_name).await?;
         self.wait_version(version).await
     }
 
-    async fn alter_index_name(&self, index_id: u32, index_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(alter_name_request::Object::IndexId(index_id), index_name)
-            .await?;
-        self.wait_version(version).await
-    }
-
-    async fn alter_sink_name(&self, sink_id: u32, sink_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(alter_name_request::Object::SinkId(sink_id), sink_name)
-            .await?;
-        self.wait_version(version).await
-    }
-
-    async fn alter_source_name(&self, source_id: u32, source_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(alter_name_request::Object::SourceId(source_id), source_name)
-            .await?;
-        self.wait_version(version).await
-    }
-
-    async fn alter_schema_name(&self, schema_id: u32, schema_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(alter_name_request::Object::SchemaId(schema_id), schema_name)
-            .await?;
-        self.wait_version(version).await
-    }
-
-    async fn alter_database_name(&self, database_id: u32, database_name: &str) -> Result<()> {
-        let version = self
-            .meta_client
-            .alter_name(
-                alter_name_request::Object::DatabaseId(database_id),
-                database_name,
-            )
-            .await?;
-        self.wait_version(version).await
-    }
-
-    async fn alter_owner(&self, object: Object, owner_id: u32) -> Result<()> {
+    async fn alter_owner(&self, object: alter_owner_request::Object, owner_id: u32) -> Result<()> {
         let version = self.meta_client.alter_owner(object, owner_id).await?;
         self.wait_version(version).await
     }
@@ -495,33 +611,102 @@ impl CatalogWriter for CatalogWriterImpl {
         self.wait_version(version).await
     }
 
+    async fn alter_source(&self, source: PbSource) -> Result<()> {
+        let version = self.meta_client.alter_source(source).await?;
+        self.wait_version(version).await
+    }
+
     async fn alter_parallelism(
         &self,
-        table_id: u32,
+        job_id: u32,
         parallelism: PbTableParallelism,
+        deferred: bool,
     ) -> Result<()> {
         self.meta_client
-            .alter_parallelism(table_id, parallelism)
+            .alter_parallelism(job_id, parallelism, deferred)
             .await
             .map_err(|e| anyhow!(e))?;
 
         Ok(())
     }
+
+    async fn alter_swap_rename(&self, object: alter_swap_rename_request::Object) -> Result<()> {
+        let version = self.meta_client.alter_swap_rename(object).await?;
+        self.wait_version(version).await
+    }
+
+    async fn alter_secret(
+        &self,
+        secret_id: u32,
+        secret_name: String,
+        database_id: u32,
+        schema_id: u32,
+        owner_id: u32,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let version = self
+            .meta_client
+            .alter_secret(
+                secret_id,
+                secret_name,
+                database_id,
+                schema_id,
+                owner_id,
+                payload,
+            )
+            .await?;
+        self.wait_version(version).await
+    }
+
+    async fn alter_resource_group(
+        &self,
+        table_id: u32,
+        resource_group: Option<String>,
+        deferred: bool,
+    ) -> Result<()> {
+        self.meta_client
+            .alter_resource_group(table_id, resource_group, deferred)
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(())
+    }
+
+    async fn alter_database_param(
+        &self,
+        database_id: DatabaseId,
+        param: AlterDatabaseParam,
+    ) -> Result<()> {
+        let version = self
+            .meta_client
+            .alter_database_param(database_id, param)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        self.wait_version(version).await
+    }
 }
 
 impl CatalogWriterImpl {
-    pub fn new(meta_client: MetaClient, catalog_updated_rx: Receiver<CatalogVersion>) -> Self {
+    pub fn new(
+        meta_client: MetaClient,
+        catalog_updated_rx: Receiver<CatalogVersion>,
+        hummock_snapshot_manager: HummockSnapshotManagerRef,
+    ) -> Self {
         Self {
             meta_client,
             catalog_updated_rx,
+            hummock_snapshot_manager,
         }
     }
 
-    async fn wait_version(&self, version: CatalogVersion) -> Result<()> {
+    async fn wait_version(&self, version: WaitVersion) -> Result<()> {
         let mut rx = self.catalog_updated_rx.clone();
-        while *rx.borrow_and_update() < version {
+        while *rx.borrow_and_update() < version.catalog_version {
             rx.changed().await.map_err(|e| anyhow!(e))?;
         }
+        self.hummock_snapshot_manager
+            .wait(HummockVersionId::new(version.hummock_version_id))
+            .await;
         Ok(())
     }
 }
